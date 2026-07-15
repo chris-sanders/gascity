@@ -7877,18 +7877,31 @@ func TestPreferredDeterministicControlDispatcher(t *testing.T) {
 	rigCopy := deterministic("fixture")
 	plain := Agent{Name: ControlDispatcherAgentName, Dir: "fixture"} // no StartCommand
 
+	// A rig-scoped dispatcher made RESIDENT by a min_active_sessions>=1 floor.
+	minOne := 1
+	rigCopyMinActive := deterministic("fixture")
+	rigCopyMinActive.MinActiveSessions = &minOne
+
+	// alwaysPin returns a [[named_session]] mode="always" pinning the rig-scoped
+	// core.control-dispatcher for dir; its TemplateQualifiedName matches the agent
+	// QualifiedName "<dir>/core.control-dispatcher", mirroring atlas's city.toml.
+	alwaysPin := func(dir string) NamedSession {
+		return NamedSession{Template: "core.control-dispatcher", Dir: dir, Mode: "always"}
+	}
+
 	tests := []struct {
-		name       string
-		agents     []Agent
-		rigContext string
-		wantQN     string
-		wantOK     bool
+		name          string
+		agents        []Agent
+		namedSessions []NamedSession
+		rigContext    string
+		wantQN        string
+		wantOK        bool
 	}{
 		{
-			name:       "rig copy selected for rig scope",
+			name:       "singleton preferred over NON-resident rig copy for rig scope",
 			agents:     []Agent{rigCopy, citySingleton},
 			rigContext: "fixture",
-			wantQN:     "fixture/core.control-dispatcher",
+			wantQN:     "core.control-dispatcher",
 			wantOK:     true,
 		},
 		{
@@ -7906,10 +7919,11 @@ func TestPreferredDeterministicControlDispatcher(t *testing.T) {
 			wantOK:     true,
 		},
 		{
-			name:       "city dispatcher does not satisfy rig scope",
+			name:       "city dispatcher satisfies rig scope when no resident rig dispatcher exists",
 			agents:     []Agent{citySingleton},
 			rigContext: "fixture",
-			wantOK:     false,
+			wantQN:     "core.control-dispatcher",
+			wantOK:     true,
 		},
 		{
 			name:       "no match when only a non-deterministic dispatcher exists",
@@ -7923,11 +7937,59 @@ func TestPreferredDeterministicControlDispatcher(t *testing.T) {
 			rigContext: "other",
 			wantOK:     false,
 		},
+		{
+			// Multi-store city (atlas): the rig dispatcher is pinned always-on,
+			// so it runs + serves its own rig store — its control beads route to
+			// it, not the singleton (which cannot claim a <rig>/... route).
+			name:          "RESIDENT rig copy (named_session always) preferred for its rig scope",
+			agents:        []Agent{rigCopy, citySingleton},
+			namedSessions: []NamedSession{alwaysPin("fixture")},
+			rigContext:    "fixture",
+			wantQN:        "fixture/core.control-dispatcher",
+			wantOK:        true,
+		},
+		{
+			name:       "RESIDENT rig copy (min_active_sessions>=1) preferred for its rig scope",
+			agents:     []Agent{rigCopyMinActive, citySingleton},
+			rigContext: "fixture",
+			wantQN:     "fixture/core.control-dispatcher",
+			wantOK:     true,
+		},
+		{
+			// Residency must not leak into city-scope work: a pinned rig
+			// dispatcher does NOT capture rigContext=="" (run-operator-city).
+			name:          "resident rig copy still yields singleton for empty scope",
+			agents:        []Agent{rigCopy, citySingleton},
+			namedSessions: []NamedSession{alwaysPin("fixture")},
+			rigContext:    "",
+			wantQN:        "core.control-dispatcher",
+			wantOK:        true,
+		},
+		{
+			// on_demand pinning does NOT make the rig dispatcher resident (only
+			// the singleton runs given max_active_sessions=1) — singleton wins.
+			name:          "on_demand-pinned rig copy is NOT resident — singleton wins",
+			agents:        []Agent{rigCopy, citySingleton},
+			namedSessions: []NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "on_demand"}},
+			rigContext:    "fixture",
+			wantQN:        "core.control-dispatcher",
+			wantOK:        true,
+		},
+		{
+			// A pin for a DIFFERENT rig does not make THIS rig's dispatcher
+			// resident (the QualifiedName correlation is rig-specific).
+			name:          "always-pin for another rig does not make this rig resident",
+			agents:        []Agent{rigCopy, citySingleton},
+			namedSessions: []NamedSession{alwaysPin("other")},
+			rigContext:    "fixture",
+			wantQN:        "core.control-dispatcher",
+			wantOK:        true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := PreferredDeterministicControlDispatcher(&City{Agents: tt.agents}, tt.rigContext)
+			got, ok := PreferredDeterministicControlDispatcher(&City{Agents: tt.agents, NamedSessions: tt.namedSessions}, tt.rigContext)
 			if ok != tt.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
 			}

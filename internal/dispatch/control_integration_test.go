@@ -1340,7 +1340,168 @@ func TestApplyAttemptControlStepRoute_RejectsMissingOwningStoreDispatcher(t *tes
 	}
 }
 
+func TestApplyAttemptControlStepRoute_PrefersResidentRigScoped(t *testing.T) {
+	t.Parallel()
+
+	maxActive := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "atlas-like-city"},
+		Daemon:    config.DaemonConfig{FormulaV2: boolPtr(true)},
+		Rigs: []config.Rig{{
+			Name: "fixture",
+			Path: t.TempDir(),
+		}},
+		Agents: []config.Agent{{
+			Name:              config.ControlDispatcherAgentName,
+			BindingName:       "core",
+			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+			ProcessNames:      []string{"gc"},
+			MaxActiveSessions: &maxActive,
+		}, {
+			Name:              config.ControlDispatcherAgentName,
+			BindingName:       "core",
+			Dir:               "fixture",
+			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+			ProcessNames:      []string{"gc"},
+			MaxActiveSessions: &maxActive,
+		}, {
+			Name: "superpowers.brainstorming",
+			Dir:  "fixture",
+		}},
+		NamedSessions: []config.NamedSession{
+			{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"},
+		},
+	}
+
+	step := &formula.RecipeStep{
+		Metadata: map[string]string{
+			"gc.routed_to": "stale-route",
+		},
+	}
+	if err := applyAttemptControlStepRoute(step, "fixture/superpowers.brainstorming", cfg, beads.NewMemStore()); err != nil {
+		t.Fatalf("applyAttemptControlStepRoute: %v", err)
+	}
+
+	if step.Assignee != "" {
+		t.Fatalf("assignee = %q, want empty routed control-dispatcher queue", step.Assignee)
+	}
+	if got := step.Metadata["gc.routed_to"]; got != "fixture/core.control-dispatcher" {
+		t.Fatalf("gc.routed_to = %q, want resident rig dispatcher fixture/core.control-dispatcher", got)
+	}
+	if got := step.Metadata["gc.execution_routed_to"]; got != "fixture/superpowers.brainstorming" {
+		t.Fatalf("gc.execution_routed_to = %q, want fixture/superpowers.brainstorming", got)
+	}
+}
+
 func TestSpawnNextAttemptUsesOwningCityStoreForRigExecution(t *testing.T) {
+	t.Parallel()
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`
+[workspace]
+name = "maintainer-city"
+
+[daemon]
+formula_v2 = true
+
+[[rigs]]
+name = "frontend"
+path = "/tmp/frontend"
+
+[[rigs]]
+name = "backend"
+path = "/tmp/backend"
+
+[[agent]]
+name = "reviewer"
+dir = "frontend"
+
+[[agent]]
+name = "control-dispatcher"
+max_active_sessions = 1
+
+[[agent]]
+name = "control-dispatcher"
+dir = "frontend"
+max_active_sessions = 1
+
+[[agent]]
+name = "reviewer"
+dir = "backend"
+
+[[agent]]
+name = "control-dispatcher"
+dir = "backend"
+max_active_sessions = 1
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+
+	store := beads.NewMemStore()
+	spec := &formula.Step{
+		ID:    "review-loop",
+		Title: "Review loop",
+		Type:  "task",
+		Ralph: &formula.RalphSpec{MaxAttempts: 3},
+		Children: []*formula.Step{
+			{
+				ID:    "review",
+				Title: "Review",
+				Type:  "task",
+				Metadata: map[string]string{
+					"gc.run_target":     "reviewer",
+					"gc.root_store_ref": "rig:frontend",
+				},
+				Retry: &formula.RetrySpec{MaxAttempts: 2},
+			},
+		},
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatalf("marshal step spec: %v", err)
+	}
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "review-loop",
+		Metadata: map[string]string{
+			"gc.kind":                "ralph",
+			"gc.root_bead_id":        root.ID,
+			"gc.step_ref":            "mol-adopt-pr-v2.review-loop",
+			"gc.step_id":             "review-loop",
+			"gc.source_step_spec":    string(specJSON),
+			"gc.control_epoch":       "1",
+			"gc.execution_routed_to": "frontend/reviewer",
+			"gc.root_store_ref":      "city:maintainer-city",
+		},
+	})
+
+	if err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{CityPath: cityPath}); err != nil {
+		t.Fatalf("spawnNextAttempt: %v", err)
+	}
+
+	review := findAttemptByRef(t, store, root.ID, "mol-adopt-pr-v2.review-loop.iteration.2.review")
+	if review.ID == "" {
+		t.Fatal("review child not created")
+	}
+	if got := review.Metadata["gc.execution_routed_to"]; got != "frontend/reviewer" {
+		t.Fatalf("review gc.execution_routed_to = %q, want frontend/reviewer", got)
+	}
+	if got := review.Metadata["gc.routed_to"]; got != "control-dispatcher" {
+		t.Fatalf("review gc.routed_to = %q, want owning city-store route control-dispatcher", got)
+	}
+	if got := review.Metadata["gc.root_store_ref"]; got != "city:maintainer-city" {
+		t.Fatalf("review gc.root_store_ref = %q, want authoritative parent store city:maintainer-city", got)
+	}
+	if review.Assignee != "" {
+		t.Fatalf("review assignee = %q, want empty routed control-dispatcher queue", review.Assignee)
+	}
+}
+
+func TestSpawnNextAttemptUsesSourceRigForBareChildControlRoute(t *testing.T) {
 	t.Parallel()
 
 	cityPath := t.TempDir()

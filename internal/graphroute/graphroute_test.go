@@ -899,9 +899,61 @@ func TestControlDispatcherBinding_UsesDispatcherForGraphScope(t *testing.T) {
 	}
 }
 
-// TestControlDispatcherBinding_CityOnlyBoundDispatcher covers a config with
-// only the bound city dispatcher. It resolves city graphs but fails loudly for
-// rig graphs instead of routing rig-store control work to the city store.
+// TestControlDispatcherBinding_PrefersResidentRigScoped is the multi-store
+// (atlas) counterpart to PrefersCitySingletonOverRigScoped: the SAME city, but
+// the rig-scoped dispatcher is pinned RESIDENT by a [[named_session]]
+// mode="always". A resident rig dispatcher runs and serves its own rig store, so
+// a rig-scope (rigContext="fixture") control bead must route to it — while a
+// city-scope (rigContext="") bead still routes to the singleton.
+func TestControlDispatcherBinding_PrefersResidentRigScoped(t *testing.T) {
+	maxActive := 1
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{
+				Name:              config.ControlDispatcherAgentName,
+				BindingName:       "core",
+				StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+				MaxActiveSessions: &maxActive,
+			},
+			{
+				Name:              config.ControlDispatcherAgentName,
+				BindingName:       "core",
+				Dir:               "fixture",
+				StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+				MaxActiveSessions: &maxActive,
+			},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"},
+		},
+	}
+
+	cases := map[string]string{
+		"fixture": "fixture/core.control-dispatcher", // rig scope → resident rig dispatcher
+		"":        "core.control-dispatcher",         // city scope → singleton
+	}
+	for rigContext, wantQN := range cases {
+		t.Run("rigContext="+rigContext, func(t *testing.T) {
+			binding, err := ControlDispatcherBinding(nil, "test-city", cfg, rigContext, Deps{Resolver: noMatchAgentResolver{}})
+			if err != nil {
+				t.Fatalf("ControlDispatcherBinding: %v", err)
+			}
+			if binding.QualifiedName != wantQN {
+				t.Fatalf("QualifiedName = %q, want %q", binding.QualifiedName, wantQN)
+			}
+			if !binding.MetadataOnly {
+				t.Fatalf("MetadataOnly = false, want true")
+			}
+		})
+	}
+}
+
+// TestControlDispatcherBinding_CityOnlyBoundDispatcher covers a city with only
+// the bound city-level singleton (no per-rig copies). It must resolve for both
+// the empty and a non-empty rig context, and must NOT depend on bare-name
+// matching: AgentMatchesIdentity rejects the bare "control-dispatcher" for a
+// bound agent, so a resolver that only does qualified-name matching returns no
+// match — the binding-agnostic deterministic lookup must still succeed.
 func TestControlDispatcherBinding_CityOnlyBoundDispatcher(t *testing.T) {
 	maxActive := 1
 	dispatcher := config.Agent{
