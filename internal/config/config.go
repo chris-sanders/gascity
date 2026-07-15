@@ -126,18 +126,12 @@ func PreferredDeterministicControlDispatcher(cfg *City, rigContext string) (Agen
 			rigScoped, haveRig = a, true
 		}
 	}
-	// (1) A resident rig-scoped dispatcher runs and serves that rig's own prefix
-	// store; its rig-store control beads must route to it (the singleton can
-	// never claim a <rig>/... route in that store). This is the multi-store case.
-	if haveRig && controlDispatcherIsResident(cfg, &rigScoped) {
-		return rigScoped, true
+	if resident, ok := ResidentRigControlDispatcher(cfg, rigContext); ok {
+		return resident, true
 	}
-	// (2) Otherwise the city-level singleton — the session that runs given the
-	// shipped pack's max_active_sessions=1. Preserves the #3764 unpinned shape.
 	if haveCity {
 		return citySingleton, true
 	}
-	// (3) Rig-scoped fallback only when no city-level dispatcher exists at all.
 	if haveRig {
 		return rigScoped, true
 	}
@@ -163,28 +157,48 @@ func ControlDispatcherForScope(cfg *City, rigContext string) (Agent, bool) {
 	return Agent{}, false
 }
 
-// controlDispatcherIsResident reports whether a control-dispatcher agent is kept
-// live by the controller — pinned by a [[named_session]] mode="always" bound to
-// it (the same TemplateQualifiedName↔QualifiedName correlation validateNamedSessions
-// uses) or carrying a min_active_sessions>=1 floor. Only a resident rig-scoped
-// dispatcher is a session that actually runs and serves its rig's own prefix bead
-// store, so only then may a rig-store control bead route to it instead of the
-// city singleton.
-func controlDispatcherIsResident(cfg *City, agent *Agent) bool {
-	if cfg == nil || agent == nil {
-		return false
+// ResidentRigControlDispatcher returns the rig-scoped deterministic control
+// dispatcher for rigName when configuration actually keeps a session alive
+// for it: min_active_sessions >= 1 on the rig-scoped dispatcher agent, or a
+// [[named_session]] with mode="always" whose backing template resolves (the
+// same FindAgent correlation validateNamedSessions uses) to that rig's
+// dispatcher. This is the residency predicate that partitions rig-store
+// control-bead serving: a resident rig dispatcher exclusively serves its
+// rig store, and the city singleton's serve loop skips that store, so the
+// same control bead can never be visible to two serve loops. A
+// configured-but-idle rig-scoped copy (no pin) is NOT resident — routing
+// to it or reserving its store for it would strand control beads with no
+// live session to claim them (the #3764 failure mode).
+func ResidentRigControlDispatcher(cfg *City, rigName string) (Agent, bool) {
+	if cfg == nil {
+		return Agent{}, false
 	}
-	if agent.MinActiveSessions != nil && *agent.MinActiveSessions >= 1 {
-		return true
+	rigName = strings.TrimSpace(rigName)
+	if rigName == "" {
+		return Agent{}, false
 	}
-	qn := agent.QualifiedName()
-	for i := range cfg.NamedSessions {
-		ns := &cfg.NamedSessions[i]
-		if ns.ModeOrDefault() == "always" && ns.TemplateQualifiedName() == qn {
-			return true
+	for _, a := range cfg.Agents {
+		if !IsDeterministicControlDispatcher(&a) || strings.TrimSpace(a.Dir) != rigName {
+			continue
+		}
+		if a.EffectiveMinActiveSessions() >= 1 {
+			return a, true
 		}
 	}
-	return false
+	for i := range cfg.NamedSessions {
+		s := &cfg.NamedSessions[i]
+		if s.ModeOrDefault() != "always" || strings.TrimSpace(s.Dir) != rigName {
+			continue
+		}
+		backing := FindAgent(cfg, s.TemplateQualifiedName())
+		if backing == nil || !IsDeterministicControlDispatcher(backing) {
+			continue
+		}
+		if strings.TrimSpace(backing.Dir) == rigName {
+			return *backing, true
+		}
+	}
+	return Agent{}, false
 }
 
 // BindingQualifiedName returns the binding-qualified agent identity without a
