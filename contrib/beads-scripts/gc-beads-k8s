@@ -362,6 +362,15 @@ case "$op" in
     description=$(echo "$input" | jq -r '.description // empty')
     [ -n "$description" ] && cmd_args+=(--description "$description")
 
+    # Type/status changes must reach bd, or graph.v2 activation silently no-ops:
+    # activateFencedGraphWorkflowBead restores the deferred type via Store.Update
+    # with Type set, but if the wrapper drops it the bead stays type=gate forever
+    # (ready-excluded -> no dispatch). Mirrors the create case which passes --type.
+    new_type=$(echo "$input" | jq -r '.type // empty')
+    [ -n "$new_type" ] && cmd_args+=(--type "$new_type")
+    new_status=$(echo "$input" | jq -r '.status // empty')
+    [ -n "$new_status" ] && cmd_args+=(--status "$new_status")
+
     # Append labels via --add-label (one per flag).
     while IFS= read -r label; do
       [ -n "$label" ] && cmd_args+=(--add-label "$label")
