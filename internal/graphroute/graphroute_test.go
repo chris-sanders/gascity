@@ -297,7 +297,7 @@ func TestDecorateGraphWorkflowRecipe_ControlRouteUsesOwningStoreScope(t *testing
 			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
 			MaxActiveSessions: &maxActive,
 		},
-	}}
+	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
 	recipe := &formula.Recipe{
 		Name: "wf-cross-scope",
 		Steps: []formula.RecipeStep{
@@ -355,7 +355,7 @@ func TestDecorateGraphWorkflowRecipe_OwningStoreDoesNotRetargetExplicitWorkerSte
 			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
 			MaxActiveSessions: &maxOne,
 		},
-	}}
+	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
 	recipe := &formula.Recipe{
 		Name: "wf-cross-scope-target",
 		Steps: []formula.RecipeStep{
@@ -413,7 +413,7 @@ func TestDecorateGraphWorkflowRecipe_RootStampsRoutedToForClaim(t *testing.T) {
 	cfg := &config.City{Agents: []config.Agent{
 		{Name: "mayor", MaxActiveSessions: intPtr(1)},
 		{Name: "control-dispatcher", MaxActiveSessions: intPtr(1)},
-	}}
+	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
 	r := &formula.Recipe{
 		Name: "wf-test",
 		Steps: []formula.RecipeStep{
@@ -871,7 +871,7 @@ func TestControlDispatcherBinding_UsesDispatcherForGraphScope(t *testing.T) {
 			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
 			MaxActiveSessions: &maxActive,
 		},
-	}}
+	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
 
 	for _, tt := range []struct {
 		name       string
@@ -981,8 +981,12 @@ func TestControlDispatcherBinding_CityOnlyBoundDispatcher(t *testing.T) {
 		t.Fatalf("MetadataOnly = false, want true")
 	}
 
-	if _, err := ControlDispatcherBinding(nil, "test-city", cfg, "fixture", Deps{Resolver: noMatchAgentResolver{}}); err == nil {
-		t.Fatal("ControlDispatcherBinding(rig) error = nil, want missing rig dispatcher error")
+	binding, err = ControlDispatcherBinding(nil, "test-city", cfg, "fixture", Deps{Resolver: noMatchAgentResolver{}})
+	if err != nil {
+		t.Fatalf("ControlDispatcherBinding(rig): %v", err)
+	}
+	if binding.QualifiedName != "core.control-dispatcher" {
+		t.Fatalf("rig QualifiedName = %q, want core.control-dispatcher", binding.QualifiedName)
 	}
 }
 

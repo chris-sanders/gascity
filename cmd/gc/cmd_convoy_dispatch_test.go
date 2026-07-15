@@ -6205,7 +6205,8 @@ func TestRunWorkflowServeFollowSurvivesDoltCircuitBreakerOutage(t *testing.T) {
 	}
 
 	agent := config.Agent{Name: config.ControlDispatcherAgentName}
-	err := runWorkflowServeFollow(agent, t.TempDir(), t.TempDir(), agent.EffectiveWorkQuery(), nil, io.Discard)
+	targets := []workflowServeTarget{{storePath: t.TempDir()}}
+	err := runWorkflowServeFollow(agent, t.TempDir(), targets, agent.EffectiveWorkQuery(), io.Discard)
 	if !errors.Is(err, fatalErr) {
 		t.Fatalf("runWorkflowServeFollow err = %v, want fatal error after surviving the breaker outage", err)
 	}

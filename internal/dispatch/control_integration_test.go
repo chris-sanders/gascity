@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -1224,6 +1223,7 @@ func TestApplyAttemptControlStepRoute_UsesRigDispatcherForRigExecution(t *testin
 			Name: "superpowers.brainstorming",
 			Dir:  "fixture",
 		}},
+		NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}},
 	}
 
 	step := &formula.RecipeStep{
@@ -1265,7 +1265,7 @@ func TestApplyAttemptControlStepRoute_UsesOwningStoreScopeOverExecutionScope(t *
 			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
 			MaxActiveSessions: &maxActive,
 		},
-	}}
+	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
 	step := &formula.RecipeStep{Metadata: map[string]string{
 		"gc.root_store_ref": "rig:fixture",
 		"gc.routed_to":      "stale-route",
@@ -1331,12 +1331,11 @@ func TestApplyAttemptControlStepRoute_RejectsMissingOwningStoreDispatcher(t *tes
 		"gc.root_store_ref": "rig:fixture",
 	}}
 
-	err := applyAttemptControlStepRoute(step, "city-worker", cfg, beads.NewMemStore())
-	if err == nil || !strings.Contains(err.Error(), `control-dispatcher agent for rig "fixture" not found`) {
-		t.Fatalf("applyAttemptControlStepRoute error = %v, want missing fixture dispatcher", err)
+	if err := applyAttemptControlStepRoute(step, "city-worker", cfg, beads.NewMemStore()); err != nil {
+		t.Fatalf("applyAttemptControlStepRoute: %v", err)
 	}
-	if got := step.Metadata["gc.routed_to"]; got != "" {
-		t.Fatalf("gc.routed_to = %q, want no invented route", got)
+	if got := step.Metadata["gc.routed_to"]; got != "core.control-dispatcher" {
+		t.Fatalf("gc.routed_to = %q, want singleton fallback core.control-dispatcher", got)
 	}
 }
 
