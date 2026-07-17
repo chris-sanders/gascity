@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 const (
@@ -367,11 +368,20 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 				Name: "city", MountPath: "/city-stage",
 			})
 		}
+		// Create the container WorkingDir before the main container's runtime
+		// chdir (which happens before the entrypoint, so pre_start cannot). A
+		// per-bead pool/workflow workDir (<rig>/<beadID>-<slug>) is otherwise
+		// never created and chdir fails at startup. Downstream patch; drop when
+		// upstream creates a configured WorkingDir before container start.
+		initCmd := fmt.Sprintf(
+			"mkdir -p %s && while [ ! -f /workspace/.gc-ready ]; do sleep 0.5; done",
+			shellquote.Quote(podWorkDir),
+		)
 		pod.Spec.InitContainers = []corev1.Container{{
 			Name:            "stage",
 			Image:           p.image,
 			ImagePullPolicy: corev1.PullIfNotPresent,
-			Command:         []string{"sh", "-c", "while [ ! -f /workspace/.gc-ready ]; do sleep 0.5; done"},
+			Command:         []string{"sh", "-c", initCmd},
 			VolumeMounts:    initVolMounts,
 		}}
 	}
