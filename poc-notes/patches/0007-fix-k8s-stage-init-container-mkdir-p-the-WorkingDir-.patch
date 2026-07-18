@@ -1,0 +1,56 @@
+From b885da6390702d50cedccdc70e30b28d1c79ab0b Mon Sep 17 00:00:00 2001
+From: Chris Sanders <sanders.chris@gmail.com>
+Date: Fri, 17 Jul 2026 18:13:14 +0000
+Subject: [PATCH 7/8] fix(k8s): stage init container mkdir -p the WorkingDir
+ before main container start
+
+Pool/workflow step workers get a per-bead WorkingDir (<rig>/<beadID>-<slug>,
+poolTriggerWorkDir) that nothing creates: stageFiles skips it (no controller-side
+source dir) and pre_start runs too late (container runtime chdir to WorkingDir
+happens before the entrypoint). The container dies at startup 'chdir to cwd ...
+no such file or directory'. The stage init container shares the ws volume and
+completes before the main container, so mkdir -p there guarantees the cwd exists.
+
+Downstream POC patch (Draft 13); removal condition = upstream creates a
+configured WorkingDir before container start.
+---
+ internal/runtime/k8s/pod.go | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/internal/runtime/k8s/pod.go b/internal/runtime/k8s/pod.go
+index f56b04557..b4bb53909 100644
+--- a/internal/runtime/k8s/pod.go
++++ b/internal/runtime/k8s/pod.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/gastownhall/gascity/internal/citylayout"
+ 	"github.com/gastownhall/gascity/internal/pathutil"
+ 	"github.com/gastownhall/gascity/internal/runtime"
++	"github.com/gastownhall/gascity/internal/shellquote"
+ )
+ 
+ const (
+@@ -367,11 +368,20 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
+ 				Name: "city", MountPath: "/city-stage",
+ 			})
+ 		}
++		// Create the container WorkingDir before the main container's runtime
++		// chdir (which happens before the entrypoint, so pre_start cannot). A
++		// per-bead pool/workflow workDir (<rig>/<beadID>-<slug>) is otherwise
++		// never created and chdir fails at startup. Downstream patch; drop when
++		// upstream creates a configured WorkingDir before container start.
++		initCmd := fmt.Sprintf(
++			"mkdir -p %s && while [ ! -f /workspace/.gc-ready ]; do sleep 0.5; done",
++			shellquote.Quote(podWorkDir),
++		)
+ 		pod.Spec.InitContainers = []corev1.Container{{
+ 			Name:            "stage",
+ 			Image:           p.image,
+ 			ImagePullPolicy: corev1.PullIfNotPresent,
+-			Command:         []string{"sh", "-c", "while [ ! -f /workspace/.gc-ready ]; do sleep 0.5; done"},
++			Command:         []string{"sh", "-c", initCmd},
+ 			VolumeMounts:    initVolMounts,
+ 		}}
+ 	}
+-- 
+2.30.2
+

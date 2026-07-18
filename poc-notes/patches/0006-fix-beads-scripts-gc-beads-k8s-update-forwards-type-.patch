@@ -1,0 +1,34 @@
+From ebca0ba169d01113bd5a6d8e21be3ba0b8710b46 Mon Sep 17 00:00:00 2001
+From: Chris Sanders <sanders.chris@gmail.com>
+Date: Wed, 15 Jul 2026 23:38:03 +0000
+Subject: [PATCH 6/8] fix(beads-scripts): gc-beads-k8s update forwards
+ --type/--status (graph.v2 step type-restore; else steps stuck type=gate).
+ Shim patch #5, baked into controller image
+
+---
+ contrib/beads-scripts/gc-beads-k8s | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/contrib/beads-scripts/gc-beads-k8s b/contrib/beads-scripts/gc-beads-k8s
+index 3a1162214..63a8239ef 100755
+--- a/contrib/beads-scripts/gc-beads-k8s
++++ b/contrib/beads-scripts/gc-beads-k8s
+@@ -362,6 +362,15 @@ case "$op" in
+     description=$(echo "$input" | jq -r '.description // empty')
+     [ -n "$description" ] && cmd_args+=(--description "$description")
+ 
++    # Type/status changes must reach bd, or graph.v2 activation silently no-ops:
++    # activateFencedGraphWorkflowBead restores the deferred type via Store.Update
++    # with Type set, but if the wrapper drops it the bead stays type=gate forever
++    # (ready-excluded -> no dispatch). Mirrors the create case which passes --type.
++    new_type=$(echo "$input" | jq -r '.type // empty')
++    [ -n "$new_type" ] && cmd_args+=(--type "$new_type")
++    new_status=$(echo "$input" | jq -r '.status // empty')
++    [ -n "$new_status" ] && cmd_args+=(--status "$new_status")
++
+     # Append labels via --add-label (one per flag).
+     while IFS= read -r label; do
+       [ -n "$label" ] && cmd_args+=(--add-label "$label")
+-- 
+2.30.2
+

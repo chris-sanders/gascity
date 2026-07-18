@@ -1,0 +1,40 @@
+From 02f8d743cab52116f668ea8eb641ba570ad12963 Mon Sep 17 00:00:00 2001
+From: Chris Sanders <sanders.chris@gmail.com>
+Date: Sat, 18 Jul 2026 15:34:05 +0000
+Subject: [PATCH 8/8] fix(reconciler): stop the mismatched runtime on
+ pending-create rollback
+
+When a pending-create is rolled back because the live runtime under the session
+name carries a different identity token ('live runtime belongs to another
+session'), the reconciler closed the bead but left the runtime alive. On k8s a
+pool worker runs a sleep-infinity pod that outlives the rolled-back create, so
+this leaked an orphaned, unnudged pod that never reaps. Add sp.Stop(name) at the
+rollback site. Safe: pool-instance session names are unique, so Stop(name)
+targets only the orphan. Downstream POC patch (Draft 15); drop when upstream
+stops the mismatched runtime on rollback.
+---
+ cmd/gc/session_reconciler.go | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/cmd/gc/session_reconciler.go b/cmd/gc/session_reconciler.go
+index e85b76dd3..871a72b71 100644
+--- a/cmd/gc/session_reconciler.go
++++ b/cmd/gc/session_reconciler.go
+@@ -2110,6 +2110,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
+ 		// TestReconcileSessionBeads_ZombieTerminalErrorReflectedOnSnapshot.
+ 		infoPostZombie := infoByID[id]
+ 		if alive && shouldRollbackPendingCreateInfo(infoPostZombie) && !runningSessionMatchesPendingCreateInfo(infoPostZombie, name, sp) {
++			// Stop the abandoned runtime too, else a k8s pool worker's
++			// sleep-infinity pod outlives the rolled-back create as an orphan
++			// that never reaps. Safe: pool-instance session names are unique, so
++			// Stop(name) only targets this orphan. Downstream patch (Draft 15);
++			// drop when upstream stops the mismatched runtime on rollback.
++			if err := sp.Stop(name); err != nil && !runtime.IsSessionGone(err) {
++				fmt.Fprintf(stderr, "session reconciler: stopping mismatched pending-create runtime %s: %v\n", name, err) //nolint:errcheck
++			}
+ 			// Fold the rollback's mirrored metadata onto the snapshot (Step 6d;
+ 			// no Closed change — store-only close). STEP6-PREPASS-AUDIT group 2.
+ 			tick.apply(id, attemptRollbackPendingCreate(infoByID[id], tp.TemplateName, name, "pending_create_rollback", "live runtime belongs to another session", false))
+-- 
+2.30.2
+

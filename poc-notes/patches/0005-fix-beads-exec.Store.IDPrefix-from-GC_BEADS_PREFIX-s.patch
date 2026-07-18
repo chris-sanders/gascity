@@ -1,0 +1,38 @@
+From 1ced9479cbca9fff7438ddfae085a4dc6cb8dddf Mon Sep 17 00:00:00 2001
+From: Chris Sanders <sanders.chris@gmail.com>
+Date: Wed, 15 Jul 2026 20:39:44 +0000
+Subject: [PATCH 5/8] fix(beads): exec.Store.IDPrefix() from GC_BEADS_PREFIX so
+ caching store keys exec-backed rig stores by prefix (fixes rig=(no-prefix) ->
+ rig scale-check sees routed beads -> direct gc sling <rig>/<agent> scales)
+
+---
+ internal/beads/exec/exec.go | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/internal/beads/exec/exec.go b/internal/beads/exec/exec.go
+index d0927480d..14f80fe5d 100644
+--- a/internal/beads/exec/exec.go
++++ b/internal/beads/exec/exec.go
+@@ -33,6 +33,19 @@ func (s *Store) SetEnv(env map[string]string) {
+ 	s.env = env
+ }
+ 
++// IDPrefix returns the bead ID prefix for this exec-backed scope, taken from
++// the projected GC_BEADS_PREFIX env. NewCachingStore uses this to key the
++// per-scope cache (owner metadata); without it an exec-backed rig store caches
++// as "(no-prefix)" and the reconciler's rig-scoped scale-check cannot associate
++// routed rig beads with the rig pool, so a direct `gc sling <rig>/<agent>` never
++// scales a worker.
++func (s *Store) IDPrefix() string {
++	if s == nil {
++		return ""
++	}
++	return strings.TrimSpace(s.env["GC_BEADS_PREFIX"])
++}
++
+ // NewStore returns a Store that delegates to the given script.
+ // The script path may be absolute, relative, or a bare name resolved via
+ // exec.LookPath.
+-- 
+2.30.2
+

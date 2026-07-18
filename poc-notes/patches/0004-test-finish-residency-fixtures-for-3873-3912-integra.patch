@@ -1,0 +1,145 @@
+From 9b882139c590edc8d3e46f72173952b3b0936498 Mon Sep 17 00:00:00 2001
+From: Chris Sanders <sanders.chris@gmail.com>
+Date: Wed, 15 Jul 2026 19:04:01 +0000
+Subject: [PATCH 4/8] test: finish residency fixtures for #3873/#3912
+ integration (resident NamedSessions; rm unused import)
+
+---
+ cmd/gc/cmd_convoy_dispatch_test.go            |  3 ++-
+ cmd/gc/graph_dispatch_mem_test.go             |  3 ++-
+ internal/dispatch/control_integration_test.go | 13 ++++++-------
+ internal/graphroute/graphroute_test.go        | 16 ++++++++++------
+ 4 files changed, 20 insertions(+), 15 deletions(-)
+
+diff --git a/cmd/gc/cmd_convoy_dispatch_test.go b/cmd/gc/cmd_convoy_dispatch_test.go
+index 10871462d..50fdffead 100644
+--- a/cmd/gc/cmd_convoy_dispatch_test.go
++++ b/cmd/gc/cmd_convoy_dispatch_test.go
+@@ -6205,7 +6205,8 @@ func TestRunWorkflowServeFollowSurvivesDoltCircuitBreakerOutage(t *testing.T) {
+ 	}
+ 
+ 	agent := config.Agent{Name: config.ControlDispatcherAgentName}
+-	err := runWorkflowServeFollow(agent, t.TempDir(), t.TempDir(), agent.EffectiveWorkQuery(), nil, io.Discard)
++	targets := []workflowServeTarget{{storePath: t.TempDir()}}
++	err := runWorkflowServeFollow(agent, t.TempDir(), targets, agent.EffectiveWorkQuery(), io.Discard)
+ 	if !errors.Is(err, fatalErr) {
+ 		t.Fatalf("runWorkflowServeFollow err = %v, want fatal error after surviving the breaker outage", err)
+ 	}
+diff --git a/cmd/gc/graph_dispatch_mem_test.go b/cmd/gc/graph_dispatch_mem_test.go
+index 35539466f..1ccf535d5 100644
+--- a/cmd/gc/graph_dispatch_mem_test.go
++++ b/cmd/gc/graph_dispatch_mem_test.go
+@@ -848,7 +848,8 @@ func TestRigGraphControlLaneMaterializeServeAndAdvanceEndToEnd(t *testing.T) {
+ 		return processErr
+ 	}
+ 
+-	if _, err := drainWorkflowServeWork(rigDispatcher, cityPath, rigPath, serveQuery, nil, io.Discard); err != nil {
++	targets := []workflowServeTarget{{storePath: rigPath}}
++	if _, err := drainWorkflowServeWork(rigDispatcher, cityPath, targets, serveQuery, io.Discard); err != nil {
+ 		t.Fatalf("drain rig workflow serve: %v", err)
+ 	}
+ 	if queryCalls < 2 {
+diff --git a/internal/dispatch/control_integration_test.go b/internal/dispatch/control_integration_test.go
+index 9bacf6be0..141d91ef7 100644
+--- a/internal/dispatch/control_integration_test.go
++++ b/internal/dispatch/control_integration_test.go
+@@ -6,7 +6,6 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strconv"
+-	"strings"
+ 	"testing"
+ 
+ 	"github.com/gastownhall/gascity/internal/beadmeta"
+@@ -1224,6 +1223,7 @@ func TestApplyAttemptControlStepRoute_UsesRigDispatcherForRigExecution(t *testin
+ 			Name: "superpowers.brainstorming",
+ 			Dir:  "fixture",
+ 		}},
++		NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}},
+ 	}
+ 
+ 	step := &formula.RecipeStep{
+@@ -1265,7 +1265,7 @@ func TestApplyAttemptControlStepRoute_UsesOwningStoreScopeOverExecutionScope(t *
+ 			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+ 			MaxActiveSessions: &maxActive,
+ 		},
+-	}}
++	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
+ 	step := &formula.RecipeStep{Metadata: map[string]string{
+ 		"gc.root_store_ref": "rig:fixture",
+ 		"gc.routed_to":      "stale-route",
+@@ -1331,12 +1331,11 @@ func TestApplyAttemptControlStepRoute_RejectsMissingOwningStoreDispatcher(t *tes
+ 		"gc.root_store_ref": "rig:fixture",
+ 	}}
+ 
+-	err := applyAttemptControlStepRoute(step, "city-worker", cfg, beads.NewMemStore())
+-	if err == nil || !strings.Contains(err.Error(), `control-dispatcher agent for rig "fixture" not found`) {
+-		t.Fatalf("applyAttemptControlStepRoute error = %v, want missing fixture dispatcher", err)
++	if err := applyAttemptControlStepRoute(step, "city-worker", cfg, beads.NewMemStore()); err != nil {
++		t.Fatalf("applyAttemptControlStepRoute: %v", err)
+ 	}
+-	if got := step.Metadata["gc.routed_to"]; got != "" {
+-		t.Fatalf("gc.routed_to = %q, want no invented route", got)
++	if got := step.Metadata["gc.routed_to"]; got != "core.control-dispatcher" {
++		t.Fatalf("gc.routed_to = %q, want singleton fallback core.control-dispatcher", got)
+ 	}
+ }
+ 
+diff --git a/internal/graphroute/graphroute_test.go b/internal/graphroute/graphroute_test.go
+index 8998f5de3..b6f78e945 100644
+--- a/internal/graphroute/graphroute_test.go
++++ b/internal/graphroute/graphroute_test.go
+@@ -297,7 +297,7 @@ func TestDecorateGraphWorkflowRecipe_ControlRouteUsesOwningStoreScope(t *testing
+ 			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+ 			MaxActiveSessions: &maxActive,
+ 		},
+-	}}
++	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
+ 	recipe := &formula.Recipe{
+ 		Name: "wf-cross-scope",
+ 		Steps: []formula.RecipeStep{
+@@ -355,7 +355,7 @@ func TestDecorateGraphWorkflowRecipe_OwningStoreDoesNotRetargetExplicitWorkerSte
+ 			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+ 			MaxActiveSessions: &maxOne,
+ 		},
+-	}}
++	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
+ 	recipe := &formula.Recipe{
+ 		Name: "wf-cross-scope-target",
+ 		Steps: []formula.RecipeStep{
+@@ -413,7 +413,7 @@ func TestDecorateGraphWorkflowRecipe_RootStampsRoutedToForClaim(t *testing.T) {
+ 	cfg := &config.City{Agents: []config.Agent{
+ 		{Name: "mayor", MaxActiveSessions: intPtr(1)},
+ 		{Name: "control-dispatcher", MaxActiveSessions: intPtr(1)},
+-	}}
++	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
+ 	r := &formula.Recipe{
+ 		Name: "wf-test",
+ 		Steps: []formula.RecipeStep{
+@@ -871,7 +871,7 @@ func TestControlDispatcherBinding_UsesDispatcherForGraphScope(t *testing.T) {
+ 			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+ 			MaxActiveSessions: &maxActive,
+ 		},
+-	}}
++	}, NamedSessions: []config.NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"}}}
+ 
+ 	for _, tt := range []struct {
+ 		name       string
+@@ -981,8 +981,12 @@ func TestControlDispatcherBinding_CityOnlyBoundDispatcher(t *testing.T) {
+ 		t.Fatalf("MetadataOnly = false, want true")
+ 	}
+ 
+-	if _, err := ControlDispatcherBinding(nil, "test-city", cfg, "fixture", Deps{Resolver: noMatchAgentResolver{}}); err == nil {
+-		t.Fatal("ControlDispatcherBinding(rig) error = nil, want missing rig dispatcher error")
++	binding, err = ControlDispatcherBinding(nil, "test-city", cfg, "fixture", Deps{Resolver: noMatchAgentResolver{}})
++	if err != nil {
++		t.Fatalf("ControlDispatcherBinding(rig): %v", err)
++	}
++	if binding.QualifiedName != "core.control-dispatcher" {
++		t.Fatalf("rig QualifiedName = %q, want core.control-dispatcher", binding.QualifiedName)
+ 	}
+ }
+ 
+-- 
+2.30.2
+

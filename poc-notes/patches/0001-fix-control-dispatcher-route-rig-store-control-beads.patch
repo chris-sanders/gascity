@@ -1,0 +1,492 @@
+From bfe98051ed64fe2bb25c0ab0886d149dd24c08c6 Mon Sep 17 00:00:00 2001
+From: Chris Sanders <sanders.chris@gmail.com>
+Date: Wed, 15 Jul 2026 04:22:40 +0000
+Subject: [PATCH 1/8] fix(control-dispatcher): route rig-store control beads to
+ resident dispatcher
+
+---
+ internal/config/config.go                     |  78 +++++++--
+ internal/config/config_test.go                |  82 +++++++--
+ internal/dispatch/control_integration_test.go | 161 ++++++++++++++++++
+ internal/graphroute/graphroute_test.go        |  58 ++++++-
+ 4 files changed, 354 insertions(+), 25 deletions(-)
+
+diff --git a/internal/config/config.go b/internal/config/config.go
+index e86bc6f95..90094a40b 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -91,32 +91,62 @@ func IsDeterministicControlDispatcher(agent *Agent) bool {
+ }
+ 
+ // PreferredDeterministicControlDispatcher returns the deterministic control-
+-// dispatcher for a scope, binding-agnostic. A city graph (empty rigContext)
+-// selects the city dispatcher; a rig graph selects only the dispatcher expanded
+-// for that rig. This keeps the route identity aligned with the store that owns
+-// the graph. It is the canonical selection shared by graph.v2 decoration and
+-// attempt-time control re-routing; keep those paths in lockstep.
++// dispatcher to route a scope's control beads to, binding-agnostic. A RESIDENT
++// rig-scoped instance (Dir == rigContext, kept live by a [[named_session]]
++// mode="always" or a min_active_sessions>=1 floor) is preferred when one exists:
++// it is the session that actually runs and serves that rig's OWN prefix bead
++// store, so a control bead living in that store can only be claimed there — never
++// by the city singleton, which serves the city (HQ) store. Otherwise the
++// city-level singleton (Dir == "") is preferred — given the shipped pack's
++// max_active_sessions=1 it is the one session that runs and claims the control
++// queue, and routing a rig-store bead to a NON-resident rig copy (configured but
++// never launched) would strand it (the #3764/#3765 shape). A rig-scoped copy is
++// used as a last resort only when no city-level dispatcher is configured. This is
++// the canonical selection shared by the graph.v2 decoration path
++// (internal/graphroute) and the attempt-time control re-route path
++// (internal/dispatch); keep them in lockstep.
+ func PreferredDeterministicControlDispatcher(cfg *City, rigContext string) (Agent, bool) {
+ 	if cfg == nil {
+ 		return Agent{}, false
+ 	}
+ 	rigContext = strings.TrimSpace(rigContext)
++	var citySingleton, rigScoped Agent
++	haveCity, haveRig := false, false
+ 	for _, a := range cfg.Agents {
+ 		if !IsDeterministicControlDispatcher(&a) {
+ 			continue
+ 		}
+-		if strings.TrimSpace(a.Dir) == rigContext {
+-			return a, true
++		if strings.TrimSpace(a.Dir) == "" {
++			if !haveCity {
++				citySingleton, haveCity = a, true
++			}
++			continue
++		}
++		if !haveRig && rigContext != "" && strings.TrimSpace(a.Dir) == rigContext {
++			rigScoped, haveRig = a, true
+ 		}
+ 	}
++	// (1) A resident rig-scoped dispatcher runs and serves that rig's own prefix
++	// store; its rig-store control beads must route to it (the singleton can
++	// never claim a <rig>/... route in that store). This is the multi-store case.
++	if haveRig && controlDispatcherIsResident(cfg, &rigScoped) {
++		return rigScoped, true
++	}
++	// (2) Otherwise the city-level singleton — the session that runs given the
++	// shipped pack's max_active_sessions=1. Preserves the #3764 unpinned shape.
++	if haveCity {
++		return citySingleton, true
++	}
++	// (3) Rig-scoped fallback only when no city-level dispatcher exists at all.
++	if haveRig {
++		return rigScoped, true
++	}
+ 	return Agent{}, false
+ }
+ 
+-// ControlDispatcherForScope returns the configured control dispatcher whose
+-// directory exactly matches rigContext. Deterministic dispatchers are preferred,
+-// while an exact-scope plain dispatcher remains supported for minimal/custom
+-// configs. It never substitutes a city dispatcher for a rig scope (or vice
+-// versa), because those dispatchers read different bead stores.
++// ControlDispatcherForScope returns the configured control dispatcher for the
++// scope. Deterministic dispatchers use the resident rig/city selection rules;
++// an exact-scope plain dispatcher remains supported for minimal/custom configs.
+ func ControlDispatcherForScope(cfg *City, rigContext string) (Agent, bool) {
+ 	if dispatcher, ok := PreferredDeterministicControlDispatcher(cfg, rigContext); ok {
+ 		return dispatcher, true
+@@ -133,6 +163,30 @@ func ControlDispatcherForScope(cfg *City, rigContext string) (Agent, bool) {
+ 	return Agent{}, false
+ }
+ 
++// controlDispatcherIsResident reports whether a control-dispatcher agent is kept
++// live by the controller — pinned by a [[named_session]] mode="always" bound to
++// it (the same TemplateQualifiedName↔QualifiedName correlation validateNamedSessions
++// uses) or carrying a min_active_sessions>=1 floor. Only a resident rig-scoped
++// dispatcher is a session that actually runs and serves its rig's own prefix bead
++// store, so only then may a rig-store control bead route to it instead of the
++// city singleton.
++func controlDispatcherIsResident(cfg *City, agent *Agent) bool {
++	if cfg == nil || agent == nil {
++		return false
++	}
++	if agent.MinActiveSessions != nil && *agent.MinActiveSessions >= 1 {
++		return true
++	}
++	qn := agent.QualifiedName()
++	for i := range cfg.NamedSessions {
++		ns := &cfg.NamedSessions[i]
++		if ns.ModeOrDefault() == "always" && ns.TemplateQualifiedName() == qn {
++			return true
++		}
++	}
++	return false
++}
++
+ // BindingQualifiedName returns the binding-qualified agent identity without a
+ // rig prefix. Examples: "polecat", "gastown.polecat", or "gastown.mayor".
+ func (a *Agent) BindingQualifiedName() string {
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index 7f59c9fd5..6d14a710a 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -7877,18 +7877,31 @@ func TestPreferredDeterministicControlDispatcher(t *testing.T) {
+ 	rigCopy := deterministic("fixture")
+ 	plain := Agent{Name: ControlDispatcherAgentName, Dir: "fixture"} // no StartCommand
+ 
++	// A rig-scoped dispatcher made RESIDENT by a min_active_sessions>=1 floor.
++	minOne := 1
++	rigCopyMinActive := deterministic("fixture")
++	rigCopyMinActive.MinActiveSessions = &minOne
++
++	// alwaysPin returns a [[named_session]] mode="always" pinning the rig-scoped
++	// core.control-dispatcher for dir; its TemplateQualifiedName matches the agent
++	// QualifiedName "<dir>/core.control-dispatcher", mirroring atlas's city.toml.
++	alwaysPin := func(dir string) NamedSession {
++		return NamedSession{Template: "core.control-dispatcher", Dir: dir, Mode: "always"}
++	}
++
+ 	tests := []struct {
+-		name       string
+-		agents     []Agent
+-		rigContext string
+-		wantQN     string
+-		wantOK     bool
++		name          string
++		agents        []Agent
++		namedSessions []NamedSession
++		rigContext    string
++		wantQN        string
++		wantOK        bool
+ 	}{
+ 		{
+-			name:       "rig copy selected for rig scope",
++			name:       "singleton preferred over NON-resident rig copy for rig scope",
+ 			agents:     []Agent{rigCopy, citySingleton},
+ 			rigContext: "fixture",
+-			wantQN:     "fixture/core.control-dispatcher",
++			wantQN:     "core.control-dispatcher",
+ 			wantOK:     true,
+ 		},
+ 		{
+@@ -7906,10 +7919,11 @@ func TestPreferredDeterministicControlDispatcher(t *testing.T) {
+ 			wantOK:     true,
+ 		},
+ 		{
+-			name:       "city dispatcher does not satisfy rig scope",
++			name:       "city dispatcher satisfies rig scope when no resident rig dispatcher exists",
+ 			agents:     []Agent{citySingleton},
+ 			rigContext: "fixture",
+-			wantOK:     false,
++			wantQN:     "core.control-dispatcher",
++			wantOK:     true,
+ 		},
+ 		{
+ 			name:       "no match when only a non-deterministic dispatcher exists",
+@@ -7923,11 +7937,59 @@ func TestPreferredDeterministicControlDispatcher(t *testing.T) {
+ 			rigContext: "other",
+ 			wantOK:     false,
+ 		},
++		{
++			// Multi-store city (atlas): the rig dispatcher is pinned always-on,
++			// so it runs + serves its own rig store — its control beads route to
++			// it, not the singleton (which cannot claim a <rig>/... route).
++			name:          "RESIDENT rig copy (named_session always) preferred for its rig scope",
++			agents:        []Agent{rigCopy, citySingleton},
++			namedSessions: []NamedSession{alwaysPin("fixture")},
++			rigContext:    "fixture",
++			wantQN:        "fixture/core.control-dispatcher",
++			wantOK:        true,
++		},
++		{
++			name:       "RESIDENT rig copy (min_active_sessions>=1) preferred for its rig scope",
++			agents:     []Agent{rigCopyMinActive, citySingleton},
++			rigContext: "fixture",
++			wantQN:     "fixture/core.control-dispatcher",
++			wantOK:     true,
++		},
++		{
++			// Residency must not leak into city-scope work: a pinned rig
++			// dispatcher does NOT capture rigContext=="" (run-operator-city).
++			name:          "resident rig copy still yields singleton for empty scope",
++			agents:        []Agent{rigCopy, citySingleton},
++			namedSessions: []NamedSession{alwaysPin("fixture")},
++			rigContext:    "",
++			wantQN:        "core.control-dispatcher",
++			wantOK:        true,
++		},
++		{
++			// on_demand pinning does NOT make the rig dispatcher resident (only
++			// the singleton runs given max_active_sessions=1) — singleton wins.
++			name:          "on_demand-pinned rig copy is NOT resident — singleton wins",
++			agents:        []Agent{rigCopy, citySingleton},
++			namedSessions: []NamedSession{{Template: "core.control-dispatcher", Dir: "fixture", Mode: "on_demand"}},
++			rigContext:    "fixture",
++			wantQN:        "core.control-dispatcher",
++			wantOK:        true,
++		},
++		{
++			// A pin for a DIFFERENT rig does not make THIS rig's dispatcher
++			// resident (the QualifiedName correlation is rig-specific).
++			name:          "always-pin for another rig does not make this rig resident",
++			agents:        []Agent{rigCopy, citySingleton},
++			namedSessions: []NamedSession{alwaysPin("other")},
++			rigContext:    "fixture",
++			wantQN:        "core.control-dispatcher",
++			wantOK:        true,
++		},
+ 	}
+ 
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			got, ok := PreferredDeterministicControlDispatcher(&City{Agents: tt.agents}, tt.rigContext)
++			got, ok := PreferredDeterministicControlDispatcher(&City{Agents: tt.agents, NamedSessions: tt.namedSessions}, tt.rigContext)
+ 			if ok != tt.wantOK {
+ 				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+ 			}
+diff --git a/internal/dispatch/control_integration_test.go b/internal/dispatch/control_integration_test.go
+index 222f1498e..9bacf6be0 100644
+--- a/internal/dispatch/control_integration_test.go
++++ b/internal/dispatch/control_integration_test.go
+@@ -1340,6 +1340,59 @@ func TestApplyAttemptControlStepRoute_RejectsMissingOwningStoreDispatcher(t *tes
+ 	}
+ }
+ 
++func TestApplyAttemptControlStepRoute_PrefersResidentRigScoped(t *testing.T) {
++	t.Parallel()
++
++	maxActive := 1
++	cfg := &config.City{
++		Workspace: config.Workspace{Name: "atlas-like-city"},
++		Daemon:    config.DaemonConfig{FormulaV2: boolPtr(true)},
++		Rigs: []config.Rig{{
++			Name: "fixture",
++			Path: t.TempDir(),
++		}},
++		Agents: []config.Agent{{
++			Name:              config.ControlDispatcherAgentName,
++			BindingName:       "core",
++			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
++			ProcessNames:      []string{"gc"},
++			MaxActiveSessions: &maxActive,
++		}, {
++			Name:              config.ControlDispatcherAgentName,
++			BindingName:       "core",
++			Dir:               "fixture",
++			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
++			ProcessNames:      []string{"gc"},
++			MaxActiveSessions: &maxActive,
++		}, {
++			Name: "superpowers.brainstorming",
++			Dir:  "fixture",
++		}},
++		NamedSessions: []config.NamedSession{
++			{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"},
++		},
++	}
++
++	step := &formula.RecipeStep{
++		Metadata: map[string]string{
++			"gc.routed_to": "stale-route",
++		},
++	}
++	if err := applyAttemptControlStepRoute(step, "fixture/superpowers.brainstorming", cfg, beads.NewMemStore()); err != nil {
++		t.Fatalf("applyAttemptControlStepRoute: %v", err)
++	}
++
++	if step.Assignee != "" {
++		t.Fatalf("assignee = %q, want empty routed control-dispatcher queue", step.Assignee)
++	}
++	if got := step.Metadata["gc.routed_to"]; got != "fixture/core.control-dispatcher" {
++		t.Fatalf("gc.routed_to = %q, want resident rig dispatcher fixture/core.control-dispatcher", got)
++	}
++	if got := step.Metadata["gc.execution_routed_to"]; got != "fixture/superpowers.brainstorming" {
++		t.Fatalf("gc.execution_routed_to = %q, want fixture/superpowers.brainstorming", got)
++	}
++}
++
+ func TestSpawnNextAttemptUsesOwningCityStoreForRigExecution(t *testing.T) {
+ 	t.Parallel()
+ 
+@@ -1448,6 +1501,114 @@ max_active_sessions = 1
+ 	}
+ }
+ 
++func TestSpawnNextAttemptUsesSourceRigForBareChildControlRoute(t *testing.T) {
++	t.Parallel()
++
++	cityPath := t.TempDir()
++	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`
++[workspace]
++name = "maintainer-city"
++
++[daemon]
++formula_v2 = true
++
++[[rigs]]
++name = "frontend"
++path = "/tmp/frontend"
++
++[[rigs]]
++name = "backend"
++path = "/tmp/backend"
++
++[[agent]]
++name = "reviewer"
++dir = "frontend"
++
++[[agent]]
++name = "control-dispatcher"
++max_active_sessions = 1
++
++[[agent]]
++name = "control-dispatcher"
++dir = "frontend"
++max_active_sessions = 1
++
++[[agent]]
++name = "reviewer"
++dir = "backend"
++
++[[agent]]
++name = "control-dispatcher"
++dir = "backend"
++max_active_sessions = 1
++`), 0o644); err != nil {
++		t.Fatalf("write city.toml: %v", err)
++	}
++
++	store := beads.NewMemStore()
++	spec := &formula.Step{
++		ID:    "review-loop",
++		Title: "Review loop",
++		Type:  "task",
++		Ralph: &formula.RalphSpec{MaxAttempts: 3},
++		Children: []*formula.Step{
++			{
++				ID:    "review",
++				Title: "Review",
++				Type:  "task",
++				Metadata: map[string]string{
++					"gc.run_target":     "reviewer",
++					"gc.root_store_ref": "rig:frontend",
++				},
++				Retry: &formula.RetrySpec{MaxAttempts: 2},
++			},
++		},
++	}
++	specJSON, err := json.Marshal(spec)
++	if err != nil {
++		t.Fatalf("marshal step spec: %v", err)
++	}
++
++	root := mustCreate(t, store, beads.Bead{
++		Title:    "workflow",
++		Metadata: map[string]string{"gc.kind": "workflow"},
++	})
++	control := mustCreate(t, store, beads.Bead{
++		Title: "review-loop",
++		Metadata: map[string]string{
++			"gc.kind":                "ralph",
++			"gc.root_bead_id":        root.ID,
++			"gc.step_ref":            "mol-adopt-pr-v2.review-loop",
++			"gc.step_id":             "review-loop",
++			"gc.source_step_spec":    string(specJSON),
++			"gc.control_epoch":       "1",
++			"gc.execution_routed_to": "frontend/reviewer",
++			"gc.root_store_ref":      "city:maintainer-city",
++		},
++	})
++
++	if err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{CityPath: cityPath}); err != nil {
++		t.Fatalf("spawnNextAttempt: %v", err)
++	}
++
++	review := findAttemptByRef(t, store, root.ID, "mol-adopt-pr-v2.review-loop.iteration.2.review")
++	if review.ID == "" {
++		t.Fatal("review child not created")
++	}
++	if got := review.Metadata["gc.execution_routed_to"]; got != "frontend/reviewer" {
++		t.Fatalf("review gc.execution_routed_to = %q, want frontend/reviewer", got)
++	}
++	if got := review.Metadata["gc.routed_to"]; got != "control-dispatcher" {
++		t.Fatalf("review gc.routed_to = %q, want owning city-store route control-dispatcher", got)
++	}
++	if got := review.Metadata["gc.root_store_ref"]; got != "city:maintainer-city" {
++		t.Fatalf("review gc.root_store_ref = %q, want authoritative parent store city:maintainer-city", got)
++	}
++	if review.Assignee != "" {
++		t.Fatalf("review assignee = %q, want empty routed control-dispatcher queue", review.Assignee)
++	}
++}
++
+ func TestApplyAttemptControlStepRoute_MinimalRigScopedDispatcherUsesMetadataRoute(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/internal/graphroute/graphroute_test.go b/internal/graphroute/graphroute_test.go
+index f1d6ba889..8998f5de3 100644
+--- a/internal/graphroute/graphroute_test.go
++++ b/internal/graphroute/graphroute_test.go
+@@ -899,9 +899,61 @@ func TestControlDispatcherBinding_UsesDispatcherForGraphScope(t *testing.T) {
+ 	}
+ }
+ 
+-// TestControlDispatcherBinding_CityOnlyBoundDispatcher covers a config with
+-// only the bound city dispatcher. It resolves city graphs but fails loudly for
+-// rig graphs instead of routing rig-store control work to the city store.
++// TestControlDispatcherBinding_PrefersResidentRigScoped is the multi-store
++// (atlas) counterpart to PrefersCitySingletonOverRigScoped: the SAME city, but
++// the rig-scoped dispatcher is pinned RESIDENT by a [[named_session]]
++// mode="always". A resident rig dispatcher runs and serves its own rig store, so
++// a rig-scope (rigContext="fixture") control bead must route to it — while a
++// city-scope (rigContext="") bead still routes to the singleton.
++func TestControlDispatcherBinding_PrefersResidentRigScoped(t *testing.T) {
++	maxActive := 1
++	cfg := &config.City{
++		Agents: []config.Agent{
++			{
++				Name:              config.ControlDispatcherAgentName,
++				BindingName:       "core",
++				StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
++				MaxActiveSessions: &maxActive,
++			},
++			{
++				Name:              config.ControlDispatcherAgentName,
++				BindingName:       "core",
++				Dir:               "fixture",
++				StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
++				MaxActiveSessions: &maxActive,
++			},
++		},
++		NamedSessions: []config.NamedSession{
++			{Template: "core.control-dispatcher", Dir: "fixture", Mode: "always"},
++		},
++	}
++
++	cases := map[string]string{
++		"fixture": "fixture/core.control-dispatcher", // rig scope → resident rig dispatcher
++		"":        "core.control-dispatcher",         // city scope → singleton
++	}
++	for rigContext, wantQN := range cases {
++		t.Run("rigContext="+rigContext, func(t *testing.T) {
++			binding, err := ControlDispatcherBinding(nil, "test-city", cfg, rigContext, Deps{Resolver: noMatchAgentResolver{}})
++			if err != nil {
++				t.Fatalf("ControlDispatcherBinding: %v", err)
++			}
++			if binding.QualifiedName != wantQN {
++				t.Fatalf("QualifiedName = %q, want %q", binding.QualifiedName, wantQN)
++			}
++			if !binding.MetadataOnly {
++				t.Fatalf("MetadataOnly = false, want true")
++			}
++		})
++	}
++}
++
++// TestControlDispatcherBinding_CityOnlyBoundDispatcher covers a city with only
++// the bound city-level singleton (no per-rig copies). It must resolve for both
++// the empty and a non-empty rig context, and must NOT depend on bare-name
++// matching: AgentMatchesIdentity rejects the bare "control-dispatcher" for a
++// bound agent, so a resolver that only does qualified-name matching returns no
++// match — the binding-agnostic deterministic lookup must still succeed.
+ func TestControlDispatcherBinding_CityOnlyBoundDispatcher(t *testing.T) {
+ 	maxActive := 1
+ 	dispatcher := config.Agent{
+-- 
+2.30.2
+
