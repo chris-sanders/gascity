@@ -2110,6 +2110,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// TestReconcileSessionBeads_ZombieTerminalErrorReflectedOnSnapshot.
 		infoPostZombie := infoByID[id]
 		if alive && shouldRollbackPendingCreateInfo(infoPostZombie) && !runningSessionMatchesPendingCreateInfo(infoPostZombie, name, sp) {
+			// Stop the abandoned runtime too, else a k8s pool worker's
+			// sleep-infinity pod outlives the rolled-back create as an orphan
+			// that never reaps. Safe: pool-instance session names are unique, so
+			// Stop(name) only targets this orphan. Downstream patch (Draft 15);
+			// drop when upstream stops the mismatched runtime on rollback.
+			if err := sp.Stop(name); err != nil && !runtime.IsSessionGone(err) {
+				fmt.Fprintf(stderr, "session reconciler: stopping mismatched pending-create runtime %s: %v\n", name, err) //nolint:errcheck
+			}
 			// Fold the rollback's mirrored metadata onto the snapshot (Step 6d;
 			// no Closed change — store-only close). STEP6-PREPASS-AUDIT group 2.
 			tick.apply(id, attemptRollbackPendingCreate(infoByID[id], tp.TemplateName, name, "pending_create_rollback", "live runtime belongs to another session", false))
