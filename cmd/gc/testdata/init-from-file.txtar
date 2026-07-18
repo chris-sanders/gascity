@@ -1,0 +1,57 @@
+# gc init --file with a TOML file path.
+
+env GC_SESSION=fake
+env GC_BEADS=file
+env GC_DOLT=skip
+
+# Init from a TOML file.
+exec gc init --file $WORK/configs/08-agent-pools.toml $WORK/my-city
+stdout 'Welcome to Gas City!'
+stdout 'Initialized city'
+stdout '08-agent-pools.toml'
+
+# Verify city starts with the pool config.
+exec gc start $WORK/my-city
+stdout 'Woke session .worker-1.'
+stdout 'City started.'
+
+# gc config show shows the pool info.
+cd $WORK/my-city
+exec gc config show
+stdout 'worker'
+stdout 'max_active_sessions = 5'
+
+# gc init --file uses the target dir basename unless --name overrides it.
+exec grep 'name = "my-city"' $WORK/my-city/pack.toml
+! exec grep 'name = "placeholder"' $WORK/my-city/pack.toml
+exec grep 'workspace_name = "my-city"' $WORK/my-city/.gc/site.toml
+
+# gc init --file rejects already-initialized city.
+! exec gc init --file $WORK/configs/08-agent-pools.toml $WORK/my-city
+stderr 'already initialized'
+
+# gc init --file with nonexistent file.
+! exec gc init --file $WORK/nonexistent.toml $WORK/new-city
+stderr 'reading'
+
+# gc init --file with invalid TOML.
+! exec gc init --file $WORK/configs/bad.toml $WORK/bad-city
+stderr 'parsing'
+
+-- configs/08-agent-pools.toml --
+[workspace]
+name = "placeholder"
+
+[[agent]]
+name = "mayor"
+start_command = "echo hello"
+
+[[agent]]
+name = "worker"
+start_command = "echo hello"
+
+min_active_sessions = 0
+max_active_sessions = 5
+scale_check = "echo 3"
+-- configs/bad.toml --
+[[[invalid toml

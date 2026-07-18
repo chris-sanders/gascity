@@ -1,0 +1,523 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+
+	"github.com/gastownhall/gascity/internal/api/apierr"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sessionlog"
+	"github.com/gastownhall/gascity/internal/worker"
+	"golang.org/x/sync/errgroup"
+)
+
+// Query-side session handlers (list, get, transcript, pending, agent-list,
+// agent-get). Split out of huma_handlers_sessions.go to isolate read-side
+// logic from mutations and streaming.
+
+func (s *Server) humaHandleSessionList(_ context.Context, input *SessionListInput) (*ListOutput[sessionResponse], error) {
+	store := s.state.SessionsBeadStore()
+	if store.Store == nil {
+		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
+	}
+	// Validate the cursor before the read-model listing and per-session
+	// runtime enrichment — a garbage cursor gets its 400 without paying the
+	// full probe cost (matching the convoy and mail handlers).
+	seek, err := keysetSeek(input.Cursor)
+	if err != nil {
+		return nil, err
+	}
+	mgr := s.sessionManager(store.Store)
+	cfg := s.state.Config()
+
+	listings, partialErrors, err := sessionReadModelListings(session.NewStore(store))
+	if err != nil {
+		return nil, apierr.Internal.Msg(err.Error())
+	}
+	sessions, responseByID := filterEnrichReadModel(mgr, listings, input.State, input.Template)
+
+	wantPeek := input.Peek
+	hasDeferredQueue := strings.TrimSpace(s.state.CityPath()) != ""
+	items := make([]sessionResponse, len(sessions))
+	for i, sess := range sessions {
+		items[i] = sessionResponseWithReason(sess, responseByID[sess.ID], cfg, s.state.SessionProvider(), hasDeferredQueue)
+		s.enrichSessionResponse(&items[i], sess, cfg, s.runtimeSessionResponseHandle(sess), wantPeek, false, false, 0)
+	}
+
+	// Unified page contract (S4): default 100 like every other keyset list.
+	// The offset-cursor era defaulted sessions to the 1000-row server cap;
+	// truncated responses now always mint next_cursor, so a default-size
+	// fetch of a large fleet is walkable instead of silently oversized.
+	limit := defaultPaginationLimit
+	if input.Limit > 0 {
+		limit = input.Limit
+		if limit > maxPaginationLimit {
+			limit = maxPaginationLimit
+		}
+	}
+
+	// items[i] mirrors sessions[i], and the read model returns them in the
+	// canonical (created_at DESC, id DESC) total order. The keyset boundary is
+	// compared and minted from the UNDERLYING session times (sessions[i]),
+	// never the response's RFC3339-formatted string, so sub-second precision
+	// survives the round trip — hence the index-keyed reuse of the shared
+	// helpers. Total keeps its full-match-count meaning, and a truncated
+	// response always carries next_cursor — cursor-less requests previously
+	// truncated silently, the #3208 defect class the bead list already fixed.
+	rowIdx := make([]int, len(items))
+	for i := range rowIdx {
+		rowIdx[i] = i
+	}
+	infoKey := func(i int) keysetKey {
+		return keysetKey{CreatedAt: sessions[i].CreatedAt, ID: sessions[i].ID}
+	}
+	pageIdx, total, hasMore := resolveKeysetPage(rowIdx, infoKey, seek, limit)
+	nextCursor := mintKeysetNextCursor(pageIdx, infoKey, hasMore)
+	page := make([]sessionResponse, len(pageIdx))
+	for j, i := range pageIdx {
+		page[j] = items[i]
+	}
+	return &ListOutput[sessionResponse]{
+		Index:     s.latestIndex(),
+		CacheAgeS: cacheAgeSeconds(store.Store),
+		Body: ListBody[sessionResponse]{
+			Items:         page,
+			Total:         total,
+			NextCursor:    nextCursor,
+			Partial:       len(partialErrors) > 0,
+			PartialErrors: partialErrors,
+		},
+	}, nil
+}
+
+// --- Session Get ---
+
+// humaHandleSessionGet is the Huma-typed handler for GET /v0/session/{id}.
+
+func (s *Server) humaHandleSessionGet(_ context.Context, input *SessionGetInput) (*IndexOutput[sessionResponse], error) {
+	store := s.state.SessionsBeadStore()
+	if store.Store == nil {
+		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
+	}
+	mgr := s.sessionManager(store.Store)
+	cfg := s.state.Config()
+	sp := s.state.SessionProvider()
+
+	id, err := s.resolveSessionIDAllowClosedWithConfig(store.Store, input.ID)
+	if err != nil {
+		return nil, humaResolveError(err)
+	}
+	info, pr, err := sessionGetEnriched(session.NewStore(store), mgr, id)
+	if err != nil {
+		return nil, humaSessionManagerError(err)
+	}
+	wantPeek := input.Peek
+	resp := sessionResponseWithReason(info, pr, cfg, s.state.SessionProvider(), strings.TrimSpace(s.state.CityPath()) != "")
+	s.enrichSessionResponse(&resp, info, cfg, sp, wantPeek, true, true, input.PeekLines)
+	return &IndexOutput[sessionResponse]{
+		Index:     s.latestIndex(),
+		CacheAgeS: cacheAgeSeconds(store.Store),
+		Body:      resp,
+	}, nil
+}
+
+// --- Session Create ---
+
+// humaHandleSessionCreate is the Huma-typed handler for POST /v0/sessions.
+
+func (s *Server) humaHandleSessionTranscript(_ context.Context, input *SessionTranscriptInput) (*IndexOutput[sessionTranscriptGetResponse], error) {
+	store := s.state.SessionsBeadStore()
+	if store.Store == nil {
+		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
+	}
+
+	id, err := s.resolveSessionIDAllowClosedWithConfig(store.Store, input.ID)
+	if err != nil {
+		return nil, humaResolveError(err)
+	}
+
+	mgr := s.sessionManager(store.Store)
+	info, err := mgr.Get(id)
+	if err != nil {
+		return nil, humaSessionManagerError(err)
+	}
+
+	path, err := mgr.TranscriptPath(id, s.sessionLogPaths())
+	if err != nil {
+		return nil, humaSessionManagerError(err)
+	}
+
+	wantRaw := input.Format == "raw"
+
+	if path != "" {
+		// Compactions() returns (n, provided). When the client omitted
+		// ?tail the transcript endpoint has historically returned all
+		// entries, so default to 0 (sessionlog's "no pagination"
+		// sentinel) rather than 1 compaction.
+		tail, _ := input.Compactions()
+		before := input.Before
+		after := input.After
+
+		if before != "" && after != "" {
+			return nil, apierr.ValidationFailed.Msg("before and after are mutually exclusive")
+		}
+
+		if wantRaw {
+			var rawSess *sessionlog.Session
+			switch {
+			case before != "":
+				rawSess, err = sessionlog.ReadProviderFileRawOlder(info.Provider, path, tail, before)
+			case after != "":
+				rawSess, err = sessionlog.ReadProviderFileRawNewer(info.Provider, path, tail, after)
+			default:
+				rawSess, err = sessionlog.ReadProviderFileRaw(info.Provider, path, tail)
+			}
+			if err != nil {
+				return nil, apierr.Internal.Msg("reading session log: " + err.Error())
+			}
+			return &IndexOutput[sessionTranscriptGetResponse]{
+				Index: s.latestIndex(),
+				Body: sessionTranscriptGetResponse{
+					ID:         info.ID,
+					Template:   info.Template,
+					Provider:   info.Provider,
+					Format:     "raw",
+					Messages:   wrapRawFrameBytes(rawSess.RawPayloadBytes()),
+					Pagination: rawSess.Pagination,
+				},
+			}, nil
+		}
+
+		var sess *sessionlog.Session
+		switch {
+		case before != "":
+			sess, err = sessionlog.ReadProviderFileOlder(info.Provider, path, tail, before)
+		case after != "":
+			sess, err = sessionlog.ReadProviderFileNewer(info.Provider, path, tail, after)
+		default:
+			sess, err = sessionlog.ReadProviderFile(info.Provider, path, tail)
+		}
+		if err != nil {
+			return nil, apierr.Internal.Msg("reading session log: " + err.Error())
+		}
+
+		turns := make([]outputTurn, 0, len(sess.Messages))
+		for _, entry := range sess.Messages {
+			turn := entryToTurn(entry)
+			if turn.Text == "" {
+				continue
+			}
+			turns = append(turns, turn)
+		}
+		return &IndexOutput[sessionTranscriptGetResponse]{
+			Index: s.latestIndex(),
+			Body: sessionTranscriptGetResponse{
+				ID:         info.ID,
+				Template:   info.Template,
+				Provider:   info.Provider,
+				Format:     "conversation",
+				Turns:      turns,
+				Pagination: sess.Pagination,
+			},
+		}, nil
+	}
+
+	if wantRaw {
+		return &IndexOutput[sessionTranscriptGetResponse]{
+			Index: s.latestIndex(),
+			Body: sessionTranscriptGetResponse{
+				ID:       info.ID,
+				Template: info.Template,
+				Provider: info.Provider,
+				Format:   "raw",
+				Messages: []SessionRawMessageFrame{},
+			},
+		}, nil
+	}
+
+	if info.State == session.StateActive && s.state.SessionProvider().IsRunning(info.SessionName) {
+		output, peekErr := s.state.SessionProvider().Peek(info.SessionName, 100)
+		if peekErr != nil {
+			return nil, apierr.Internal.Msg(peekErr.Error())
+		}
+		turns := []outputTurn{}
+		if output != "" {
+			turns = append(turns, outputTurn{Role: "output", Text: output})
+		}
+		return &IndexOutput[sessionTranscriptGetResponse]{
+			Index: s.latestIndex(),
+			Body: sessionTranscriptGetResponse{
+				ID:       info.ID,
+				Template: info.Template,
+				Provider: info.Provider,
+				Format:   "text",
+				Turns:    turns,
+			},
+		}, nil
+	}
+
+	return &IndexOutput[sessionTranscriptGetResponse]{
+		Index: s.latestIndex(),
+		Body: sessionTranscriptGetResponse{
+			ID:       info.ID,
+			Template: info.Template,
+			Provider: info.Provider,
+			Format:   "conversation",
+			Turns:    []outputTurn{},
+		},
+	}, nil
+}
+
+// --- Session Pending ---
+
+// humaHandleSessionPending is the Huma-typed handler for GET /v0/session/{id}/pending.
+
+func (s *Server) humaHandleSessionPending(_ context.Context, input *SessionIDInput) (*IndexOutput[sessionPendingResponse], error) {
+	store := s.state.SessionsBeadStore()
+	if store.Store == nil {
+		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
+	}
+
+	id, err := s.resolveSessionIDWithConfig(store.Store, input.ID)
+	if err != nil {
+		return nil, humaResolveError(err)
+	}
+
+	if b, bErr := store.Get(id); bErr == nil && b.Metadata["state"] == "creating" {
+		return &IndexOutput[sessionPendingResponse]{
+			Index: s.latestIndex(),
+			Body:  sessionPendingResponse{Supported: false},
+		}, nil
+	}
+
+	mgr := s.sessionManager(store.Store)
+	pending, supported, err := mgr.Pending(id)
+	if err != nil {
+		return nil, humaSessionManagerError(err)
+	}
+	return &IndexOutput[sessionPendingResponse]{
+		Index: s.latestIndex(),
+		Body: sessionPendingResponse{
+			Supported: supported,
+			Pending:   pending,
+		},
+	}, nil
+}
+
+// --- City Pending Aggregate ---
+
+// cityPendingProbeConcurrency bounds the city pending aggregate's per-session
+// probe fan-out so a many-session city neither serializes expensive runtime
+// probes nor floods the provider with unbounded concurrent captures.
+const cityPendingProbeConcurrency = 8
+
+// cityPendingProbe is one session's pending-probe outcome, collected by index
+// so the concurrent aggregate can be reassembled in deterministic order.
+type cityPendingProbe struct {
+	pending   *runtime.PendingInteraction
+	supported bool
+	err       error
+}
+
+// humaHandleCityPending is the Huma-typed handler for GET
+// /v0/city/{cityName}/pending. It returns the snapshot of active sessions
+// currently awaiting a human decision by probing each active session's
+// PendingInteraction via the session manager — the city-wide poll-based
+// complement to the per-session GET .../session/{id}/pending endpoint and
+// the per-session SSE pending frame. Per-session probe failures are surfaced
+// as Partial/PartialErrors rather than failing the whole aggregate, so one
+// gone runtime session does not blind the operator to the rest.
+//
+// The probe set is active sessions plus legacy empty-state ("none") beads,
+// which the codebase treats as active for upgrade/bootstrap cities; a live
+// runtime predating the state-metadata field can still hold a pending
+// decision and must not be dropped from the aggregate.
+func (s *Server) humaHandleCityPending(_ context.Context, _ *CityPendingInput) (*ListOutput[cityPendingEntry], error) {
+	store := s.state.SessionsBeadStore()
+	if store.Store == nil {
+		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
+	}
+	mgr := s.sessionManager(store.Store)
+
+	infos, partialErrors, err := sessionReadModelInfos(session.NewStore(store))
+	if err != nil {
+		return nil, apierr.Internal.Msg(err.Error())
+	}
+	// Active sessions can be awaiting a human decision — and so can legacy
+	// empty-state ("none") beads, which the codebase treats as active for
+	// upgrade/bootstrap cities (see resolveLiveSessionByPathAlias in
+	// session_resolution.go and the StateNone->StateActive normalization in
+	// session/manager.go). A live runtime predating the state-metadata field
+	// can still hold a PendingInteraction, so it must be probed too. Asleep,
+	// draining, creating, and closed beads stay excluded: they have no live
+	// runtime that could be holding a pending decision. Pending() itself
+	// degrades gracefully (runtime-gone -> no pending), so over-including a
+	// dormant empty-state bead is harmless.
+	// ListFromInfos takes a comma-separated state filter; StateNone is the empty
+	// string, so this resolves to "active," — both states, closed beads still
+	// excluded by the status guard (sessionMatchesFiltersInfo).
+	stateFilter := strings.Join([]string{string(session.StateActive), string(session.StateNone)}, ",")
+	sessions := mgr.ListFromInfos(infos, stateFilter, "")
+
+	// Probe sessions concurrently with bounded fan-out. Pending() can be
+	// expensive per session (e.g. a tmux pane capture), so probing a
+	// many-session city sequentially adds avoidable latency and provider load;
+	// the limit keeps a large city from spawning an unbounded probe storm.
+	// PendingByName reuses each session's already-resolved runtime name,
+	// skipping the redundant per-session bead-store lookup that Pending(id)
+	// would perform. Each goroutine writes its own slot in probes, and entries
+	// are assembled by iterating sessions in order afterward, so the aggregate
+	// stays deterministic regardless of probe completion order.
+	probes := make([]cityPendingProbe, len(sessions))
+	group := new(errgroup.Group)
+	group.SetLimit(cityPendingProbeConcurrency)
+	for i, sess := range sessions {
+		i, sessName := i, sess.SessionName
+		group.Go(func() error {
+			pending, supported, pErr := mgr.PendingByName(sessName)
+			probes[i] = cityPendingProbe{pending: pending, supported: supported, err: pErr}
+			return nil
+		})
+	}
+	_ = group.Wait()
+
+	entries := make([]cityPendingEntry, 0, len(sessions))
+	for i, sess := range sessions {
+		probe := probes[i]
+		if probe.err != nil {
+			partialErrors = append(partialErrors, fmt.Sprintf("session %s: %v", sess.ID, probe.err))
+			continue
+		}
+		if !probe.supported || probe.pending == nil {
+			continue
+		}
+		entries = append(entries, cityPendingEntry{
+			SessionID: sess.ID,
+			RequestID: probe.pending.RequestID,
+			Kind:      probe.pending.Kind,
+		})
+	}
+
+	return &ListOutput[cityPendingEntry]{
+		Index:     s.latestIndex(),
+		CacheAgeS: cacheAgeSeconds(store.Store),
+		Body: ListBody[cityPendingEntry]{
+			Items:         entries,
+			Total:         len(entries),
+			Partial:       len(partialErrors) > 0,
+			PartialErrors: partialErrors,
+		},
+	}, nil
+}
+
+// --- Session Patch ---
+
+// humaHandleSessionPatch is the Huma-typed handler for PATCH /v0/session/{id}.
+
+func (s *Server) humaHandleSessionAgentList(_ context.Context, input *SessionIDInput) (*IndexOutput[sessionAgentListResponse], error) {
+	store := s.state.SessionsBeadStore()
+	if store.Store == nil {
+		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
+	}
+
+	id, err := s.resolveSessionIDAllowClosedWithConfig(store.Store, input.ID)
+	if err != nil {
+		return nil, humaResolveError(err)
+	}
+
+	mgr := s.sessionManager(store.Store)
+	logPath, err := mgr.TranscriptPath(id, s.sessionLogPaths())
+	if err != nil {
+		return nil, humaSessionManagerError(err)
+	}
+	if logPath == "" {
+		return &IndexOutput[sessionAgentListResponse]{
+			Index: s.latestIndex(),
+			Body:  sessionAgentListResponse{Agents: []sessionlog.AgentMapping{}},
+		}, nil
+	}
+
+	mappings, err := sessionlog.FindAgentMappings(logPath)
+	if err != nil {
+		log.Printf("gc api: session %s agent mapping failed for %s: %v", id, logPath, err)
+		return nil, apierr.Internal.Msg("failed to list agents")
+	}
+	if mappings == nil {
+		mappings = []sessionlog.AgentMapping{}
+	}
+	return &IndexOutput[sessionAgentListResponse]{
+		Index: s.latestIndex(),
+		Body:  sessionAgentListResponse{Agents: mappings},
+	}, nil
+}
+
+// --- Session Agent Get ---
+
+// humaHandleSessionAgentGet is the Huma-typed handler for GET /v0/session/{id}/agents/{agentId}.
+
+func (s *Server) humaHandleSessionAgentGet(_ context.Context, input *SessionAgentGetInput) (*IndexOutput[sessionAgentGetResponse], error) {
+	store := s.state.SessionsBeadStore()
+	if store.Store == nil {
+		return nil, apierr.ServiceUnavailable.Msg("no bead store configured")
+	}
+
+	id, err := s.resolveSessionIDAllowClosedWithConfig(store.Store, input.ID)
+	if err != nil {
+		return nil, humaResolveError(err)
+	}
+
+	if input.AgentID == "" {
+		return nil, apierr.InvalidRequest.Msg("agentId is required")
+	}
+	if err := sessionlog.ValidateAgentID(input.AgentID); err != nil {
+		return nil, apierr.InvalidRequest.Msg(err.Error())
+	}
+
+	mgr := s.sessionManager(store.Store)
+	logPath, err := mgr.TranscriptPath(id, s.sessionLogPaths())
+	if err != nil {
+		return nil, humaSessionManagerError(err)
+	}
+	if logPath == "" {
+		return nil, apierr.SessionNotFound.Msg("no transcript found for session " + id)
+	}
+
+	agentSession, err := sessionlog.ReadAgentSession(logPath, input.AgentID)
+	if err != nil {
+		if errors.Is(err, sessionlog.ErrAgentNotFound) {
+			return nil, apierr.AgentNotFound.Msg("agent not found")
+		}
+		return nil, apierr.Internal.Msg("failed to read agent transcript")
+	}
+
+	return &IndexOutput[sessionAgentGetResponse]{
+		Index: s.latestIndex(),
+		Body: sessionAgentGetResponse{
+			Messages: agentSession.RawPayloads(),
+			Status:   agentSession.Status,
+		},
+	}, nil
+}
+
+// --- Session Stream (SSE) ---
+
+// sessionStreamState holds the state resolved by checkSessionStream that
+// streamSession needs. The Huma input caches it per request so the stream
+// body can reuse the initial History/State resolution instead of reloading
+// the transcript before the first byte is written.
+type sessionStreamState struct {
+	info       session.Info
+	handle     worker.Handle
+	history    *worker.HistorySnapshot
+	historyReq worker.HistoryRequest
+	hasHistory bool
+	running    bool
+}
+
+// resolveSessionStream is the shared resolution logic used by both the
+// precheck and the stream callback. It returns the resolved state or an
+// error suitable for HTTP response.

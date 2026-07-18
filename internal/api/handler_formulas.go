@@ -1,0 +1,450 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/graphv2"
+	"github.com/gastownhall/gascity/internal/molecule"
+)
+
+var (
+	errFormulaNotWorkflow = errors.New("formula is not a workflow")
+	errFormulaNotFound    = errors.New("formula not found")
+)
+
+// Response types (formulaDetailResponse, formulaSummaryResponse,
+// formulaRunsResponse, and the formulaPreview* / formulaVarDef /
+// formulaRecentRun building blocks) live in huma_types_formulas.go so
+// every response-body struct has one canonical home. This file
+// contains only the dispatch helpers that populate them.
+
+const (
+	defaultFormulaRunsLimit = 3
+	maxFormulaRunsLimit     = 20
+)
+
+func (s *Server) formulaSearchPaths(scopeKind, scopeRef string) ([]string, int, string) {
+	cfg := s.state.Config()
+	if cfg == nil {
+		return nil, http.StatusServiceUnavailable, "config is unavailable"
+	}
+
+	switch scopeKind {
+	case "city":
+		if scopeRef != strings.TrimSpace(s.state.CityName()) {
+			return nil, http.StatusNotFound, "city scope " + scopeRef + " not found"
+		}
+		return cfg.FormulaLayers.City, http.StatusOK, ""
+	case "rig":
+		if s.state.BeadStore(scopeRef) == nil {
+			return nil, http.StatusNotFound, "rig scope " + scopeRef + " not found"
+		}
+		return cfg.FormulaLayers.SearchPaths(scopeRef), http.StatusOK, ""
+	default:
+		return nil, http.StatusBadRequest, "scope_kind must be 'city' or 'rig'"
+	}
+}
+
+func buildFormulaCatalog(paths []string) ([]formulaSummaryResponse, error) {
+	if len(paths) == 0 {
+		return []formulaSummaryResponse{}, nil
+	}
+	parser := formula.NewParser(paths...).SetSource(formula.SourceFromEnv())
+	names := discoverFormulaNamesFromSource(parser.Source(), paths)
+	items := make([]formulaSummaryResponse, 0, len(names))
+	for _, name := range names {
+		resolved, err := loadResolvedWorkflowFormula(parser, name)
+		if err != nil {
+			if errors.Is(err, errFormulaNotWorkflow) {
+				continue
+			}
+			return nil, err
+		}
+		items = append(items, formulaSummaryResponse{
+			Name:        resolved.Formula,
+			Description: resolved.Description,
+			VarDefs:     formulaVarDefs(resolved.Vars),
+			RunCount:    0,
+			RecentRuns:  []formulaRecentRunResponse{},
+		})
+	}
+	return items, nil
+}
+
+func formulaRunCountFor(name string, runs []workflowRunProjection) int {
+	count := 0
+	for _, run := range runs {
+		if run.FormulaName == name {
+			count++
+		}
+	}
+	return count
+}
+
+func formulaRecentRunsFor(name string, runs []workflowRunProjection, limit int) []formulaRecentRunResponse {
+	if limit <= 0 {
+		return []formulaRecentRunResponse{}
+	}
+
+	capHint := limit
+	if len(runs) < capHint {
+		capHint = len(runs)
+	}
+	matching := make([]workflowRunProjection, 0, capHint)
+	for _, run := range runs {
+		if run.FormulaName != name {
+			continue
+		}
+		matching = append(matching, run)
+	}
+
+	sort.SliceStable(matching, func(i, j int) bool {
+		if !matching[i].UpdatedAt.Equal(matching[j].UpdatedAt) {
+			return matching[i].UpdatedAt.After(matching[j].UpdatedAt)
+		}
+		return matching[i].StartedAt.After(matching[j].StartedAt)
+	})
+
+	if len(matching) > limit {
+		matching = matching[:limit]
+	}
+
+	items := make([]formulaRecentRunResponse, 0, len(matching))
+	for _, run := range matching {
+		items = append(items, formulaRecentRunResponse{
+			WorkflowID: run.WorkflowID,
+			Status:     run.Status,
+			Target:     run.Target,
+			StartedAt:  run.StartedAt.Format(time.RFC3339),
+			UpdatedAt:  run.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+	return items
+}
+
+func normalizeFormulaRunsLimit(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	if limit > maxFormulaRunsLimit {
+		return maxFormulaRunsLimit
+	}
+	return limit
+}
+
+func buildFormulaRuns(state State, formulaName, requestedScopeKind, requestedScopeRef string, limit int) (*formulaRunsResponse, error) {
+	// Use the full projection path (with per-root child lookups) so that
+	// status and UpdatedAt reflect closed children.  The /feed endpoint
+	// intentionally uses the cheaper root-only path for monitor views.
+	// Pass formulaName to skip child lookups for non-matching roots.
+	projectionResult, err := buildWorkflowRunProjections(state, requestedScopeKind, requestedScopeRef, formulaName)
+	if err != nil {
+		return nil, fmt.Errorf("listing workflow runs for %s:%s: %w", requestedScopeKind, requestedScopeRef, err)
+	}
+
+	projections := make([]workflowRunProjection, 0, len(projectionResult.Items))
+	for _, projection := range projectionResult.Items {
+		if projection.FormulaName != formulaName {
+			continue
+		}
+		if projection.ScopeKind != requestedScopeKind || projection.ScopeRef != requestedScopeRef {
+			continue
+		}
+		projections = append(projections, projection)
+	}
+
+	return &formulaRunsResponse{
+		Formula:       formulaName,
+		RunCount:      formulaRunCountFor(formulaName, projections),
+		RecentRuns:    formulaRecentRunsFor(formulaName, projections, limit),
+		Partial:       projectionResult.Partial,
+		PartialErrors: projectionResult.PartialErrors,
+	}, nil
+}
+
+func buildFormulaDetail(ctx context.Context, store beads.Store, name string, paths []string, target string, targetIsRoutingIdentity bool, vars map[string]string, validateRuntimeVars bool) (*formulaDetailResponse, error) {
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("%w: %q not in search paths", errFormulaNotFound, name)
+	}
+	parser := formula.NewParser(paths...).SetSource(formula.SourceFromEnv())
+	resolved, err := loadResolvedWorkflowFormula(parser, name)
+	if err != nil {
+		return nil, err
+	}
+	compileVars, err := formulaDetailPreviewVars(ctx, store, name, paths, resolved, target, targetIsRoutingIdentity, vars, validateRuntimeVars)
+	if err != nil {
+		return nil, err
+	}
+	recipe, err := formula.CompileWithoutRuntimeVarValidation(ctx, name, paths, compileVars)
+	if err != nil {
+		return nil, err
+	}
+	if validateRuntimeVars {
+		if err := molecule.ValidateRecipeRuntimeVars(recipe, molecule.Options{Vars: compileVars}); err != nil {
+			return nil, fmt.Errorf("formula %q: %w", name, err)
+		}
+	}
+	displayVars := formula.ApplyDefaults(resolved, compileVars)
+
+	rootID := ""
+	if root := recipe.RootStep(); root != nil {
+		rootID = root.ID
+	}
+	steps := make([]FormulaStepResponse, 0, len(recipe.Steps))
+	nodes := make([]formulaPreviewNodeResponse, 0, len(recipe.Steps))
+	included := make(map[string]bool, len(recipe.Steps))
+	for _, step := range recipe.Steps {
+		if !includeFormulaPreviewStep(step, rootID) {
+			continue
+		}
+		included[step.ID] = true
+		kind := recipeStepKind(step)
+		title := formula.Substitute(step.Title, displayVars)
+		item := FormulaStepResponse{
+			ID:       step.ID,
+			Title:    title,
+			Kind:     kind,
+			Type:     step.Type,
+			Assignee: step.Assignee,
+		}
+		if len(step.Labels) > 0 {
+			item.Labels = step.Labels
+		}
+		if len(step.Metadata) > 0 {
+			item.Metadata = step.Metadata
+		}
+		steps = append(steps, item)
+
+		node := formulaPreviewNodeResponse{
+			ID:    step.ID,
+			Title: title,
+			Kind:  kind,
+		}
+		if scopeRef := strings.TrimSpace(step.Metadata[beadmeta.ScopeRefMetadataKey]); scopeRef != "" {
+			node.ScopeRef = scopeRef
+		}
+		nodes = append(nodes, node)
+	}
+
+	edges := make([]formulaPreviewEdgeResponse, 0, len(recipe.Deps))
+	for _, dep := range recipe.Deps {
+		if dep.Type == "parent-child" || !included[dep.StepID] || !included[dep.DependsOnID] {
+			continue
+		}
+		edge := formulaPreviewEdgeResponse{
+			From: dep.DependsOnID,
+			To:   dep.StepID,
+		}
+		if dep.Type != "" {
+			edge.Kind = dep.Type
+		}
+		edges = append(edges, edge)
+	}
+
+	resp := &formulaDetailResponse{
+		Name:        resolved.Formula,
+		Description: formula.Substitute(resolved.Description, displayVars),
+		VarDefs:     formulaVarDefs(resolved.Vars),
+		Steps:       steps,
+		Deps:        edges,
+	}
+	resp.Preview.Nodes = nodes
+	resp.Preview.Edges = edges
+	return resp, nil
+}
+
+func formulaDetailPreviewVars(ctx context.Context, store beads.Store, name string, paths []string, resolved *formula.Formula, target string, targetIsRoutingIdentity bool, vars map[string]string, validateRuntimeVars bool) (map[string]string, error) {
+	if resolved == nil || !formula.UsesGraphCompiler(resolved) {
+		return vars, nil
+	}
+	if !validateRuntimeVars {
+		if err := graphv2.ValidateNoReservedUserVars(vars); err != nil {
+			return nil, err
+		}
+		out := graphv2.EffectiveRuntimeVars(resolved, vars)
+		parser := formula.NewParser(paths...).SetSource(formula.SourceFromEnv())
+		formulaRequiresTarget, err := formula.GraphV2FormulaReferencesInputConvoyTransitively(resolved, parser)
+		if err != nil {
+			return nil, err
+		}
+		recipe, err := formula.CompileWithoutRuntimeVarValidation(ctx, name, paths, out)
+		if err != nil {
+			return nil, err
+		}
+		recipeRequiresTarget := formula.GraphV2RecipeReferencesInputConvoy(recipe)
+		if !formulaRequiresTarget && !recipeRequiresTarget {
+			if err := formula.ValidateGraphV2RecipeReservedSymbols(recipe, false); err != nil {
+				return nil, err
+			}
+			return out, nil
+		}
+		if strings.TrimSpace(target) == "" {
+			if formulaRequiresTarget {
+				if err := formula.ValidateGraphV2ReservedSymbolsTransitively(resolved, parser, false); err != nil {
+					return nil, err
+				}
+			}
+			if recipeRequiresTarget {
+				if err := formula.ValidateGraphV2RecipeReservedSymbols(recipe, false); err != nil {
+					return nil, err
+				}
+			}
+			return nil, fmt.Errorf("formulas v2 target is required")
+		}
+		if err := formula.ValidateGraphV2RecipeReservedSymbols(recipe, true); err != nil {
+			return nil, err
+		}
+		var inputConvoyID string
+		if targetIsRoutingIdentity {
+			inputConvoyID = graphv2.PreviewInputConvoyIDForRoutingIdentity(target)
+		} else {
+			inputConvoyID, err = graphv2.PreviewInputConvoyID(store, target)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if out == nil {
+			out = make(map[string]string, 1)
+		}
+		out[graphv2.ConvoyIDVar] = inputConvoyID
+		return out, nil
+	}
+	inv, err := graphv2.PreparePreviewInvocation(ctx, store, name, paths, target, targetIsRoutingIdentity, vars)
+	if err != nil {
+		return nil, err
+	}
+	return inv.Vars, nil
+}
+
+// discoverFormulaNamesFromSource lists formula names through the same
+// Source the parser uses for loading. Keeps catalog discovery
+// consistent with ref-stable resolution (#2030 / PR #2537 Copilot
+// finding): a name visible in the working tree but absent at the
+// configured ref otherwise produces hard load errors during catalog
+// build under opt-in GC_FORMULA_REF.
+func discoverFormulaNamesFromSource(src formula.Source, paths []string) []string {
+	if src == nil {
+		src = formula.FSSource{}
+	}
+	winners := make(map[string]struct{})
+	for _, dir := range paths {
+		entries, err := src.ListDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			name, ok := formula.TrimTOMLFilename(entry)
+			if !ok {
+				continue
+			}
+			winners[name] = struct{}{}
+		}
+	}
+
+	names := make([]string, 0, len(winners))
+	for name := range winners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// loadResolvedFormula loads a formula by name and resolves its extends chain
+// without constraining its type, so callers that accept any authorable formula
+// (workflow, expansion, or aspect) can reuse the parser's load+resolve to catch
+// missing parents and other resolution errors. It returns only resolution
+// failures, never a type mismatch.
+func loadResolvedFormula(parser *formula.Parser, name string) (*formula.Formula, error) {
+	loaded, err := parser.LoadByName(name)
+	if err != nil {
+		return nil, err
+	}
+	return parser.Resolve(loaded)
+}
+
+// loadResolvedWorkflowFormula resolves a formula and additionally requires it to
+// be a workflow. The catalog and detail readers use the workflow gate to skip
+// non-workflow building blocks; authoring paths that accept those building
+// blocks call loadResolvedFormula instead.
+func loadResolvedWorkflowFormula(parser *formula.Parser, name string) (*formula.Formula, error) {
+	resolved, err := loadResolvedFormula(parser, name)
+	if err != nil {
+		return nil, err
+	}
+	if resolved.Type != formula.TypeWorkflow {
+		return nil, fmt.Errorf("%q: %w", name, errFormulaNotWorkflow)
+	}
+	return resolved, nil
+}
+
+func formulaVarDefs(vars map[string]*formula.VarDef) []formulaVarDefResponse {
+	if len(vars) == 0 {
+		return []formulaVarDefResponse{}
+	}
+	names := make([]string, 0, len(vars))
+	for name := range vars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	items := make([]formulaVarDefResponse, 0, len(names))
+	for _, name := range names {
+		def := vars[name]
+		if def == nil {
+			continue
+		}
+		item := formulaVarDefResponse{
+			Name:        name,
+			Type:        def.Type,
+			Description: def.Description,
+			Required:    def.Required,
+			Enum:        append([]string(nil), def.Enum...),
+			Pattern:     def.Pattern,
+		}
+		if item.Type == "" {
+			item.Type = "string"
+		}
+		if def.Default != nil {
+			item.Default = *def.Default
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+func recipeStepKind(step formula.RecipeStep) string {
+	if kind := strings.TrimSpace(step.Metadata[beadmeta.KindMetadataKey]); kind != "" {
+		return kind
+	}
+	if step.Type != "" {
+		return step.Type
+	}
+	return "task"
+}
+
+func includeFormulaPreviewStep(step formula.RecipeStep, rootID string) bool {
+	if step.ID == rootID {
+		return false
+	}
+	// This is a preview-projection filter, not a control-kind membership
+	// predicate, so it intentionally lists literals instead of deriving from
+	// the beadmeta control-kind taxonomy. The hidden set is the structural
+	// bookkeeping steps that should not surface in a formula preview; it
+	// includes "spec" (not a control kind) and omits control kinds that are
+	// meant to remain previewable, so no existing beadmeta set matches it.
+	switch strings.TrimSpace(step.Metadata[beadmeta.KindMetadataKey]) {
+	case "scope-check", "workflow-finalize", "spec":
+		return false
+	default:
+		return true
+	}
+}

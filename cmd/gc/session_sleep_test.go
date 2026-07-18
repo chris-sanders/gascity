@@ -1,0 +1,1310 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/session/sessiontest"
+)
+
+// infoByIDForTargets projects the wakeTargets' beads into the coherent Info
+// snapshot the reconciler passes to the idle-probe helpers.
+func infoByIDForTargets(targets []wakeTarget) map[string]sessionpkg.Info {
+	m := make(map[string]sessionpkg.Info, len(targets))
+	for _, tg := range targets {
+		if tg.info.ID != "" {
+			m[tg.info.ID] = tg.info
+		}
+	}
+	return m
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+type routedSleepProvider struct {
+	runtime.Provider
+	capabilities runtime.ProviderCapabilities
+	sleep        runtime.SessionSleepCapability
+}
+
+func (p routedSleepProvider) Capabilities() runtime.ProviderCapabilities {
+	return p.capabilities
+}
+
+func (p routedSleepProvider) SleepCapability(string) runtime.SessionSleepCapability {
+	return p.sleep
+}
+
+func startedSessionNames(sp *runtime.Fake) map[string]bool {
+	started := make(map[string]bool)
+	for _, call := range sp.Calls {
+		if call.Method == "Start" {
+			started[call.Name] = true
+		}
+	}
+	return started
+}
+
+func TestResolveSessionSleepPolicyPrecedence(t *testing.T) {
+	cfg := &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Rigs: []config.Rig{{
+			Name: "rig-a",
+			SessionSleep: config.SessionSleepConfig{
+				InteractiveResume: "5m",
+			},
+		}},
+		Agents: []config.Agent{{
+			Name:                 "worker",
+			Dir:                  "rig-a",
+			SleepAfterIdle:       "10s",
+			SleepAfterIdleSource: "agent",
+		}},
+	}
+
+	session := makeBead("b1", map[string]string{
+		"template":     "rig-a/worker",
+		"session_name": "worker",
+	})
+
+	policy := resolveSessionSleepPolicyInfo(seedSessionInfo(session), cfg, runtime.NewFake())
+	if policy.Class != config.SessionSleepInteractiveResume {
+		t.Fatalf("Class = %q, want %q", policy.Class, config.SessionSleepInteractiveResume)
+	}
+	if policy.Requested != "10s" || policy.Effective != "10s" {
+		t.Fatalf("requested/effective = %q/%q, want 10s/10s", policy.Requested, policy.Effective)
+	}
+	if policy.Source != "agent" {
+		t.Fatalf("Source = %q, want agent", policy.Source)
+	}
+}
+
+func TestWakeReasonsInteractiveResumeGraceWindow(t *testing.T) {
+	now := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
+	cfg := &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	session := makeBead("b1", map[string]string{
+		"template":            "worker",
+		"session_name":        "worker",
+		"started_config_hash": "started",
+		"detached_at":         now.Add(-30 * time.Second).Format(time.RFC3339),
+	})
+
+	reasons := wakeReasonsForBead(session, cfg, runtime.NewFake(), nil, nil, nil, &clock.Fake{Time: now})
+	if !containsWakeReason(reasons, WakeKeepWarm) {
+		t.Fatalf("expected WakeKeepWarm during keep-warm window, got %v", reasons)
+	}
+
+	expired := &clock.Fake{Time: now.Add(31 * time.Second)}
+	reasons = wakeReasonsForBead(session, cfg, runtime.NewFake(), nil, nil, nil, expired)
+	if containsWakeReason(reasons, WakeKeepWarm) {
+		t.Fatalf("did not expect WakeKeepWarm after keep-warm expiry, got %v", reasons)
+	}
+}
+
+func TestWakeReasonsNonInteractiveImmediateUsesHardWakeReasons(t *testing.T) {
+	now := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
+	cfg := &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			NonInteractive: "0s",
+		},
+		Agents: []config.Agent{{
+			Name:   "worker",
+			Attach: boolPtr(false),
+		}},
+	}
+	session := makeBead("b1", map[string]string{
+		"template":            "worker",
+		"session_name":        "worker",
+		"started_config_hash": "started",
+	})
+
+	reasons := wakeReasonsForBead(session, cfg, runtime.NewFake(), nil, nil, nil, &clock.Fake{Time: now})
+	if len(reasons) != 0 {
+		t.Fatalf("expected no reasons without hard wake triggers, got %v", reasons)
+	}
+
+	// Demand via poolDesired → WakeConfig (replaces WakeWork).
+	reasons = wakeReasonsForBead(session, cfg, runtime.NewFake(), map[string]int{"worker": 1}, nil, nil, &clock.Fake{Time: now})
+	if len(reasons) != 1 || reasons[0] != WakeConfig {
+		t.Fatalf("expected [WakeConfig], got %v", reasons)
+	}
+
+	sp := runtime.NewFake()
+	sp.SetPendingInteraction("worker", &runtime.PendingInteraction{RequestID: "req-1"})
+	reasons = wakeReasonsForBead(session, cfg, sp, nil, nil, nil, &clock.Fake{Time: now})
+	if len(reasons) != 1 || reasons[0] != WakePending {
+		t.Fatalf("expected [WakePending], got %v", reasons)
+	}
+}
+
+func TestWakeReasons_DependencyOnlyFloorDoesNotGetWakeConfig(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "db", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3), Attach: boolPtr(false)},
+			{Name: "api", Attach: boolPtr(false), DependsOn: []string{"db"}},
+		},
+	}
+	session := makeBead("b1", map[string]string{
+		"template":            "db",
+		"session_name":        "db-1",
+		"pool_slot":           "1",
+		"dependency_only":     "true",
+		"started_config_hash": "started",
+	})
+
+	reasons := wakeReasonsForBead(session, cfg, runtime.NewFake(), map[string]int{"db": 1}, nil, nil, &clock.Fake{Time: time.Now().UTC()})
+	if containsWakeReason(reasons, WakeConfig) {
+		t.Fatalf("dependency-only slot should not get WakeConfig, got %v", reasons)
+	}
+}
+
+func TestReconcileDetachedAtUsesRoutedSleepCapability(t *testing.T) {
+	now := time.Date(2026, 3, 23, 12, 0, 0, 0, time.UTC)
+	cfg := &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	store := beads.NewMemStore()
+	session, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "worker",
+			"session_name": "worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("store.Create: %v", err)
+	}
+
+	base := runtime.NewFake()
+	provider := routedSleepProvider{
+		Provider:     base,
+		capabilities: runtime.ProviderCapabilities{},
+		sleep:        runtime.SessionSleepCapabilityFull,
+	}
+	policy := resolveSessionSleepPolicyInfo(sessiontest.SeedBead(t, session), cfg, provider)
+	if policy.Capability != runtime.SessionSleepCapabilityFull {
+		t.Fatalf("policy capability = %q, want %q", policy.Capability, runtime.SessionSleepCapabilityFull)
+	}
+
+	reconcileDetachedAtInfo(sessiontest.SeedBead(t, session), store, policy, true, provider, &clock.Fake{Time: now})
+
+	got, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["detached_at"] == "" {
+		t.Fatal("detached_at was not recorded for routed full-capability session")
+	}
+}
+
+func TestReconcileSessionBeads_StartsIdleDrainAfterGrace(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	ts := env.clk.Time.Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"last_woke_at": ts,
+		"detached_at":  ts,
+	})
+	session.Metadata["last_woke_at"] = ts
+	session.Metadata["detached_at"] = ts
+	env.sp.WaitForIdleErrors["worker"] = nil
+	idleGate := make(chan struct{}) // see waitForIdleProbeReady godoc
+	env.sp.WaitForIdleGates["worker"] = idleGate
+
+	poolDesired := map[string]int{"worker": 1}
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames, env.cfg, env.sp,
+		env.store, nil, nil, nil, env.dt, poolDesired, false, nil, "",
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+	)
+	close(idleGate)
+	waitForIdleProbeReady(t, env.dt, session.ID)
+	fresh, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(session): %v", err)
+	}
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{fresh}, env.desiredState, cfgNames, env.cfg, env.sp,
+		env.store, nil, nil, nil, env.dt, poolDesired, false, nil, "",
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+	)
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatal("expected idle drain to start")
+	}
+	if ds.reason != "idle" {
+		t.Fatalf("drain reason = %q, want idle", ds.reason)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["config_wake_suppressed"] != "true" {
+		t.Fatalf("config_wake_suppressed = %q, want true", got.Metadata["config_wake_suppressed"])
+	}
+	foundProbe := false
+	for _, call := range env.sp.Calls {
+		if call.Method == "WaitForIdle" && call.Name == "worker" {
+			foundProbe = true
+			break
+		}
+	}
+	if !foundProbe {
+		t.Fatal("expected WaitForIdle probe before idle drain")
+	}
+}
+
+func TestReconcileSessionBeads_AssignedNamedSessionByBeadIDOverridesNonInteractiveSleepPolicy(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			NonInteractive: "60s",
+		},
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "worker",
+			StartCommand: "true",
+			Attach:       boolPtr(false),
+		}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "on_demand"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:                 "test-cmd",
+		SessionName:             sessionName,
+		TemplateName:            "worker",
+		ConfiguredNamedIdentity: "worker",
+		ConfiguredNamedMode:     "on_demand",
+	}
+	session := env.createSessionBead(sessionName, "worker")
+	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "on_demand",
+		"detached_at":                env.clk.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+	})
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "test-cmd"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	env.sp.SetActivity(sessionName, env.clk.Now().Add(-2*time.Minute))
+	work, err := env.store.Create(beads.Bead{
+		Title:    "assigned work",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.ID,
+	})
+	if err != nil {
+		t.Fatalf("create assigned work: %v", err)
+	}
+	cfgNames := configuredSessionNames(env.cfg, env.cfg.EffectiveCityName(), env.store)
+
+	woken := reconcileSessionBeads(
+		context.Background(),
+		[]beads.Bead{session},
+		env.desiredState,
+		cfgNames,
+		env.cfg,
+		env.sp,
+		env.store,
+		nil,
+		[]beads.Bead{work},
+		nil,
+		env.dt,
+		map[string]int{},
+		false,
+		nil,
+		env.cfg.EffectiveCityName(),
+		nil,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+		withReadyAssignedFlags([]bool{true}),
+	)
+
+	if woken != 0 {
+		t.Fatalf("woken = %d, want 0 for already-running assigned session", woken)
+	}
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatal("assigned named session should stay running")
+	}
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("unexpected drain for assigned named session: %+v", ds)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["config_wake_suppressed"] == "true" {
+		t.Fatal("assigned-work wake was suppressed by noninteractive sleep policy")
+	}
+}
+
+func TestReconcilerWakeDemandOverridesSleepSuppressionForMinActive(t *testing.T) {
+	policy := resolvedSessionSleepPolicy{Class: config.SessionSleepInteractiveResume}
+	decision := AwakeDecision{ShouldWake: true, Reason: "min-active"}
+	eval := wakeEvaluation{Reasons: []WakeReason{WakeConfig}}
+
+	if !wakeDemandOverridesSleepSuppression(decision, eval, policy, nil, "worker", false) {
+		t.Fatal("min-active config wake should override stale interactive sleep suppression")
+	}
+	if wakeDemandOverridesSleepSuppression(decision, eval, policy, nil, "worker", true) {
+		t.Fatal("explicit sleep intent should still override min-active demand")
+	}
+
+	scaledDemand := AwakeDecision{ShouldWake: true, Reason: "scaled:demand"}
+	if wakeDemandOverridesSleepSuppression(scaledDemand, eval, policy, map[string]int{"worker": 1}, "worker", false) {
+		t.Fatal("ordinary interactive pool demand should still honor sleep suppression")
+	}
+}
+
+func TestReconcilerWakeDemandOverridesSleepSuppressionForAssignedWork(t *testing.T) {
+	policy := resolvedSessionSleepPolicy{Class: config.SessionSleepInteractiveResume}
+	decision := AwakeDecision{ShouldWake: true, Reason: "assigned-work"}
+	eval := wakeEvaluation{
+		Reasons:         []WakeReason{WakeWork},
+		HasAssignedWork: true,
+	}
+
+	if !wakeDemandOverridesSleepSuppression(decision, eval, policy, nil, "worker", false) {
+		t.Fatal("assigned-work wake should override interactive sleep suppression")
+	}
+	if wakeDemandOverridesSleepSuppression(decision, eval, policy, nil, "worker", true) {
+		t.Fatal("explicit sleep intent should still override assigned-work demand")
+	}
+}
+
+func TestReconcileSessionBeads_MinActiveCityStopWakeBypassesInteractiveSleepSuppression(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{
+			Name:              "worker",
+			StartCommand:      "true",
+			MinActiveSessions: intPtr(1),
+		}},
+	}
+	env.addDesired("worker", "worker", false)
+	session := env.createSessionBead("worker", "worker")
+	stale := env.clk.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"state":        "asleep",
+		"sleep_reason": "city-stop",
+		"detached_at":  stale,
+		"last_woke_at": stale,
+	})
+
+	woken := env.reconcileWithPoolDesired([]beads.Bead{session}, map[string]int{"worker": 1})
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1; stderr=%s", woken, env.stderr.String())
+	}
+	if !env.sp.IsRunning("worker") {
+		t.Fatal("worker should start for min-active city-stop revival")
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["config_wake_suppressed"] == "true" {
+		t.Fatal("min-active city-stop wake was suppressed by interactive sleep policy")
+	}
+}
+
+func TestReconcileSessionBeads_AssignedWorkWithReadyWaitOverridesNonInteractiveSleepPolicy(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			NonInteractive: "60s",
+		},
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "worker",
+			StartCommand: "true",
+			Attach:       boolPtr(false),
+		}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "on_demand"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:                 "test-cmd",
+		SessionName:             sessionName,
+		TemplateName:            "worker",
+		ConfiguredNamedIdentity: "worker",
+		ConfiguredNamedMode:     "on_demand",
+	}
+	session := env.createSessionBead(sessionName, "worker")
+	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "on_demand",
+		"detached_at":                env.clk.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+	})
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "test-cmd"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	env.sp.SetActivity(sessionName, env.clk.Now().Add(-2*time.Minute))
+	work, err := env.store.Create(beads.Bead{
+		Title:    "assigned work",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.ID,
+	})
+	if err != nil {
+		t.Fatalf("create assigned work: %v", err)
+	}
+	cfgNames := configuredSessionNames(env.cfg, env.cfg.EffectiveCityName(), env.store)
+
+	woken := reconcileSessionBeads(
+		context.Background(),
+		[]beads.Bead{session},
+		env.desiredState,
+		cfgNames,
+		env.cfg,
+		env.sp,
+		env.store,
+		nil,
+		[]beads.Bead{work},
+		map[string]bool{session.ID: true},
+		env.dt,
+		map[string]int{},
+		false,
+		nil,
+		env.cfg.EffectiveCityName(),
+		nil,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+		withReadyAssignedFlags([]bool{true}),
+	)
+
+	if woken != 0 {
+		t.Fatalf("woken = %d, want 0 for already-running assigned session", woken)
+	}
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatal("assigned named session should stay running")
+	}
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("unexpected drain for assigned named session with ready wait: %+v", ds)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["config_wake_suppressed"] == "true" {
+		t.Fatal("ready-wait wake with assigned work was suppressed by noninteractive sleep policy")
+	}
+}
+
+func TestReconcileSessionBeads_WaitHoldBypassesIdleProbe(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	ts := env.clk.Time.Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"last_woke_at": ts,
+		"detached_at":  ts,
+		"sleep_intent": "wait-hold",
+	})
+	session.Metadata["last_woke_at"] = ts
+	session.Metadata["detached_at"] = ts
+	session.Metadata["sleep_intent"] = "wait-hold"
+
+	if got := env.reconcile([]beads.Bead{session}); got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatal("expected wait-hold drain to start immediately")
+	}
+	if ds.reason != "wait-hold" {
+		t.Fatalf("drain reason = %q, want wait-hold", ds.reason)
+	}
+	for _, call := range env.sp.Calls {
+		if call.Method == "WaitForIdle" && call.Name == "worker" {
+			t.Fatal("did not expect idle probe for explicit wait-hold sleep")
+		}
+	}
+}
+
+func TestReconcileSessionBeads_IdleLatchedSessionDoesNotWake(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	env.addDesired("worker", "worker", false)
+	session := env.createSessionBead("worker", "worker")
+	policy := resolveSessionSleepPolicyInfo(sessiontest.SeedBead(t, session), env.cfg, env.sp)
+	ts := env.clk.Time.Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"sleep_reason":             "idle",
+		"sleep_policy_fingerprint": policy.Fingerprint,
+		"slept_at":                 ts,
+	})
+	session.Metadata["sleep_reason"] = "idle"
+	session.Metadata["sleep_policy_fingerprint"] = policy.Fingerprint
+	session.Metadata["slept_at"] = ts
+
+	if got := env.reconcile([]beads.Bead{session}); got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	if starts := startedSessionNames(env.sp); len(starts) != 0 {
+		t.Fatalf("unexpected starts: %v", starts)
+	}
+}
+
+func TestReconcileSessionBeads_AssignedWorkWakesIdleLatchedInteractiveSession(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	env.addDesired("worker", "worker", false)
+	session := env.createSessionBead("worker", "worker")
+	policy := resolveSessionSleepPolicyInfo(sessiontest.SeedBead(t, session), env.cfg, env.sp)
+	ts := env.clk.Time.Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"sleep_reason":             "idle",
+		"sleep_policy_fingerprint": policy.Fingerprint,
+		"slept_at":                 ts,
+	})
+	work, err := env.store.Create(beads.Bead{
+		Title:    "assigned work",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.ID,
+	})
+	if err != nil {
+		t.Fatalf("create assigned work: %v", err)
+	}
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+
+	woken := reconcileSessionBeads(
+		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames, env.cfg, env.sp,
+		env.store, nil, []beads.Bead{work}, nil, env.dt, map[string]int{}, false, nil, "",
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+		withReadyAssignedFlags([]bool{true}),
+	)
+
+	if woken != 1 {
+		t.Fatalf("woken = %d, want 1; stderr=%s", woken, env.stderr.String())
+	}
+	if !env.sp.IsRunning("worker") {
+		t.Fatal("assigned idle-latched worker should start")
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["config_wake_suppressed"] == "true" {
+		t.Fatal("assigned-work wake was suppressed by interactive sleep policy")
+	}
+}
+
+func TestReconcileSessionBeads_ConfigChangeDoesNotWakeIdleLatchedSession(t *testing.T) {
+	env := newReconcilerTestEnv()
+	oldCfg := &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	env.cfg = oldCfg
+	env.addDesired("worker", "worker", false)
+	session := env.createSessionBead("worker", "worker")
+	oldPolicy := resolveSessionSleepPolicyInfo(sessiontest.SeedBead(t, session), oldCfg, env.sp)
+	ts := env.clk.Time.Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"sleep_reason":             "idle",
+		"sleep_policy_fingerprint": oldPolicy.Fingerprint,
+		"slept_at":                 ts,
+	})
+	session.Metadata["sleep_reason"] = "idle"
+	session.Metadata["sleep_policy_fingerprint"] = oldPolicy.Fingerprint
+	session.Metadata["slept_at"] = ts
+
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+
+	if got := env.reconcile([]beads.Bead{session}); got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	if starts := startedSessionNames(env.sp); len(starts) != 0 {
+		t.Fatalf("did not expect worker to start, got %v", starts)
+	}
+}
+
+func TestReconcileSessionBeads_ConfigChangeDoesNotRetryIdleLatchedSingletonWake(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.sp = runtime.NewFailFake()
+	oldCfg := &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	env.cfg = oldCfg
+	env.addDesired("worker", "worker", false)
+	session := env.createSessionBead("worker", "worker")
+	oldPolicy := resolveSessionSleepPolicyInfo(sessiontest.SeedBead(t, session), oldCfg, env.sp)
+	ts := env.clk.Time.Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"state":                    "asleep",
+		"sleep_reason":             "idle",
+		"sleep_policy_fingerprint": oldPolicy.Fingerprint,
+		"slept_at":                 ts,
+	})
+	session.Metadata["state"] = "asleep"
+	session.Metadata["sleep_reason"] = "idle"
+	session.Metadata["sleep_policy_fingerprint"] = oldPolicy.Fingerprint
+	session.Metadata["slept_at"] = ts
+
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+
+	env.reconcile([]beads.Bead{session})
+	env.reconcile([]beads.Bead{session})
+
+	startCalls := 0
+	for _, call := range env.sp.Calls {
+		if call.Method == "Start" && call.Name == "worker" {
+			startCalls++
+		}
+	}
+	if startCalls != 0 {
+		t.Fatalf("start calls = %d, want 0", startCalls)
+	}
+}
+
+func TestReconcileSessionBeads_ConfigChangeCancelsPendingIdleDrain(t *testing.T) {
+	env := newReconcilerTestEnv()
+	oldCfg := &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	env.cfg = oldCfg
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	oldPolicy := resolveSessionSleepPolicyInfo(sessiontest.SeedBead(t, session), oldCfg, env.sp)
+	ts := env.clk.Time.Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"state":                    "active",
+		"sleep_intent":             "idle-stop-pending",
+		"sleep_policy_fingerprint": oldPolicy.Fingerprint,
+		"last_woke_at":             ts,
+		"detached_at":              ts,
+	})
+	session.Metadata["state"] = "active"
+	session.Metadata["sleep_intent"] = "idle-stop-pending"
+	session.Metadata["sleep_policy_fingerprint"] = oldPolicy.Fingerprint
+	session.Metadata["last_woke_at"] = ts
+	session.Metadata["detached_at"] = ts
+	env.dt.set(session.ID, &drainState{
+		startedAt:  env.clk.Time.Add(-30 * time.Second),
+		deadline:   env.clk.Time.Add(2 * time.Minute),
+		reason:     "idle",
+		generation: 1,
+	})
+
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+
+	if got := env.reconcile([]beads.Bead{session}); got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	if env.dt.get(session.ID) != nil {
+		t.Fatal("idle drain should be canceled after config change")
+	}
+	if !env.sp.IsRunning("worker") {
+		t.Fatal("worker should remain running after config change")
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["sleep_intent"] != "" {
+		t.Fatalf("sleep_intent = %q, want empty", got.Metadata["sleep_intent"])
+	}
+}
+
+func TestReconcileSessionBeads_IdleTimeoutLeavesImmediateSleepPolicyAsleep(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Agents: []config.Agent{{
+			Name:           "worker",
+			Attach:         boolPtr(false),
+			IdleTimeout:    "5m",
+			SleepAfterIdle: "0s",
+		}},
+	}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	lastWoke := env.clk.Time.Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"state":        "active",
+		"last_woke_at": lastWoke,
+	})
+	session.Metadata["state"] = "active"
+	session.Metadata["last_woke_at"] = lastWoke
+
+	it := newFakeIdleTracker()
+	it.idle["worker"] = true
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	got := reconcileSessionBeads(
+		context.Background(),
+		[]beads.Bead{session},
+		env.desiredState,
+		cfgNames,
+		env.cfg,
+		env.sp,
+		env.store,
+		nil,
+		nil,
+		nil,
+		env.dt,
+		map[string]int{},
+		false,
+		nil,
+		"",
+		it,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+	)
+	if got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	startCalls := 0
+	for _, call := range env.sp.Calls {
+		if call.Method == "Start" && call.Name == "worker" {
+			startCalls++
+		}
+	}
+	if startCalls != 1 {
+		t.Fatalf("did not expect worker to restart, calls=%v", env.sp.Calls)
+	}
+}
+
+func TestReconcileSessionBeads_IdleTimeoutDoesNotRetryWithoutExplicitWakeReason(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Agents: []config.Agent{{
+			Name:           "worker",
+			Attach:         boolPtr(false),
+			IdleTimeout:    "5m",
+			SleepAfterIdle: "0s",
+		}},
+	}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	lastWoke := env.clk.Time.Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"state":        "active",
+		"last_woke_at": lastWoke,
+	})
+	session.Metadata["state"] = "active"
+	session.Metadata["last_woke_at"] = lastWoke
+	env.sp.StartErrors["worker"] = errors.New("boom")
+
+	it := newFakeIdleTracker()
+	it.idle["worker"] = true
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+	got := reconcileSessionBeads(
+		context.Background(),
+		[]beads.Bead{session},
+		env.desiredState,
+		cfgNames,
+		env.cfg,
+		env.sp,
+		env.store,
+		nil,
+		nil,
+		nil,
+		env.dt,
+		map[string]int{},
+		false,
+		nil,
+		"",
+		it,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+	)
+	if got != 0 {
+		t.Fatalf("planned wakes after failed restart = %d, want 0", got)
+	}
+	if env.sp.IsRunning("worker") {
+		t.Fatal("worker should stay stopped after failed restart")
+	}
+	failed, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get after failed restart: %v", err)
+	}
+	if failed.Metadata["sleep_reason"] != "idle-timeout" {
+		t.Fatalf("sleep_reason after failed restart = %q, want idle-timeout", failed.Metadata["sleep_reason"])
+	}
+	if failed.Metadata["last_woke_at"] != "" {
+		t.Fatalf("last_woke_at after failed restart = %q, want empty", failed.Metadata["last_woke_at"])
+	}
+
+	delete(env.sp.StartErrors, "worker")
+	got = reconcileSessionBeads(
+		context.Background(),
+		[]beads.Bead{failed},
+		env.desiredState,
+		cfgNames,
+		env.cfg,
+		env.sp,
+		env.store,
+		nil,
+		nil,
+		nil,
+		env.dt,
+		map[string]int{},
+		false,
+		nil,
+		"",
+		nil,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+	)
+	if got != 0 {
+		t.Fatalf("planned wakes after retry = %d, want 0", got)
+	}
+	if env.sp.IsRunning("worker") {
+		t.Fatal("worker should stay asleep without an explicit wake reason")
+	}
+	retried, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get after retry: %v", err)
+	}
+	if retried.Metadata["sleep_reason"] != "idle-timeout" {
+		t.Fatalf("sleep_reason after retry = %q, want idle-timeout", retried.Metadata["sleep_reason"])
+	}
+}
+
+func TestReconcileSessionBeads_RecoversPendingIdleSleep(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{{Name: "worker"}},
+	}
+	env.addDesired("worker", "worker", false)
+	session := env.createSessionBead("worker", "worker")
+	policy := resolveSessionSleepPolicyInfo(sessiontest.SeedBead(t, session), env.cfg, env.sp)
+	lastWoke := env.clk.Time.Add(-10 * time.Second).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"state":                    "active",
+		"sleep_intent":             "idle-stop-pending",
+		"sleep_policy_fingerprint": policy.Fingerprint,
+		"last_woke_at":             lastWoke,
+	})
+	session.Metadata["state"] = "active"
+	session.Metadata["sleep_intent"] = "idle-stop-pending"
+	session.Metadata["sleep_policy_fingerprint"] = policy.Fingerprint
+	session.Metadata["last_woke_at"] = lastWoke
+
+	if got := env.reconcile([]beads.Bead{session}); got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["sleep_reason"] != "idle" {
+		t.Fatalf("sleep_reason = %q, want idle", got.Metadata["sleep_reason"])
+	}
+	if got.Metadata["sleep_intent"] != "" {
+		t.Fatalf("sleep_intent = %q, want empty", got.Metadata["sleep_intent"])
+	}
+	if got.Metadata["wake_attempts"] != "" {
+		t.Fatalf("wake_attempts = %q, want empty", got.Metadata["wake_attempts"])
+	}
+}
+
+func TestRecoverPendingIdleSleep_PreservesPreDrainFingerprint(t *testing.T) {
+	store := beads.NewMemStore()
+	clk := &clock.Fake{Time: time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)}
+	session, err := store.Create(beads.Bead{
+		Title: "worker",
+		Metadata: map[string]string{
+			"session_name":             "worker",
+			"state":                    "active",
+			"sleep_intent":             "idle-stop-pending",
+			"sleep_policy_fingerprint": "old-fingerprint",
+			"last_woke_at":             clk.Time.Add(-10 * time.Second).UTC().Format(time.RFC3339),
+			"pending_create_claim":     "true",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !recoverPendingIdleSleepInfo(seedSessionInfo(session), sessionFrontDoor(store), false, clk) {
+		t.Fatal("expected pending idle sleep to recover")
+	}
+	got, err := store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["sleep_policy_fingerprint"] != "old-fingerprint" {
+		t.Fatalf("sleep_policy_fingerprint = %q, want preserved pre-drain value", got.Metadata["sleep_policy_fingerprint"])
+	}
+	if got.Metadata["pending_create_claim"] != "" {
+		t.Fatalf("pending_create_claim = %q, want cleared after pending idle sleep recovery", got.Metadata["pending_create_claim"])
+	}
+}
+
+func TestReconcileSessionBeads_DoesNotRecoverPendingIdleSleepWhileZombieStillRunning(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			NonInteractive: "0s",
+		},
+		Agents: []config.Agent{{
+			Name:   "worker",
+			Attach: boolPtr(false),
+		}},
+	}
+	env.addDesired("worker", "worker", true)
+	tp := env.desiredState["worker"]
+	tp.Hints.ProcessNames = []string{"claude"}
+	env.desiredState["worker"] = tp
+	env.sp.Zombies["worker"] = true
+
+	session := env.createSessionBead("worker", "worker")
+	lastWoke := env.clk.Time.Add(-10 * time.Second).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"state":        "active",
+		"sleep_intent": "idle-stop-pending",
+		"last_woke_at": lastWoke,
+	})
+	session.Metadata["state"] = "active"
+	session.Metadata["sleep_intent"] = "idle-stop-pending"
+	session.Metadata["last_woke_at"] = lastWoke
+
+	if got := env.reconcile([]beads.Bead{session}); got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Metadata["sleep_intent"] != "idle-stop-pending" {
+		t.Fatalf("sleep_intent = %q, want idle-stop-pending while runtime still exists", got.Metadata["sleep_intent"])
+	}
+	if got.Metadata["sleep_reason"] != "" {
+		t.Fatalf("sleep_reason = %q, want unchanged empty value", got.Metadata["sleep_reason"])
+	}
+}
+
+func TestReconcileSessionBeads_IdleStopPendingRestartsDrainAsIdle(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			NonInteractive: "0s",
+		},
+		Agents: []config.Agent{{
+			Name:   "worker",
+			Attach: boolPtr(false),
+		}},
+	}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	lastWoke := env.clk.Time.Add(-10 * time.Second).UTC().Format(time.RFC3339)
+	_ = env.store.SetMetadataBatch(session.ID, map[string]string{
+		"state":        "active",
+		"sleep_intent": "idle-stop-pending",
+		"last_woke_at": lastWoke,
+	})
+	session.Metadata["state"] = "active"
+	session.Metadata["sleep_intent"] = "idle-stop-pending"
+	session.Metadata["last_woke_at"] = lastWoke
+
+	if got := env.reconcile([]beads.Bead{session}); got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatal("expected idle-stop-pending session to enter a drain after restart")
+	}
+	if ds.reason != "idle" {
+		t.Fatalf("drain reason = %q, want idle", ds.reason)
+	}
+}
+
+func TestReconcileSessionBeads_ClearsIdleProbeForMissingSession(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.dt.startIdleProbe("missing")
+	if _, ok := env.dt.idleProbe("missing"); !ok {
+		t.Fatal("expected probe state for missing session before reconcile")
+	}
+
+	if got := env.reconcile(nil); got != 0 {
+		t.Fatalf("planned wakes = %d, want 0", got)
+	}
+	if _, ok := env.dt.idleProbe("missing"); ok {
+		t.Fatal("expected missing-session idle probe to be cleared")
+	}
+}
+
+func TestReconcileSessionBeads_AsleepSingletonsDoNotWakeViaScaleCheck(t *testing.T) {
+	// Asleep sessions are never restarted by scaleCheck/poolDesired alone.
+	// They wake only via direct assignment to their alias. The reconciler
+	// creates fresh sessions to fill demand instead of reusing asleep ones.
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			NonInteractive: "0s",
+		},
+		Agents: []config.Agent{
+			{Name: "db", Attach: boolPtr(false)},
+			{Name: "api", Attach: boolPtr(false), DependsOn: []string{"db"}},
+		},
+	}
+	env.addDesired("db", "db", false)
+	env.addDesired("api", "api", false)
+	dbSession := env.createSessionBead("db", "db")
+	apiSession := env.createSessionBead("api", "api")
+	cfgNames := configuredSessionNames(env.cfg, "", env.store)
+
+	got := reconcileSessionBeads(
+		context.Background(),
+		[]beads.Bead{dbSession, apiSession},
+		env.desiredState,
+		cfgNames,
+		env.cfg,
+		env.sp,
+		env.store,
+		nil,
+		nil,
+		nil,
+		env.dt,
+		map[string]int{"api": 1, "db": 1},
+		false,
+		nil,
+		"",
+		nil,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+	)
+	if got != 0 {
+		t.Fatalf("planned wakes = %d, want 0 (asleep sessions stay asleep)", got)
+	}
+}
+
+func TestEvaluateWakeReasons_KeepWarmForDetachedInteractive(t *testing.T) {
+	cfg := &config.City{
+		SessionSleep: config.SessionSleepConfig{
+			InteractiveResume: "60s",
+		},
+		Agents: []config.Agent{
+			{Name: "db"},
+			{Name: "api", DependsOn: []string{"db"}},
+		},
+	}
+	now := time.Now().UTC()
+	apiBead := makeBead("api-bead", map[string]string{
+		"template":     "api",
+		"session_name": "api",
+		"detached_at":  now.Add(-30 * time.Second).Format(time.RFC3339),
+	})
+	eval := evaluateWakeReasonsInfo(seedSessionInfo(apiBead), cfg, runtime.NewFake(), nil, nil, nil, &clock.Fake{Time: now})
+	if !containsWakeReason(eval.Reasons, WakeKeepWarm) {
+		t.Fatalf("api reasons = %v, want WakeKeepWarm for a recently detached interactive session", eval.Reasons)
+	}
+}
+
+func TestSelectIdleProbeTargets_RotatesAcrossTicks(t *testing.T) {
+	mkTarget := func(id string) wakeTarget {
+		return wakeTarget{
+			info:  sessionpkg.Info{ID: id},
+			alive: true,
+		}
+	}
+	wakeTargets := []wakeTarget{
+		mkTarget("one"),
+		mkTarget("two"),
+		mkTarget("three"),
+		mkTarget("four"),
+	}
+	policy := resolvedSessionSleepPolicy{
+		Class:      config.SessionSleepInteractiveResume,
+		Effective:  "60s",
+		Capability: runtime.SessionSleepCapabilityFull,
+	}
+	wakeEvals := map[string]wakeEvaluation{
+		"one":   {Policy: policy, ConfigSuppressed: true},
+		"two":   {Policy: policy, ConfigSuppressed: true},
+		"three": {Policy: policy, ConfigSuppressed: true},
+		"four":  {Policy: policy, ConfigSuppressed: true},
+	}
+	dt := newDrainTracker()
+	infoByID := infoByIDForTargets(wakeTargets)
+
+	first := selectIdleProbeTargets(wakeTargets, wakeEvals, dt, infoByID)
+	if len(first) != 3 {
+		t.Fatalf("first selection = %d targets, want 3", len(first))
+	}
+	if first["four"] {
+		t.Fatalf("first selection unexpectedly included fourth target: %v", first)
+	}
+
+	second := selectIdleProbeTargets(wakeTargets, wakeEvals, dt, infoByID)
+	if !second["four"] {
+		t.Fatalf("second selection should rotate in fourth target, got %v", second)
+	}
+}
+
+func TestSelectIdleProbeTargets_SkipsExplicitSleepIntent(t *testing.T) {
+	dt := newDrainTracker()
+	policy := resolvedSessionSleepPolicy{
+		Class:      config.SessionSleepInteractiveResume,
+		Effective:  "60s",
+		Capability: runtime.SessionSleepCapabilityFull,
+	}
+	wakeTargets := []wakeTarget{{
+		info:  sessionpkg.Info{ID: "wait-hold", SleepIntent: "wait-hold"},
+		alive: true,
+	}}
+	wakeEvals := map[string]wakeEvaluation{
+		"wait-hold": {Policy: policy, ConfigSuppressed: true},
+	}
+
+	targets := selectIdleProbeTargets(wakeTargets, wakeEvals, dt, infoByIDForTargets(wakeTargets))
+	if len(targets) != 0 {
+		t.Fatalf("selectIdleProbeTargets returned %v, want no probe targets", targets)
+	}
+}
+
+func TestAdvanceSessionDrainsWithSessions_UsesProvidedWakeEvaluations(t *testing.T) {
+	now := time.Now().UTC()
+	dt := newDrainTracker()
+	bead := beads.Bead{
+		ID: "session-1",
+		Metadata: map[string]string{
+			"session_name": "worker-1",
+			"generation":   "1",
+			"template":     "worker",
+		},
+	}
+	dt.set(bead.ID, &drainState{
+		startedAt:  now.Add(-time.Minute),
+		deadline:   now.Add(time.Minute),
+		reason:     "idle",
+		generation: 1,
+	})
+
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker-1", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	advanceSessionDrainsWithSessionsTraced(
+		dt,
+		sp,
+		nil,
+		infoLookupFromBeadLookup(func(id string) *beads.Bead {
+			if id == bead.ID {
+				return &bead
+			}
+			return nil
+		}),
+		map[string]wakeEvaluation{
+			bead.ID: {Reasons: []WakeReason{WakeWork}},
+		},
+		&config.City{},
+		&clock.Fake{Time: now},
+		nil,
+	)
+
+	if got := dt.get(bead.ID); got != nil {
+		t.Fatalf("drain state = %#v, want canceled drain", got)
+	}
+}
+
+// waitForIdleProbeReady polls the drain tracker until the idle probe for
+// beadID is registered and marked ready, or until the deadline expires.
+//
+// Callers must ensure the probe goroutine does not complete within the
+// same reconcile tick that started it — otherwise shouldBeginIdleDrain
+// observes probe.ready=true and its deferred clearIdleProbe removes the
+// probe from the map before this helper can see it. The standard way to
+// enforce that ordering is to set env.sp.WaitForIdleGates[sessionName]
+// to a channel, run the tick (probe goroutine blocks on the gate), then
+// close the gate and call this helper. Without the gate, tests race
+// against goroutine scheduling and flake under -race.
+func waitForIdleProbeReady(t *testing.T, dt *drainTracker, beadID string) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if probe, ok := dt.idleProbe(beadID); ok && probe.ready {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("idle probe for %s not ready within 10s", beadID)
+}

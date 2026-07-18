@@ -1,0 +1,630 @@
+package api
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/configedit"
+	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/extmsg"
+	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
+	"github.com/gastownhall/gascity/internal/orderdispatch"
+	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/usage"
+	"github.com/gastownhall/gascity/internal/workspacesvc"
+)
+
+// newPostRequest creates a POST httptest request with the X-GC-Request header
+// set, satisfying the CSRF protection middleware.
+func newPostRequest(url string, body io.Reader) *http.Request {
+	req := httptest.NewRequest("POST", url, body)
+	req.Header.Set("X-GC-Request", "true")
+	return req
+}
+
+// fakeState implements State for testing.
+type fakeState struct {
+	cfg               *config.City
+	rawCfg            *config.City // optional: raw config for provenance detection
+	sp                *runtime.Fake
+	stores            map[string]beads.Store
+	cityBeadStore     beads.Store // city-level store for session beads
+	nudgesBeadStore   beads.Store // relocated nudges store; nil falls back to cityBeadStore (default backend)
+	sessionsBeadStore beads.Store // relocated sessions store; nil falls back to cityBeadStore (default backend)
+	graphBeadStore    beads.Store // relocated graph store; nil falls back to cityBeadStore (default backend)
+	cityBeadsDiag     *beads.BeadsDiagnostic
+	cityMailProv      mail.Provider // city-level mail provider (all mail is city-scoped)
+	eventProv         events.Provider
+	cityName          string
+	cityPath          string
+	startedAt         time.Time
+	quarantined       map[string]bool
+	autos             []orders.Order
+	allOrders         []orders.Order
+	services          workspacesvc.Registry
+	webhookDispatcher orderdispatch.Dispatcher // backs WebhookDispatchProvider; nil disables webhook dispatch
+	pokeCount         int
+	extmsgSvc         *extmsg.Services
+	adapterReg        *extmsg.AdapterRegistry
+	maintenance       MaintenanceProvider
+	usageSink         usage.Sink
+	// scopedStoreFn backs ScopedStoreLike. Nil (the default) returns
+	// (nil, nil) — "existing isn't bd-CLI backed, keep using it directly" —
+	// matching the real implementation's answer for the MemStore fakes most
+	// tests use.
+	scopedStoreFn func(ctx context.Context, existing beads.Store) (beads.Store, error)
+}
+
+func newFakeState(t testing.TB) *fakeState {
+	t.Helper()
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	return &fakeState{
+		cfg: &config.City{
+			Workspace: config.Workspace{Name: "test-city"},
+			Agents: []config.Agent{
+				{Name: "worker", Dir: "myrig", Provider: "test-agent", MaxActiveSessions: intPtr(1)},
+			},
+			NamedSessions: []config.NamedSession{
+				{Template: "worker", Dir: "myrig"},
+			},
+			Rigs: []config.Rig{
+				{Name: "myrig", Path: "/tmp/myrig"},
+			},
+			Providers: map[string]config.ProviderSpec{
+				"test-agent": {DisplayName: "Test Agent"},
+			},
+		},
+		sp:           runtime.NewFake(),
+		stores:       map[string]beads.Store{"myrig": store},
+		cityMailProv: mp,
+		eventProv:    events.NewFake(),
+		cityName:     "test-city",
+		cityPath:     t.TempDir(),
+		startedAt:    time.Now(),
+	}
+}
+
+func (f *fakeState) Config() *config.City                { return f.cfg }
+func (f *fakeState) SessionProvider() runtime.Provider   { return f.sp }
+func (f *fakeState) BeadStore(rig string) beads.Store    { return f.stores[rig] }
+func (f *fakeState) BeadStores() map[string]beads.Store  { return f.stores }
+func (f *fakeState) MailProvider(_ string) mail.Provider { return f.cityMailProv }
+func (f *fakeState) MailProviders() map[string]mail.Provider {
+	if f.cityMailProv == nil {
+		return map[string]mail.Provider{}
+	}
+	return map[string]mail.Provider{f.cityName: f.cityMailProv}
+}
+func (f *fakeState) EventProvider() events.Provider { return f.eventProv }
+func (f *fakeState) UsageSink() usage.Sink {
+	if f.usageSink != nil {
+		return f.usageSink
+	}
+	return usage.Discard
+}
+func (f *fakeState) CityName() string                      { return f.cityName }
+func (f *fakeState) CityPath() string                      { return f.cityPath }
+func (f *fakeState) Version() string                       { return "test" }
+func (f *fakeState) StartedAt() time.Time                  { return f.startedAt }
+func (f *fakeState) IsQuarantined(sessionName string) bool { return f.quarantined[sessionName] }
+func (f *fakeState) ClearCrashHistory(sessionName string)  { delete(f.quarantined, sessionName) }
+func (f *fakeState) CityBeadStore() beads.Store            { return f.cityBeadStore }
+func (f *fakeState) ScopedStoreLike(ctx context.Context, existing beads.Store) (beads.Store, error) {
+	if f.scopedStoreFn == nil {
+		return nil, nil
+	}
+	return f.scopedStoreFn(ctx, existing)
+}
+
+func (f *fakeState) NudgesBeadStore() beads.NudgesStore {
+	if f.nudgesBeadStore != nil {
+		return beads.NudgesStore{Store: f.nudgesBeadStore}
+	}
+	return beads.NudgesStore{Store: f.cityBeadStore}
+}
+
+func (f *fakeState) SessionsBeadStore() beads.SessionStore {
+	if f.sessionsBeadStore != nil {
+		return beads.SessionStore{Store: f.sessionsBeadStore}
+	}
+	return beads.SessionStore{Store: f.cityBeadStore}
+}
+
+func (f *fakeState) GraphBeadStore() beads.GraphStore {
+	if f.graphBeadStore != nil {
+		return beads.GraphStore{Store: f.graphBeadStore}
+	}
+	return beads.GraphStore{Store: f.cityBeadStore}
+}
+
+func (f *fakeState) CityBeadsDiagnostic() *beads.BeadsDiagnostic {
+	if f.cityBeadsDiag == nil {
+		return nil
+	}
+	diag := *f.cityBeadsDiag
+	return &diag
+}
+func (f *fakeState) Orders() []orders.Order { return f.autos }
+func (f *fakeState) OrdersAll() []orders.Order {
+	if f.allOrders != nil {
+		return f.allOrders
+	}
+	return f.autos
+}
+func (f *fakeState) Poke()                                  { f.pokeCount++ }
+func (f *fakeState) ServiceRegistry() workspacesvc.Registry { return f.services }
+
+// WebhookDispatcher lets fakeState satisfy WebhookDispatchProvider so webhook
+// receiver tests can inject a fake dispatcher (or leave it nil to exercise the
+// dispatch-unavailable path).
+func (f *fakeState) WebhookDispatcher() orderdispatch.Dispatcher { return f.webhookDispatcher }
+
+func (f *fakeState) ExtMsgServices() *extmsg.Services         { return f.extmsgSvc }
+func (f *fakeState) AdapterRegistry() *extmsg.AdapterRegistry { return f.adapterReg }
+func (f *fakeState) MaintenanceLoop() MaintenanceProvider     { return f.maintenance }
+
+func (f *fakeState) RawConfig() *config.City {
+	if f.rawCfg != nil {
+		return f.rawCfg
+	}
+	return f.cfg // fallback: raw == expanded when no packs
+}
+
+// fakeMutatorState extends fakeState with StateMutator for testing mutations.
+type fakeMutatorState struct {
+	*fakeState
+	suspended map[string]bool
+
+	// serializeMu + serializeCalls make fakeMutatorState a ConfigWriteSerializer
+	// so pack handler tests exercise the real per-city write-lock seam and can
+	// assert mutations route through it.
+	serializeMu    sync.Mutex
+	serializeCalls atomic.Int32
+
+	// provisionGate, when non-nil, blocks ProvisionRigFromGit until it is closed
+	// or receives — lets a test hold a provision in flight to exercise the
+	// live-index replay path deterministically.
+	provisionGate chan struct{}
+
+	// Rollback/teardown injection for the C4c G14 tests, guarded by provisionMu.
+	// provisionFailN makes the next N ProvisionRigFromGit calls return
+	// provisionErr AFTER emitting a created-dir manifest (a failure once the dir
+	// exists). teardownCalls records every TeardownPartialRig manifest;
+	// teardownErr, when set, makes TeardownPartialRig fail.
+	provisionMu             sync.Mutex
+	provisionCalls          int
+	provisionFailN          int
+	provisionErr            error
+	provisionCtxHadDeadline bool
+	teardownCalls           []RigProvisionManifest
+	teardownErr             error
+}
+
+func newFakeMutatorState(t *testing.T) *fakeMutatorState {
+	t.Helper()
+	return &fakeMutatorState{
+		fakeState: newFakeState(t),
+		suspended: make(map[string]bool),
+	}
+}
+
+// SerializeConfigWrite runs fn under a real lock and counts the call, mirroring
+// the production controllerState seam that shares the configedit.Editor lock.
+func (f *fakeMutatorState) SerializeConfigWrite(fn func() error) error {
+	f.serializeMu.Lock()
+	defer f.serializeMu.Unlock()
+	f.serializeCalls.Add(1)
+	return fn()
+}
+
+func (f *fakeMutatorState) SuspendAgent(name string) error { f.suspended[name] = true; return nil }
+func (f *fakeMutatorState) ResumeAgent(name string) error  { delete(f.suspended, name); return nil }
+func (f *fakeMutatorState) EnableOrder(name, rig string) error {
+	enabled := true
+	return f.SetOrderOverrideEnabled(name, rig, &enabled)
+}
+
+func (f *fakeMutatorState) DisableOrder(name, rig string) error {
+	enabled := false
+	return f.SetOrderOverrideEnabled(name, rig, &enabled)
+}
+
+func (f *fakeMutatorState) SetOrderOverrideEnabled(name, rig string, enabled *bool) error {
+	for i := range f.cfg.Orders.Overrides {
+		if f.cfg.Orders.Overrides[i].Name == name && f.cfg.Orders.Overrides[i].Rig == rig {
+			f.cfg.Orders.Overrides[i].Enabled = enabled
+			return nil
+		}
+	}
+	f.cfg.Orders.Overrides = append(f.cfg.Orders.Overrides, config.OrderOverride{
+		Name:    name,
+		Rig:     rig,
+		Enabled: enabled,
+	})
+	return nil
+}
+
+func (f *fakeMutatorState) SuspendRig(name string) error {
+	cfg := f.Config()
+	found := false
+	for _, r := range cfg.Rigs {
+		if r.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: rig %q", configedit.ErrNotFound, name)
+	}
+	tmpl := cfg.Workspace.SessionTemplate
+	for _, a := range cfg.Agents {
+		if a.Dir != name {
+			continue
+		}
+		expanded := expandAgent(a, f.cityName, tmpl, f.sp)
+		for _, ea := range expanded {
+			sessionName := agent.SessionNameFor(f.cityName, ea.qualifiedName, tmpl)
+			_ = f.sp.SetMeta(sessionName, "suspended", "true")
+		}
+	}
+	return nil
+}
+
+func (f *fakeMutatorState) ResumeRig(name string) error {
+	cfg := f.Config()
+	found := false
+	for _, r := range cfg.Rigs {
+		if r.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: rig %q", configedit.ErrNotFound, name)
+	}
+	tmpl := cfg.Workspace.SessionTemplate
+	for _, a := range cfg.Agents {
+		if a.Dir != name {
+			continue
+		}
+		expanded := expandAgent(a, f.cityName, tmpl, f.sp)
+		for _, ea := range expanded {
+			sessionName := agent.SessionNameFor(f.cityName, ea.qualifiedName, tmpl)
+			_ = f.sp.RemoveMeta(sessionName, "suspended")
+		}
+	}
+	return nil
+}
+
+func (f *fakeMutatorState) SuspendCity() error { f.cfg.Workspace.Suspended = true; return nil }
+func (f *fakeMutatorState) ResumeCity() error  { f.cfg.Workspace.Suspended = false; return nil }
+func (f *fakeMutatorState) CreateAgent(a config.Agent) error {
+	if err := config.ValidateAgents([]config.Agent{a}); err != nil {
+		return fmt.Errorf("%w: agent: %w", configedit.ErrValidation, err)
+	}
+	f.cfg.Agents = append(f.cfg.Agents, a)
+	return nil
+}
+
+func (f *fakeMutatorState) UpdateAgent(name string, patch AgentUpdate) error {
+	dir, base := config.ParseQualifiedName(name)
+	for i := range f.cfg.Agents {
+		if f.cfg.Agents[i].Dir == dir && f.cfg.Agents[i].Name == base {
+			if patch.Provider != "" {
+				f.cfg.Agents[i].Provider = patch.Provider
+			}
+			if patch.Scope != "" {
+				f.cfg.Agents[i].Scope = patch.Scope
+			}
+			if patch.Suspended != nil {
+				f.cfg.Agents[i].Suspended = *patch.Suspended
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: agent %q", configedit.ErrNotFound, name)
+}
+
+func (f *fakeMutatorState) DeleteAgent(name string) error {
+	dir, base := config.ParseQualifiedName(name)
+	for i := range f.cfg.Agents {
+		if f.cfg.Agents[i].Dir == dir && f.cfg.Agents[i].Name == base {
+			f.cfg.Agents = append(f.cfg.Agents[:i], f.cfg.Agents[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: agent %q", configedit.ErrNotFound, name)
+}
+
+func (f *fakeMutatorState) CreateRig(r config.Rig) error {
+	f.cfg.Rigs = append(f.cfg.Rigs, r)
+	return nil
+}
+
+// ProvisionRigFromGit is the fake async-clone path: it skips the real
+// clone/SSRF and just appends the rig (emitting synthetic progress) so handler
+// tests can exercise the 202 flow without a network. If onStep is set it emits
+// a clone + done step. onManifest is invoked record-then-create with the
+// created dir so persistence/rollback wiring is exercised; mirroring the real
+// path, a pre-clone onManifest error is fail-closed (abort before appending the
+// rig) while the post-init one is best-effort. When provisionFailN is set it
+// returns provisionErr after the manifest is reported (a failure once the dir
+// exists), without appending the rig.
+func (f *fakeMutatorState) ProvisionRigFromGit(ctx context.Context, r config.Rig, gitURL string, onStep func(step, detail string, warn bool), onManifest func(RigProvisionManifest) error) (config.Rig, error) {
+	_, hasDeadline := ctx.Deadline()
+	f.provisionMu.Lock()
+	f.provisionCtxHadDeadline = hasDeadline
+	f.provisionMu.Unlock()
+	if f.provisionGate != nil {
+		// Honor the caller's deadline while gated so a bounded provisioning context
+		// can terminalize a "stalled clone" instead of blocking forever.
+		select {
+		case <-f.provisionGate:
+		case <-ctx.Done():
+			return config.Rig{}, ctx.Err()
+		}
+	}
+	if onStep != nil {
+		onStep("clone", "cloning "+gitURL, false)
+	}
+	if r.Path == "" {
+		r.Path = "rigs/" + r.Name
+	}
+	// Record-then-create: manifest the dir before "cloning". A pre-clone persist
+	// failure is fail-closed (mirror the real ProvisionRigFromGit): abort before
+	// appending the rig so no un-manifested rig is created.
+	if onManifest != nil {
+		if err := onManifest(RigProvisionManifest{RigName: r.Name, CreatedDir: r.Path}); err != nil {
+			return config.Rig{}, err
+		}
+	}
+
+	f.provisionMu.Lock()
+	f.provisionCalls++
+	fail := f.provisionFailN > 0
+	if fail {
+		f.provisionFailN--
+	}
+	provErr := f.provisionErr
+	f.provisionMu.Unlock()
+	if fail {
+		return config.Rig{}, provErr
+	}
+
+	f.cfg.Rigs = append(f.cfg.Rigs, r)
+	// Post-init manifest is best-effort in the real path (a complete rig is
+	// forward-reconciled, never torn down), so a persist error here does not fail
+	// the provision.
+	if onManifest != nil {
+		_ = onManifest(RigProvisionManifest{RigName: r.Name, CreatedDir: r.Path})
+	}
+	if onStep != nil {
+		onStep("done", "Rig added.", false)
+	}
+	return r, nil
+}
+
+// TeardownPartialRig records the manifest it was asked to tear down (and,
+// unless teardownErr is set, reports success) so tests can assert the
+// drop-then-mark rollback, the re-clone pre-drop, and the boot sweep invoked it
+// with the right created_dir.
+func (f *fakeMutatorState) TeardownPartialRig(_ context.Context, m RigProvisionManifest) error {
+	f.provisionMu.Lock()
+	defer f.provisionMu.Unlock()
+	f.teardownCalls = append(f.teardownCalls, m)
+	return f.teardownErr
+}
+
+// teardownManifests returns a copy of the recorded teardown manifests.
+func (f *fakeMutatorState) teardownManifests() []RigProvisionManifest {
+	f.provisionMu.Lock()
+	defer f.provisionMu.Unlock()
+	return append([]RigProvisionManifest(nil), f.teardownCalls...)
+}
+
+// provisionHadDeadline reports whether the last ProvisionRigFromGit was called
+// with a context carrying a deadline (the server-owned provisioning bound).
+func (f *fakeMutatorState) provisionHadDeadline() bool {
+	f.provisionMu.Lock()
+	defer f.provisionMu.Unlock()
+	return f.provisionCtxHadDeadline
+}
+
+func (f *fakeMutatorState) UpdateRig(name string, patch RigUpdate) error {
+	for i := range f.cfg.Rigs {
+		if f.cfg.Rigs[i].Name == name {
+			if patch.Path != "" {
+				f.cfg.Rigs[i].Path = patch.Path
+			}
+			if patch.Prefix != "" {
+				f.cfg.Rigs[i].Prefix = patch.Prefix
+			}
+			if patch.DefaultBranch != "" {
+				f.cfg.Rigs[i].DefaultBranch = patch.DefaultBranch
+			}
+			if patch.Suspended != nil {
+				f.cfg.Rigs[i].Suspended = *patch.Suspended
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: rig %q", configedit.ErrNotFound, name)
+}
+
+func (f *fakeMutatorState) DeleteRig(name string) error {
+	for i := range f.cfg.Rigs {
+		if f.cfg.Rigs[i].Name == name {
+			f.cfg.Rigs = append(f.cfg.Rigs[:i], f.cfg.Rigs[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: rig %q", configedit.ErrNotFound, name)
+}
+
+func (f *fakeMutatorState) CreateProvider(name string, spec config.ProviderSpec) error {
+	if f.cfg.Providers == nil {
+		f.cfg.Providers = make(map[string]config.ProviderSpec)
+	}
+	if _, exists := f.cfg.Providers[name]; exists {
+		return fmt.Errorf("%w: provider %q", configedit.ErrAlreadyExists, name)
+	}
+	f.cfg.Providers[name] = spec
+	return nil
+}
+
+func (f *fakeMutatorState) UpdateProvider(name string, patch ProviderUpdate) error {
+	if f.cfg.Providers == nil {
+		return fmt.Errorf("%w: provider %q", configedit.ErrNotFound, name)
+	}
+	spec, ok := f.cfg.Providers[name]
+	if !ok {
+		return fmt.Errorf("%w: provider %q", configedit.ErrNotFound, name)
+	}
+	if patch.DisplayName != nil {
+		spec.DisplayName = *patch.DisplayName
+	}
+	if patch.Base != nil {
+		spec.Base = *patch.Base
+	}
+	if patch.Command != nil {
+		spec.Command = *patch.Command
+	}
+	if patch.ACPCommand != nil {
+		spec.ACPCommand = *patch.ACPCommand
+	}
+	if patch.Args != nil {
+		spec.Args = make([]string, len(patch.Args))
+		copy(spec.Args, patch.Args)
+	}
+	if patch.ACPArgs != nil {
+		spec.ACPArgs = make([]string, len(patch.ACPArgs))
+		copy(spec.ACPArgs, patch.ACPArgs)
+	}
+	if patch.ArgsAppend != nil {
+		spec.ArgsAppend = make([]string, len(patch.ArgsAppend))
+		copy(spec.ArgsAppend, patch.ArgsAppend)
+	}
+	if patch.PromptMode != nil {
+		spec.PromptMode = *patch.PromptMode
+	}
+	if patch.PromptFlag != nil {
+		spec.PromptFlag = *patch.PromptFlag
+	}
+	if patch.ReadyDelayMs != nil {
+		spec.ReadyDelayMs = *patch.ReadyDelayMs
+	}
+	if len(patch.Env) > 0 {
+		if spec.Env == nil {
+			spec.Env = make(map[string]string, len(patch.Env))
+		}
+		for k, v := range patch.Env {
+			spec.Env[k] = v
+		}
+	}
+	if patch.OptionsSchemaMerge != nil {
+		spec.OptionsSchemaMerge = *patch.OptionsSchemaMerge
+	}
+	if patch.OptionsSchema != nil {
+		spec.OptionsSchema = append([]config.ProviderOption(nil), patch.OptionsSchema...)
+	}
+	if len(patch.OptionDefaults) > 0 {
+		if spec.OptionDefaults == nil {
+			spec.OptionDefaults = make(map[string]string, len(patch.OptionDefaults))
+		}
+		for k, v := range patch.OptionDefaults {
+			spec.OptionDefaults[k] = v
+		}
+	}
+	f.cfg.Providers[name] = spec
+	return nil
+}
+
+func (f *fakeMutatorState) DeleteProvider(name string) error {
+	if f.cfg.Providers == nil {
+		return fmt.Errorf("%w: provider %q", configedit.ErrNotFound, name)
+	}
+	if _, ok := f.cfg.Providers[name]; !ok {
+		return fmt.Errorf("%w: provider %q", configedit.ErrNotFound, name)
+	}
+	delete(f.cfg.Providers, name)
+	return nil
+}
+
+func (f *fakeMutatorState) SetAgentPatch(patch config.AgentPatch) error {
+	for i := range f.cfg.Patches.Agents {
+		if f.cfg.Patches.Agents[i].Dir == patch.Dir && f.cfg.Patches.Agents[i].Name == patch.Name {
+			f.cfg.Patches.Agents[i] = patch
+			return nil
+		}
+	}
+	f.cfg.Patches.Agents = append(f.cfg.Patches.Agents, patch)
+	return nil
+}
+
+func (f *fakeMutatorState) DeleteAgentPatch(name string) error {
+	dir, base := config.ParseQualifiedName(name)
+	for i := range f.cfg.Patches.Agents {
+		if f.cfg.Patches.Agents[i].Dir == dir && f.cfg.Patches.Agents[i].Name == base {
+			f.cfg.Patches.Agents = append(f.cfg.Patches.Agents[:i], f.cfg.Patches.Agents[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: agent patch %q", configedit.ErrNotFound, name)
+}
+
+func (f *fakeMutatorState) SetRigPatch(patch config.RigPatch) error {
+	for i := range f.cfg.Patches.Rigs {
+		if f.cfg.Patches.Rigs[i].Name == patch.Name {
+			f.cfg.Patches.Rigs[i] = patch
+			return nil
+		}
+	}
+	f.cfg.Patches.Rigs = append(f.cfg.Patches.Rigs, patch)
+	return nil
+}
+
+func (f *fakeMutatorState) DeleteRigPatch(name string) error {
+	for i := range f.cfg.Patches.Rigs {
+		if f.cfg.Patches.Rigs[i].Name == name {
+			f.cfg.Patches.Rigs = append(f.cfg.Patches.Rigs[:i], f.cfg.Patches.Rigs[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: rig patch %q", configedit.ErrNotFound, name)
+}
+
+func (f *fakeMutatorState) SetProviderPatch(patch config.ProviderPatch) error {
+	for i := range f.cfg.Patches.Providers {
+		if f.cfg.Patches.Providers[i].Name == patch.Name {
+			f.cfg.Patches.Providers[i] = patch
+			return nil
+		}
+	}
+	f.cfg.Patches.Providers = append(f.cfg.Patches.Providers, patch)
+	return nil
+}
+
+func (f *fakeMutatorState) DeleteProviderPatch(name string) error {
+	for i := range f.cfg.Patches.Providers {
+		if f.cfg.Patches.Providers[i].Name == name {
+			f.cfg.Patches.Providers = append(f.cfg.Patches.Providers[:i], f.cfg.Patches.Providers[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: provider patch %q", configedit.ErrNotFound, name)
+}
+
+func intPtr(n int) *int { return &n }

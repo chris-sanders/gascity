@@ -1,0 +1,69 @@
+# Gas City controller container image.
+#
+# Extends the agent image with kubectl, K8s helper scripts, and
+# the workspace management dashboard.
+#
+# Build:
+#   docker build -f contrib/k8s/Dockerfile.controller \
+#     -t gc-controller:latest .
+#
+# The gc-agent image must be built first:
+#   docker build -f contrib/k8s/Dockerfile.agent -t gc-agent:latest .
+
+# Local build-layer image produced by Dockerfile.agent, not a registry pull.
+ARG BASE=gc-agent:latest
+FROM ${BASE}
+
+# Controller installs to /usr/local/bin — need root.
+USER root
+
+# kubectl for agent attach and beads/events exec providers.
+ARG KUBECTL_VERSION=v1.36.0
+RUN curl -fsSL \
+    "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+    -o /tmp/kubectl \
+    && curl -fsSL \
+       "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256" \
+       -o /tmp/kubectl.sha256 \
+    && echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c - \
+    && install -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
+    && rm -f /tmp/kubectl /tmp/kubectl.sha256
+
+# K8s provider scripts (beads, events). Session provider is now native
+# (compiled into gc binary as GC_SESSION=k8s).
+COPY contrib/beads-scripts/gc-beads-k8s /usr/local/bin/gc-beads-k8s
+COPY contrib/events-scripts/gc-events-k8s /usr/local/bin/gc-events-k8s
+
+# Dashboard — per-workspace management UI (1:1 with workspace).
+# Pre-built binary + frontend assets from the dashboard repo.
+# COPY --from=dashboard server/target/release/dashboard-server /usr/local/bin/dashboard-server
+# COPY --from=dashboard dist/ /opt/dashboard/dist/
+
+WORKDIR /city
+USER gcagent
+
+# gc does not harvest SIGCHLD, so bd/dolt/git processes that reparent to it
+# would pile up as <defunct> zombies. Run tini as PID 1 to reap those orphans
+# and forward signals to gc, which becomes tini's direct child via `exec gc` in
+# CMD below.
+#
+# tini ships in the base image (Dockerfile.base). Fail the build if the inherited
+# gc-agent layer predates that install, rather than shipping a controller image
+# that only crashes at startup when this ENTRYPOINT execs a missing /usr/bin/tini
+# (rebuild the chain with `make docker-base docker-agent`).
+RUN test -x /usr/bin/tini
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# Wait for city directory to be copied in (via gc-controller-k8s deploy),
+# then init from it and wait for the deploy script to finish setup (bd init
+# for scale_check) before starting the controller.  Skip init if already
+# initialized (persistent PVC survives pod restarts).
+CMD ["sh", "-c", \
+  "while [ ! -f /city/city.toml ]; do sleep 1; done && \
+   if [ ! -d /city/.gc ]; then \
+     cp -r /city /tmp/city-src && \
+     gc init --from /tmp/city-src /city; \
+   fi && \
+   touch /city/.gc-init-done && \
+   while [ ! -f /city/.gc-start ]; do sleep 0.5; done && \
+   exec gc start --foreground /city"]

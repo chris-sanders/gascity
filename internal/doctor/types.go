@@ -1,0 +1,104 @@
+// Package doctor provides system health diagnostics for a Gas City workspace.
+// It defines a Check interface and runner that executes checks with streaming
+// output, optional --fix support, and a summary report.
+package doctor
+
+import "io"
+
+// CheckStatus represents the outcome of a health check.
+type CheckStatus int
+
+const (
+	// StatusOK means the check passed.
+	StatusOK CheckStatus = iota
+	// StatusWarning means the check found a non-critical issue.
+	StatusWarning
+	// StatusError means the check found a critical problem.
+	StatusError
+)
+
+// CheckSeverity tells consumers (e.g. dispatch gates) whether a failing check
+// should be treated as blocking or merely informational. The zero value is
+// SeverityBlocking so existing checks remain blocking without modification.
+type CheckSeverity int
+
+const (
+	// SeverityBlocking means a failing result should gate consumers
+	// (dispatch, automation, exit codes). This is the default.
+	SeverityBlocking CheckSeverity = iota
+	// SeverityAdvisory means a failing result is informational only;
+	// consumers may proceed past it without remediation.
+	SeverityAdvisory
+)
+
+// Check is a single diagnostic check. Implementations are registered with
+// a Doctor and executed sequentially during Run.
+type Check interface {
+	// Name returns a short, unique identifier for this check (e.g. "city-config").
+	Name() string
+	// Run executes the check and returns a result.
+	Run(ctx *CheckContext) *CheckResult
+	// CanFix reports whether this check supports automatic remediation.
+	CanFix() bool
+	// Fix attempts to automatically remediate the issue found by Run.
+	// Only called when CanFix returns true and Run returned a non-OK status.
+	Fix(ctx *CheckContext) error
+	// WarmupEligible reports whether this check should be included in
+	// `gc start`'s warm-up scan (in addition to running on demand via
+	// `gc doctor`). Default for all in-tree checks is false; opt in by
+	// returning true. Pack-declared checks opt in via `warmup = true`
+	// on the pack.toml [[doctor]] entry or doctor.toml manifest.
+	WarmupEligible() bool
+}
+
+// CheckContext carries shared state for all checks during a doctor run.
+type CheckContext struct {
+	// CityPath is the absolute path to the city root directory.
+	CityPath string
+	// Verbose enables extra diagnostic output in check results.
+	Verbose bool
+	// Output is the writer used for doctor output during Doctor.Run.
+	// Checks that need to surface fix-time diagnostics should use this
+	// writer so captured doctor output includes the diagnostics.
+	Output io.Writer
+	// ExplainPostgresAuth, when true, opts checks that implement
+	// Renderer into emitting their per-scope resolution table after
+	// the standard summary line. Today only PostgresAuthCheck honors
+	// this flag.
+	ExplainPostgresAuth bool
+}
+
+// Renderer is implemented by checks that produce additional, optional
+// output controlled by a flag in CheckContext (e.g., the
+// --explain-postgres-auth resolution table). Renderer is opt-in: the
+// doctor runner type-asserts each check and skips the call when the
+// check does not implement it.
+type Renderer interface {
+	RenderExtras(ctx *CheckContext, w io.Writer)
+}
+
+// CheckResult holds the outcome of a single check execution.
+type CheckResult struct {
+	// Name identifies which check produced this result.
+	Name string
+	// Status is the outcome: OK, Warning, or Error.
+	Status CheckStatus
+	// Severity classifies a failing Status for gate consumers. Zero
+	// value (SeverityBlocking) preserves the legacy "every error gates"
+	// behavior; checks that opt in to SeverityAdvisory let callers
+	// proceed past their failures.
+	Severity CheckSeverity
+	// Message is a human-readable summary of the result.
+	Message string
+	// Details holds extra lines shown only in verbose mode.
+	Details []string
+	// FixHint is a suggestion shown when the check fails and cannot auto-fix.
+	FixHint string
+	// FixError describes why an attempted automatic remediation failed.
+	FixError string
+	// FixAttempted is true when automatic remediation ran but did not
+	// leave the check passing.
+	FixAttempted bool
+	// Fixed is true when --fix successfully remediated the issue.
+	Fixed bool
+}

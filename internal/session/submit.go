@@ -1,0 +1,692 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/execenv"
+	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/nudgepoller"
+	"github.com/gastownhall/gascity/internal/nudgequeue"
+	"github.com/gastownhall/gascity/internal/pidutil"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/sessionlog"
+)
+
+const (
+	defaultQueuedSubmitTTL    = 24 * time.Hour
+	interruptClearDelay       = 100 * time.Millisecond
+	interruptBoundaryWait     = 10 * time.Second
+	codexDeferredDialogDelay  = 2 * time.Second
+	softInterruptFallbackWait = 2 * time.Second
+	startupDialogVerifiedKey  = "startup_dialog_verified"
+)
+
+// SubmitIntent is the semantic delivery choice for a user message.
+type SubmitIntent string
+
+const (
+	// SubmitIntentDefault asks the session runtime to deliver the message using
+	// its normal provider-specific behavior.
+	SubmitIntentDefault SubmitIntent = "default"
+	// SubmitIntentFollowUp asks the session runtime to hold the message until
+	// the current run reaches its follow-up boundary.
+	SubmitIntentFollowUp SubmitIntent = "follow_up"
+	// SubmitIntentInterruptNow asks the session runtime to interrupt the current
+	// run and deliver the replacement message immediately.
+	SubmitIntentInterruptNow SubmitIntent = "interrupt_now"
+)
+
+// SubmissionCapabilities describes which submit intents a session can honor.
+type SubmissionCapabilities struct {
+	SupportsFollowUp     bool `json:"supports_follow_up"`
+	SupportsInterruptNow bool `json:"supports_interrupt_now"`
+}
+
+// SubmitOutcome reports whether a submit was delivered now or queued.
+type SubmitOutcome struct {
+	Queued bool
+}
+
+// SubmissionCapabilitiesForMetadata derives runtime submit affordances from
+// persisted session metadata and whether deferred queueing is available.
+func SubmissionCapabilitiesForMetadata(metadata map[string]string, hasDeferredQueue bool) SubmissionCapabilities {
+	transport := transportFromMetadata(beads.Bead{Metadata: metadata})
+	return SubmissionCapabilities{
+		SupportsFollowUp:     hasDeferredQueue && transport != "acp",
+		SupportsInterruptNow: supportsInterruptNowForMetadata(metadata),
+	}
+}
+
+func supportsInterruptNowForMetadata(metadata map[string]string) bool {
+	return ProviderFamilyFromMetadata(metadata, "") != "antigravity"
+}
+
+// SubmissionCapabilities reports which semantic submit intents the session can
+// currently support.
+func (m *Manager) SubmissionCapabilities(id string) (SubmissionCapabilities, error) {
+	b, _, err := m.loadSessionBead(id, true)
+	if err != nil {
+		return SubmissionCapabilities{}, err
+	}
+	return SubmissionCapabilitiesForMetadata(b.Metadata, strings.TrimSpace(m.cityPath) != ""), nil
+}
+
+// Submit delivers a user message according to the requested semantic intent.
+func (m *Manager) Submit(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, intent SubmitIntent) (SubmitOutcome, error) {
+	switch intent {
+	case "", SubmitIntentDefault, SubmitIntentFollowUp, SubmitIntentInterruptNow:
+	default:
+		return SubmitOutcome{}, fmt.Errorf("invalid submit intent %q", intent)
+	}
+	return m.submit(ctx, id, message, resumeCommand, hints, intent)
+}
+
+func (m *Manager) submit(ctx context.Context, id, message, resumeCommand string, hints runtime.Config, intent SubmitIntent) (SubmitOutcome, error) {
+	var outcome SubmitOutcome
+	err := withSessionMutationLock(id, func() error {
+		b, sessName, err := m.sessionBead(id)
+		if err != nil {
+			return err
+		}
+		switch intent {
+		case SubmitIntentFollowUp:
+			if !m.supportsFollowUpLocked(b) {
+				return ErrInteractionUnsupported
+			}
+			if State(b.Metadata["state"]) == StateSuspended || !m.sp.IsRunning(sessName) {
+				return m.sendLocked(ctx, id, b, sessName, message, resumeCommand, hints, true)
+			}
+			if err := m.pendingInteractionLocked(sessName); err != nil {
+				return err
+			}
+			if err := m.enqueueDeferredSubmitLocked(b, sessName, message); err != nil {
+				return err
+			}
+			outcome.Queued = true
+			return nil
+		case SubmitIntentInterruptNow:
+			if !supportsInterruptNowForMetadata(b.Metadata) {
+				return ErrInteractionUnsupported
+			}
+			return m.interruptAndSubmitLocked(ctx, id, b, sessName, message, resumeCommand, hints)
+		default:
+			running := m.sp.IsRunning(sessName)
+			if (State(b.Metadata["state"]) == StateStartPending || State(b.Metadata["state"]) == StateCreating) && !running {
+				if err := m.enqueueDeferredSubmitLocked(b, sessName, message); err != nil {
+					return err
+				}
+				outcome.Queued = true
+				return nil
+			}
+			resuming := State(b.Metadata["state"]) == StateSuspended || !running
+			return m.sendLocked(ctx, id, b, sessName, message, resumeCommand, hints, usesImmediateDefaultSubmit(b, resuming))
+		}
+	})
+	return outcome, err
+}
+
+func (m *Manager) supportsFollowUpLocked(b beads.Bead) bool {
+	return SubmissionCapabilitiesForMetadata(
+		b.Metadata,
+		strings.TrimSpace(m.cityPath) != "",
+	).SupportsFollowUp
+}
+
+func (m *Manager) interruptAndSubmitLocked(ctx context.Context, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config) error {
+	running := State(b.Metadata["state"]) != StateSuspended && m.sp.IsRunning(sessName)
+	if !running {
+		return m.sendLocked(ctx, id, b, sessName, message, resumeCommand, hints, true)
+	}
+	if requiresHardRestartInterrupt(b) {
+		piTranscriptPath, err := piPendingTurnPath(b, hints)
+		if err != nil {
+			return err
+		}
+		if err := m.sp.Stop(sessName); err != nil {
+			return fmt.Errorf("stopping session for interrupt replacement: %w", err)
+		}
+		if err := discardPiPendingTurn(piTranscriptPath, hints); err != nil {
+			// Pi must be stopped before transcript truncation so it cannot race the
+			// write. If truncation fails, restart on the dirty transcript; the
+			// caller's retry will repeat this stop-and-discard sequence.
+			if restartErr := m.restoreAfterHardRestartFailureLocked(ctx, id, b, sessName, resumeCommand, hints); restartErr != nil {
+				return fmt.Errorf("%w; additionally failed to restore session: %w", err, restartErr)
+			}
+			return err
+		}
+		return m.restartAndSendLocked(ctx, id, b, sessName, message, resumeCommand, hints)
+	}
+	interruptStartedAt := time.Now()
+	if err := m.stopTurnLocked(b, sessName); err != nil {
+		return err
+	}
+	if err := m.waitForInterruptIdleLocked(ctx, b, sessName); err != nil {
+		// Idle wait failed (e.g. timeout). Fall back to hard
+		// restart so the session isn't left in limbo.
+		if stopErr := m.sp.Stop(sessName); stopErr != nil {
+			return fmt.Errorf("stopping session after idle timeout: %w", stopErr)
+		}
+		return m.restartAndSendLocked(ctx, id, b, sessName, message, resumeCommand, hints)
+	}
+	if err := m.waitForInterruptBoundaryLocked(ctx, b, sessName, interruptStartedAt); err != nil {
+		if stopErr := m.sp.Stop(sessName); stopErr != nil {
+			return fmt.Errorf("stopping session after interrupt boundary timeout: %w", stopErr)
+		}
+		return m.restartAndSendLocked(ctx, id, b, sessName, message, resumeCommand, hints)
+	}
+	if err := m.resetInterruptedTurnLocked(ctx, b, sessName); err != nil {
+		return err
+	}
+	if shouldClearInterruptedInputBeforeSubmit(b) {
+		if err := m.clearInterruptedInputLocked(ctx, sessName); err != nil {
+			return err
+		}
+	}
+	return m.sendLocked(ctx, id, b, sessName, message, resumeCommand, hints, true)
+}
+
+func (m *Manager) restartAndSendLocked(ctx context.Context, id string, b beads.Bead, sessName, message, resumeCommand string, hints runtime.Config) error {
+	if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
+		return err
+	}
+	if err := m.waitUntilRunningLocked(ctx, id, sessName, 2*time.Second); err != nil {
+		return err
+	}
+	if waiter, ok := m.sp.(runtime.IdleWaitProvider); ok && waitsForIdleAfterHardRestart(b) {
+		if err := waiter.WaitForIdle(ctx, sessName, 15*time.Second); err != nil && !errors.Is(err, runtime.ErrInteractionUnsupported) {
+			return fmt.Errorf("waiting for restarted session to become idle: %w", err)
+		}
+	}
+	// This is a fresh replacement turn after a hard restart. The previous run's
+	// pending-interaction state is irrelevant, and probing tmux immediately after
+	// the restart is race-prone for Claude-backed sessions.
+	return m.nudgeSession(ctx, sessName, message, true)
+}
+
+func (m *Manager) waitUntilRunningLocked(ctx context.Context, id, sessName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if m.sp.IsRunning(sessName) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: %s", ErrSessionInactive, id)
+		}
+		if err := sleepWithContext(ctx, 100*time.Millisecond); err != nil {
+			return err
+		}
+	}
+}
+
+func (m *Manager) stopTurnLocked(b beads.Bead, sessName string) error {
+	if State(b.Metadata["state"]) == StateSuspended || !m.sp.IsRunning(sessName) {
+		return nil
+	}
+	if usesSoftEscapeInterrupt(b) {
+		if err := m.sp.SendKeys(sessName, "Escape"); err != nil {
+			return fmt.Errorf("interrupting session: %w", err)
+		}
+		return nil
+	}
+	if err := m.sp.Interrupt(sessName); err != nil {
+		return fmt.Errorf("interrupting session: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) waitForInterruptIdleLocked(ctx context.Context, b beads.Bead, sessName string) error {
+	if !waitsForIdleAfterInterrupt(b) {
+		return nil
+	}
+	waiter, ok := m.sp.(runtime.IdleWaitProvider)
+	if !ok {
+		return nil
+	}
+	waitForIdle := func(timeout time.Duration) error {
+		err := waiter.WaitForIdle(ctx, sessName, timeout)
+		if errors.Is(err, runtime.ErrInteractionUnsupported) {
+			return nil
+		}
+		return err
+	}
+	if usesSoftEscapeInterrupt(b) {
+		if requiresImmediateInterruptConfirm(b) {
+			if err := m.sp.Interrupt(sessName); err != nil {
+				return fmt.Errorf("confirming interrupt after soft escape: %w", err)
+			}
+			return waitForIdle(15 * time.Second)
+		}
+		if err := waitForIdle(softInterruptFallbackWait); err == nil {
+			return nil
+		}
+		if err := m.sp.Interrupt(sessName); err != nil {
+			return fmt.Errorf("interrupting session with control-c fallback: %w", err)
+		}
+	}
+	return waitForIdle(15 * time.Second)
+}
+
+func (m *Manager) waitForInterruptBoundaryLocked(ctx context.Context, b beads.Bead, sessName string, since time.Time) error {
+	if !requiresInterruptBoundaryWait(b) {
+		return nil
+	}
+	waiter, ok := m.sp.(runtime.InterruptBoundaryWaitProvider)
+	if !ok {
+		return nil
+	}
+	if err := waiter.WaitForInterruptBoundary(ctx, sessName, since, interruptBoundaryWait); err != nil && !errors.Is(err, runtime.ErrInteractionUnsupported) {
+		return fmt.Errorf("waiting for interrupt boundary: %w", err)
+	}
+	return nil
+}
+
+// ProviderFamilyFromMetadata returns the canonical provider family for session
+// metadata. It prefers metadata stamped at session-bead creation over raw
+// provider names so wrapped custom aliases inherit their built-in family.
+// Preference order:
+//  1. builtin_ancestor — stamped from ResolvedProvider.BuiltinAncestor
+//     at session-bead creation for custom providers with explicit
+//     `base = "builtin:..."` (see cmd/gc session-bead creation sites).
+//  2. provider_kind — stamped for command-matched custom aliases
+//     (legacy Phase A auto-inheritance path).
+//  3. provider — normalized through sessionlog.ProviderFamily as a
+//     last-resort fallback.
+//
+// Callers that branch on Claude/Codex/Gemini-family behavior
+// (idle-wait-after-interrupt, soft-escape interrupt, default submit,
+// etc.) consume this helper so wrapped custom aliases inherit the
+// correct family behavior without every call site re-deriving it.
+func ProviderFamilyFromMetadata(meta map[string]string, fallback string) string {
+	if ancestor := strings.TrimSpace(meta["builtin_ancestor"]); ancestor != "" {
+		return sessionlog.ProviderFamily(ancestor)
+	}
+	if kind := strings.TrimSpace(meta["provider_kind"]); kind != "" {
+		return sessionlog.ProviderFamily(kind)
+	}
+	if provider := strings.TrimSpace(meta["provider"]); provider != "" {
+		return sessionlog.ProviderFamily(provider)
+	}
+	return sessionlog.ProviderFamily(fallback)
+}
+
+func providerKind(b beads.Bead) string {
+	return ProviderFamilyFromMetadata(b.Metadata, "")
+}
+
+// ProviderFamilyFromInfo is the session.Info sibling of ProviderFamilyFromMetadata:
+// it walks the same builtin_ancestor → provider_kind → provider precedence ladder,
+// reading the raw mirrors Info carries (BuiltinAncestor, ProviderKind, Provider)
+// instead of the bead metadata map. Byte-identical to the metadata form for any
+// bead b (ProviderFamilyFromInfo(infoFromPersistedBead(b), fallback) ==
+// ProviderFamilyFromMetadata(b.Metadata, fallback)), so a caller holding a typed
+// Info can resolve the provider family without the raw bead.
+func ProviderFamilyFromInfo(info Info, fallback string) string {
+	if ancestor := strings.TrimSpace(info.BuiltinAncestor); ancestor != "" {
+		return sessionlog.ProviderFamily(ancestor)
+	}
+	if kind := strings.TrimSpace(info.ProviderKind); kind != "" {
+		return sessionlog.ProviderFamily(kind)
+	}
+	if provider := strings.TrimSpace(info.Provider); provider != "" {
+		return sessionlog.ProviderFamily(provider)
+	}
+	return sessionlog.ProviderFamily(fallback)
+}
+
+func wrappedProviderFamily(b beads.Bead, family string) bool {
+	ancestor := sessionlog.ProviderFamily(b.Metadata["builtin_ancestor"])
+	// Leave provider raw: normalizing it would collapse wrapped aliases such as
+	// "my-pi" onto their family and hide that the provider is wrapped.
+	provider := strings.TrimSpace(b.Metadata["provider"])
+	return ancestor == family && provider != "" && provider != family
+}
+
+func usesSoftEscapeInterrupt(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	if wrappedProviderFamily(b, "gemini") {
+		return true
+	}
+	switch providerKind(b) {
+	case "codex", "kimi":
+		return true
+	default:
+		return false
+	}
+}
+
+func waitsForIdleAfterInterrupt(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	if wrappedProviderFamily(b, "codex") || wrappedProviderFamily(b, "gemini") {
+		return false
+	}
+	switch providerKind(b) {
+	case "claude", "codex", "gemini", "kimi":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldClearInterruptedInputBeforeSubmit(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	switch providerKind(b) {
+	case "claude", "gemini":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) resetInterruptedTurnLocked(ctx context.Context, b beads.Bead, sessName string) error {
+	if !requiresInterruptedTurnReset(b) {
+		return nil
+	}
+	resetter, ok := m.sp.(runtime.InterruptedTurnResetProvider)
+	if !ok {
+		return nil
+	}
+	if err := resetter.ResetInterruptedTurn(ctx, sessName); err != nil && !errors.Is(err, runtime.ErrInteractionUnsupported) {
+		return fmt.Errorf("discarding interrupted turn: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) clearInterruptedInputLocked(ctx context.Context, sessName string) error {
+	if err := m.sp.SendKeys(sessName, "C-u"); err != nil {
+		return fmt.Errorf("clearing interrupted input: %w", err)
+	}
+	if err := sleepWithContext(ctx, interruptClearDelay); err != nil {
+		return err
+	}
+	return nil
+}
+
+func requiresImmediateInterruptConfirm(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	switch providerKind(b) {
+	case "gemini":
+		return true
+	default:
+		return false
+	}
+}
+
+func requiresInterruptedTurnReset(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	return providerKind(b) == "gemini"
+}
+
+func requiresInterruptBoundaryWait(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	return providerKind(b) == "codex"
+}
+
+func requiresHardRestartInterrupt(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	return providerKind(b) == "pi"
+}
+
+func waitsForIdleAfterHardRestart(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	return providerKind(b) != "pi"
+}
+
+func (m *Manager) restoreAfterHardRestartFailureLocked(ctx context.Context, id string, b beads.Bead, sessName, resumeCommand string, hints runtime.Config) error {
+	if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
+		return err
+	}
+	return m.waitUntilRunningLocked(ctx, id, sessName, 2*time.Second)
+}
+
+func piPendingTurnPath(b beads.Bead, hints runtime.Config) (string, error) {
+	searchPaths := piSessionSearchPaths(hints)
+	workDir := b.Metadata["work_dir"]
+	if sessionKey := strings.TrimSpace(b.Metadata["session_key"]); sessionKey != "" {
+		if path := strings.TrimSpace(sessionlog.FindPiSessionFileByID(searchPaths, workDir, sessionKey)); path != "" {
+			return path, nil
+		}
+		fallback, err := sessionlog.FindPiSessionFileStrict(searchPaths, workDir)
+		if err != nil {
+			if errors.Is(err, sessionlog.ErrAmbiguousPiSessionFile) {
+				return "", fmt.Errorf("resolving pi interrupted transcript for session_key %q workdir %q: %w", sessionKey, workDir, err)
+			}
+			return "", err
+		}
+		if fallback != "" {
+			return "", fmt.Errorf("resolving pi interrupted transcript for session_key %q workdir %q: keyed transcript not found; refusing same-workdir fallback %q", sessionKey, workDir, fallback)
+		}
+		return "", nil
+	}
+	path, err := sessionlog.FindPiSessionFileStrict(searchPaths, workDir)
+	if err != nil {
+		if errors.Is(err, sessionlog.ErrAmbiguousPiSessionFile) {
+			return "", fmt.Errorf("resolving pi interrupted transcript for workdir %q: %w", workDir, err)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(path), nil
+}
+
+func discardPiPendingTurn(path string, hints runtime.Config) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if err := sessionlog.ResetPiInterruptedTurn(path, strings.TrimSpace(hints.Env["GC_PI_TRANSCRIPT_DIR"])); err != nil {
+		return fmt.Errorf("discarding pi interrupted turn: %w", err)
+	}
+	return nil
+}
+
+func piSessionSearchPaths(hints runtime.Config) []string {
+	var paths []string
+	if dir := strings.TrimSpace(hints.Env["PI_CODING_AGENT_SESSION_DIR"]); dir != "" {
+		paths = append(paths, dir)
+	}
+	if dir := strings.TrimSpace(hints.Env["PI_CODING_AGENT_DIR"]); dir != "" {
+		paths = append(paths, filepath.Join(dir, "sessions"))
+	}
+	paths = append(paths, sessionlog.DefaultPiSearchPaths()...)
+	return paths
+}
+
+func usesImmediateDefaultSubmit(b beads.Bead, resuming ...bool) bool {
+	isResuming := len(resuming) > 0 && resuming[0]
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	switch providerKind(b) {
+	case "codex":
+		return true
+	case "gemini":
+		return isResuming
+	default:
+		return false
+	}
+}
+
+func needsDeferredStartupDialogVerification(b beads.Bead) bool {
+	if transportFromMetadata(b) == "acp" {
+		return false
+	}
+	if providerKind(b) != "codex" {
+		return false
+	}
+	return strings.TrimSpace(b.Metadata[startupDialogVerifiedKey]) != "true"
+}
+
+func (m *Manager) enqueueDeferredSubmitLocked(b beads.Bead, sessName, message string) error {
+	if strings.TrimSpace(m.cityPath) == "" {
+		return errors.New("deferred submit is unavailable without a city path")
+	}
+	now := time.Now().UTC()
+	item := nudgequeue.Item{
+		ID:                "nudge-" + NewInstanceToken()[:12],
+		Agent:             deferredSubmitAgentKey(b),
+		SessionID:         b.ID,
+		ContinuationEpoch: strings.TrimSpace(b.Metadata["continuation_epoch"]),
+		Source:            "session",
+		Message:           message,
+		CreatedAt:         now,
+		DeliverAfter:      now,
+		ExpiresAt:         now.Add(defaultQueuedSubmitTTL),
+	}
+	if err := nudgequeue.WithState(m.cityPath, func(state *nudgequeue.State) error {
+		state.Pending = append(state.Pending, item)
+		nudgequeue.SortState(state)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("queueing deferred submit: %w", err)
+	}
+	if m.supportsFollowUpLocked(b) {
+		_ = startSessionSubmitPoller(m.cityPath, deferredSubmitPollerKey(b), sessName)
+	}
+	return nil
+}
+
+func deferredSubmitAgentKey(b beads.Bead) string {
+	if alias := strings.TrimSpace(b.Metadata["alias"]); alias != "" {
+		return alias
+	}
+	if b.ID != "" {
+		return b.ID
+	}
+	if template := strings.TrimSpace(b.Metadata["template"]); template != "" {
+		return template
+	}
+	if sessName := strings.TrimSpace(b.Metadata["session_name"]); sessName != "" {
+		return sessName
+	}
+	return b.Title
+}
+
+func deferredSubmitPollerKey(b beads.Bead) string {
+	return PollerKeyFromBead(b)
+}
+
+var (
+	startSessionSubmitPoller      = ensureSessionSubmitPoller
+	sessionSubmitPollerExecutable = os.Executable
+)
+
+func ensureSessionSubmitPoller(cityPath, agentName, sessionName string) error {
+	pidPath := sessionSubmitPollerPIDPath(cityPath, sessionName, agentName)
+	return withSessionSubmitPollerPIDLock(pidPath, func() error {
+		if running, _ := existingSessionSubmitPollerPID(pidPath, cityPath, sessionName, agentName); running {
+			return nil
+		}
+		exe, err := sessionSubmitPollerExecutable()
+		if err != nil {
+			return err
+		}
+		if isGoTestExecutable(exe) {
+			return fmt.Errorf("refusing to start nudge poller with Go test binary %q", exe)
+		}
+		cmd := exec.Command(exe, nudgepoller.CommandArgs(cityPath, sessionName, agentName)...)
+		cmd.Env = execenv.WithUsageMetricsDisabled(os.Environ())
+		logFile, err := os.OpenFile(sessionSubmitPollerLogPath(cityPath, sessionName, agentName), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return err
+		}
+		defer logFile.Close() //nolint:errcheck
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		if err := writeSessionSubmitPollerPID(pidPath, cmd.Process.Pid); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Process.Release()
+			return err
+		}
+		return cmd.Process.Release()
+	})
+}
+
+func isGoTestExecutable(path string) bool {
+	return strings.HasSuffix(filepath.Base(path), ".test")
+}
+
+func sessionSubmitPollerPIDPath(cityPath, sessionName, agentName string) string {
+	return citylayout.RuntimePath(cityPath, "nudges", "pollers", nudgepoller.PollerFileStem(sessionName, agentName)+".pid")
+}
+
+func sessionSubmitPollerLogPath(cityPath, sessionName, agentName string) string {
+	return citylayout.RuntimePath(cityPath, "nudges", "pollers", nudgepoller.PollerFileStem(sessionName, agentName)+".log")
+}
+
+func existingSessionSubmitPollerPID(pidPath, cityPath, sessionName, agentName string) (bool, error) {
+	data, err := os.ReadFile(pidPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	pidText := strings.TrimSpace(string(data))
+	if pidText == "" {
+		return false, nil
+	}
+	var pid int
+	if _, err := fmt.Sscanf(pidText, "%d", &pid); err != nil || pid <= 0 {
+		return false, nil
+	}
+	if cityPath == "" || sessionName == "" || agentName == "" {
+		return false, nil
+	}
+	if pidutil.AliveWithCmdline(pid, nudgepoller.CmdlineMatcher(cityPath, sessionName, agentName)) {
+		return true, nil
+	}
+	return false, nil
+}
+
+func writeSessionSubmitPollerPID(pidPath string, pid int) error {
+	data := []byte(fmt.Sprintf("%d\n", pid))
+	if err := fsys.WriteFileAtomic(fsys.OSFS{}, pidPath, data, 0o644); err != nil {
+		return fmt.Errorf("write nudge poller pid: %w", err)
+	}
+	return nil
+}
+
+func withSessionSubmitPollerPIDLock(pidPath string, fn func() error) error {
+	lockPath := pidPath + ".lock"
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		return fmt.Errorf("creating nudge poller dir: %w", err)
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening nudge poller lock: %w", err)
+	}
+	defer lockFile.Close() //nolint:errcheck
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("locking nudge poller: %w", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	return fn()
+}

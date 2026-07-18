@@ -1,0 +1,8 @@
+# Hyperscale — worker template, max 100 sessions.
+#
+# No city agents — just workers that scale based on open beads.
+# Each worker runs gc prime, closes its bead, and exits.
+
+[pack]
+name = "hyperscale"
+schema = 2

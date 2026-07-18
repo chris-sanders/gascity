@@ -1,0 +1,5263 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/runtime"
+	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
+	"github.com/gastownhall/gascity/internal/sessionlog"
+	"github.com/gastownhall/gascity/internal/testutil"
+)
+
+func immediateStaleKeyDetectionWaiter(context.Context, string) error { return nil }
+
+type manualStaleKeyDetectionWaiter struct {
+	entered     chan string
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func newManualStaleKeyDetectionWaiter(t *testing.T) *manualStaleKeyDetectionWaiter {
+	t.Helper()
+	w := &manualStaleKeyDetectionWaiter{
+		entered: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(w.allow)
+	return w
+}
+
+func (w *manualStaleKeyDetectionWaiter) wait(ctx context.Context, name string) error {
+	select {
+	case w.entered <- name:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-w.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (w *manualStaleKeyDetectionWaiter) allow() {
+	w.releaseOnce.Do(func() { close(w.release) })
+}
+
+func awaitStaleKeyWaiterEntry(t *testing.T, waiter *manualStaleKeyDetectionWaiter, want string) {
+	t.Helper()
+	select {
+	case got := <-waiter.entered:
+		if got != want {
+			t.Fatalf("stale-key waiter entered for %q, want %q", got, want)
+		}
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatalf("timed out waiting for stale-key waiter entry for %q", want)
+	}
+}
+
+func awaitSessionOperation(t *testing.T, result <-chan error, description string) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatalf("timed out waiting for %s", description)
+		return nil
+	}
+}
+
+type startOverrideProvider struct {
+	*runtime.Fake
+	startErr error
+}
+
+type noImmediateProvider struct {
+	runtime.Provider
+}
+
+type providerWithoutProcessScanner struct {
+	runtime.Provider
+}
+
+type orphanScanProvider struct {
+	*runtime.Fake
+	results      []runtime.LiveRuntime
+	findErr      error
+	terminateErr error
+	events       []string
+}
+
+func (p *orphanScanProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	p.events = append(p.events, "start:"+cfg.Env["GC_SESSION_ID"])
+	return p.Fake.Start(ctx, name, cfg)
+}
+
+func (p *orphanScanProvider) FindRuntimesBySessionID(id string) ([]runtime.LiveRuntime, error) {
+	p.events = append(p.events, "find:"+id)
+	out := make([]runtime.LiveRuntime, len(p.results))
+	copy(out, p.results)
+	for i := range out {
+		if out[i].SessionID == "" {
+			out[i].SessionID = id
+		}
+	}
+	return out, p.findErr
+}
+
+func (p *orphanScanProvider) TerminateRuntime(r runtime.LiveRuntime) error {
+	p.events = append(p.events, "terminate:"+r.SessionID)
+	return p.terminateErr
+}
+
+type nonRunningStopRecorder struct {
+	*runtime.Fake
+	stopCalls int
+	stopErr   error
+}
+
+func (p *nonRunningStopRecorder) IsRunning(string) bool {
+	return false
+}
+
+func (p *nonRunningStopRecorder) Stop(name string) error {
+	p.stopCalls++
+	if p.stopErr != nil {
+		return p.stopErr
+	}
+	return p.Fake.Stop(name)
+}
+
+func (p *startOverrideProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if p.startErr != nil {
+		return p.startErr
+	}
+	return p.Fake.Start(ctx, name, cfg)
+}
+
+// failOnceStartProvider simulates a stale session key: the first Start
+// after arming succeeds but the process immediately dies (IsRunning returns
+// false). The second Start (fresh retry) succeeds and stays running.
+type failOnceStartProvider struct {
+	*runtime.Fake
+	armed   bool
+	dieOnce bool // set after armed Start to make IsRunning return false once
+}
+
+func (p *failOnceStartProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if p.armed {
+		p.armed = false
+		p.dieOnce = true
+		// Start "succeeds" but process will appear dead on next IsRunning check.
+		return p.Fake.Start(ctx, name, cfg)
+	}
+	p.dieOnce = false
+	return p.Fake.Start(ctx, name, cfg)
+}
+
+func (p *failOnceStartProvider) IsRunning(name string) bool {
+	if p.dieOnce {
+		p.dieOnce = false
+		// Simulate: process started but died immediately (stale key).
+		_ = p.Stop(name) // actually kill it so state is consistent
+		return false
+	}
+	return p.Fake.IsRunning(name)
+}
+
+// dieAndFailProvider: first Start succeeds but process dies immediately,
+// second Start fails outright. Simulates stale key + provider unavailable.
+type dieAndFailProvider struct {
+	*runtime.Fake
+	callCount int
+}
+
+func (p *dieAndFailProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	p.callCount++
+	if p.callCount == 1 {
+		// First call: start succeeds but process will appear dead.
+		return p.Fake.Start(ctx, name, cfg)
+	}
+	// Second call (fresh retry): fail outright.
+	return errors.New("provider unavailable")
+}
+
+func (p *dieAndFailProvider) IsRunning(name string) bool {
+	if p.callCount == 1 {
+		// After first Start: process died (stale key).
+		_ = p.Stop(name)
+		return false
+	}
+	return p.Fake.IsRunning(name) //nolint:staticcheck // intentional: IsRunning is not on Fake, it's on Provider
+}
+
+type startupDeathProvider struct {
+	*runtime.Fake
+	armed     bool
+	failRetry bool
+}
+
+func (p *startupDeathProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if p.armed {
+		p.armed = false
+		return fmt.Errorf("%w: session %q", runtime.ErrSessionDiedDuringStartup, name)
+	}
+	if p.failRetry {
+		return errors.New("provider unavailable")
+	}
+	return p.Fake.Start(ctx, name, cfg)
+}
+
+type lateSuccessStartProvider struct {
+	*runtime.Fake
+	startErr error
+}
+
+func (p *lateSuccessStartProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if err := p.Fake.Start(ctx, name, cfg); err != nil {
+		return err
+	}
+	if id := cfg.Env["GC_SESSION_ID"]; id != "" {
+		_ = p.SetMeta(name, "GC_SESSION_ID", id)
+	}
+	if token := cfg.Env["GC_INSTANCE_TOKEN"]; token != "" {
+		_ = p.SetMeta(name, "GC_INSTANCE_TOKEN", token)
+	}
+	if p.startErr != nil {
+		return p.startErr
+	}
+	return nil
+}
+
+func createTestWait(t *testing.T, store beads.Store, sessionID string) beads.Bead {
+	t.Helper()
+	wait, err := store.Create(beads.Bead{
+		Type:   WaitBeadType,
+		Labels: []string{WaitBeadLabel, "session:" + sessionID},
+		Metadata: map[string]string{
+			"session_id": sessionID,
+			"state":      "pending",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create wait: %v", err)
+	}
+	return wait
+}
+
+type waitFailStore struct {
+	*beads.MemStore
+}
+
+type failMetadataKeyStore struct {
+	*beads.MemStore
+	key string
+}
+
+func (s failMetadataKeyStore) SetMetadata(id, key, value string) error {
+	if key == s.key {
+		return errors.New("set metadata failed")
+	}
+	return s.MemStore.SetMetadata(id, key, value)
+}
+
+func (s waitFailStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == WaitBeadLabel || strings.HasPrefix(query.Label, "session:") {
+		return nil, errors.New("wait list failed")
+	}
+	return s.MemStore.List(query)
+}
+
+func (s waitFailStore) ListByLabel(label string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
+	if label == WaitBeadLabel || strings.HasPrefix(label, "session:") {
+		return nil, errors.New("wait list failed")
+	}
+	return s.MemStore.ListByLabel(label, limit, opts...)
+}
+
+func TestCreate(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if info.Template != "helper" {
+		t.Errorf("Template = %q, want %q", info.Template, "helper")
+	}
+	if info.Title != "my chat" {
+		t.Errorf("Title = %q, want %q", info.Title, "my chat")
+	}
+	if info.State != StateActive {
+		t.Errorf("State = %q, want %q", info.State, StateActive)
+	}
+	if info.ID == "" {
+		t.Error("ID is empty")
+	}
+
+	// Verify the tmux session was started.
+	if !sp.IsRunning(info.SessionName) {
+		t.Error("runtime session not started")
+	}
+
+	// Verify bead was created with correct type and labels.
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Type != BeadType {
+		t.Errorf("bead Type = %q, want %q", b.Type, BeadType)
+	}
+	if b.Status != "open" {
+		t.Errorf("bead Status = %q, want %q", b.Status, "open")
+	}
+	hasLabel := false
+	for _, l := range b.Labels {
+		if l == LabelSession {
+			hasLabel = true
+		}
+	}
+	if !hasLabel {
+		t.Errorf("bead missing label %q", LabelSession)
+	}
+	if b.Metadata["generation"] != "1" {
+		t.Errorf("generation = %q, want 1", b.Metadata["generation"])
+	}
+	if b.Metadata["continuation_epoch"] != "1" {
+		t.Errorf("continuation_epoch = %q, want 1", b.Metadata["continuation_epoch"])
+	}
+	if b.Metadata["instance_token"] == "" {
+		t.Error("instance_token is empty")
+	}
+	var startCall runtime.Call
+	foundStart := false
+	for _, call := range sp.Calls {
+		if call.Method == "Start" {
+			startCall = call
+			foundStart = true
+			break
+		}
+	}
+	if !foundStart {
+		t.Fatalf("runtime calls = %v, want Start", sp.Calls)
+	}
+	if got := startCall.Config.Env["GC_SESSION_ID"]; got != info.ID {
+		t.Errorf("GC_SESSION_ID = %q, want %q", got, info.ID)
+	}
+	if got := startCall.Config.Env["GC_CONTINUATION_EPOCH"]; got != "1" {
+		t.Errorf("GC_CONTINUATION_EPOCH = %q, want 1", got)
+	}
+	if got := startCall.Config.Env["GC_RUNTIME_EPOCH"]; got != "1" {
+		t.Errorf("GC_RUNTIME_EPOCH = %q, want 1", got)
+	}
+	if got := startCall.Config.Env["GC_INSTANCE_TOKEN"]; got == "" {
+		t.Error("GC_INSTANCE_TOKEN is empty")
+	}
+	if got := startCall.Config.Env["GC_DIR"]; got != "/tmp" {
+		t.Errorf("GC_DIR = %q, want %q", got, "/tmp")
+	}
+}
+
+// TestRetireConfiguredNamedSessionIdentifiersFreesCanonicalIdentity pins that the
+// Manager.Close named-session retirement path frees the durable canonical-identity
+// record (canonical_instance_name / canonical_pool_slot) alongside the legacy
+// identifiers, matching RetireNamedSessionPatch. Regression guard for the second
+// retirement path that stranded canonical identity after the S19 stage-2 fix.
+func TestRetireConfiguredNamedSessionIdentifiersFreesCanonicalIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	mgr := NewManagerWithOptions(store, runtime.NewFake())
+
+	b, err := store.Create(beads.Bead{
+		Type: BeadType,
+		Metadata: map[string]string{
+			NamedSessionMetadataKey:       "true",
+			NamedSessionIdentityMetadata:  "myrig/worker",
+			"session_name":                "test-city--myrig--worker",
+			"session_name_explicit":       "true",
+			CanonicalInstanceNameMetadata: "myrig/worker",
+			CanonicalPoolSlotMetadata:     "3",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := mgr.retireConfiguredNamedSessionIdentifiers(b.ID, b); err != nil {
+		t.Fatalf("retireConfiguredNamedSessionIdentifiers: %v", err)
+	}
+
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if v := got.Metadata[CanonicalInstanceNameMetadata]; v != "" {
+		t.Errorf("%s = %q, want cleared", CanonicalInstanceNameMetadata, v)
+	}
+	if v := got.Metadata[CanonicalPoolSlotMetadata]; v != "" {
+		t.Errorf("%s = %q, want cleared", CanonicalPoolSlotMetadata, v)
+	}
+	// Legacy identifiers stay cleared too (unchanged behavior).
+	if v := got.Metadata["session_name"]; v != "" {
+		t.Errorf("session_name = %q, want cleared", v)
+	}
+}
+
+func TestCreateKillsUntrackedOrphanBeforeStart(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &orphanScanProvider{
+		Fake: runtime.NewFake(),
+		results: []runtime.LiveRuntime{{
+			PID:       1234,
+			IsTracked: false,
+		}},
+	}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	want := []string{"find:" + info.ID, "terminate:" + info.ID, "start:" + info.ID}
+	if got := strings.Join(sp.events, ","); got != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", sp.events, want)
+	}
+}
+
+func TestCreateSkipsTrackedRuntimeBeforeStart(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &orphanScanProvider{
+		Fake: runtime.NewFake(),
+		results: []runtime.LiveRuntime{{
+			PID:       1234,
+			IsTracked: true,
+		}},
+	}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	want := []string{"find:" + info.ID, "start:" + info.ID}
+	if got := strings.Join(sp.events, ","); got != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", sp.events, want)
+	}
+}
+
+func TestCreateSkipsUntrackedRuntimeFromOtherCityBeforeStart(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &orphanScanProvider{
+		Fake: runtime.NewFake(),
+		results: []runtime.LiveRuntime{{
+			PID:       1234,
+			City:      "/tmp/other-city",
+			IsTracked: false,
+		}},
+	}
+	mgr := NewManagerWithOptions(store, sp, WithCityPath("/tmp/this-city"))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	want := []string{"find:" + info.ID, "start:" + info.ID}
+	if got := strings.Join(sp.events, ","); got != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", sp.events, want)
+	}
+}
+
+func TestCreateKillsUntrackedOrphanFromSameCityBeforeStartWithNormalizedPath(t *testing.T) {
+	realCity := t.TempDir()
+	aliasCity := filepath.Join(t.TempDir(), "city-link")
+	if err := os.Symlink(realCity, aliasCity); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	store := beads.NewMemStore()
+	sp := &orphanScanProvider{
+		Fake: runtime.NewFake(),
+		results: []runtime.LiveRuntime{{
+			PID:       1234,
+			City:      realCity,
+			IsTracked: false,
+		}},
+	}
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(aliasCity))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	want := []string{"find:" + info.ID, "terminate:" + info.ID, "start:" + info.ID}
+	if got := strings.Join(sp.events, ","); got != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", sp.events, want)
+	}
+}
+
+// TestCreateRefusesStartWhenOrphanNotConfirmedDead pins the fail-closed
+// contract: when an untracked same-session orphan cannot be confirmed dead
+// (TerminateRuntime errors — e.g. it survived SIGKILL), Create must refuse to
+// start a replacement rather than race the survivor for the same work bead. A
+// concurrent scan error is logged and treated as fail-closed, so the orphan the
+// scan did surface is still targeted. No Start is attempted.
+func TestCreateRefusesStartWhenOrphanNotConfirmedDead(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &orphanScanProvider{
+		Fake:         runtime.NewFake(),
+		findErr:      errors.New("partial scan failed"),
+		terminateErr: errors.New("terminate failed"),
+		results: []runtime.LiveRuntime{{
+			PID:       1234,
+			IsTracked: false,
+		}},
+	}
+	mgr := NewManagerWithOptions(store, sp)
+
+	_, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err == nil {
+		t.Fatal("Create succeeded despite an orphan that could not be confirmed dead")
+	}
+	if !strings.Contains(err.Error(), "orphan cleanup") {
+		t.Fatalf("Create error = %v, want pre-start orphan cleanup refusal", err)
+	}
+	for _, e := range sp.events {
+		if strings.HasPrefix(e, "start:") {
+			t.Fatalf("Start was attempted despite unconfirmed orphan; events = %v", sp.events)
+		}
+	}
+	want := []string{"find:", "terminate:"}
+	for i, prefix := range want {
+		if i >= len(sp.events) || !strings.HasPrefix(sp.events[i], prefix) {
+			t.Fatalf("events = %v, want prefixes %v", sp.events, want)
+		}
+	}
+}
+
+// acpOrphanScanProvider augments orphanScanProvider with ACP route bookkeeping
+// so a resume that reserves an ACP route before the pre-start orphan gate can
+// be observed unwinding that reservation when the gate refuses. RouteACP and
+// Unroute record into the same events slice as the scan/start calls.
+type acpOrphanScanProvider struct {
+	*orphanScanProvider
+}
+
+func (p *acpOrphanScanProvider) RouteACP(name string) { p.events = append(p.events, "route:"+name) }
+func (p *acpOrphanScanProvider) Unroute(name string)  { p.events = append(p.events, "unroute:"+name) }
+
+// seedSuspendedResumeTarget creates a session backed by a clean orphan scanner
+// and suspends it, so a subsequent Manager.Start/StartRuntimeOnly takes the
+// resume path (stopped runtime, non-empty resume command) and reaches the
+// pre-start orphan gate. It clears the recorded events after suspend so callers
+// observe only the resume attempt, and returns the provider ready to be armed
+// with an orphan.
+func seedSuspendedResumeTarget(t *testing.T) (*Manager, *orphanScanProvider, Info) {
+	t.Helper()
+	store := beads.NewMemStore()
+	sp := &orphanScanProvider{Fake: runtime.NewFake()}
+	mgr := NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: t.TempDir(), Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	sp.events = nil
+	return mgr, sp, info
+}
+
+func hasEventPrefix(events []string, prefix string) bool {
+	for _, e := range events {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// armUnconfirmedOrphan makes killExistingOrphans surface a same-session
+// untracked orphan whose termination fails, i.e. one that cannot be confirmed
+// dead. This is the fixture shape TestCreateRefusesStartWhenOrphanNotConfirmedDead
+// uses for the Create path.
+func armUnconfirmedOrphan(sp *orphanScanProvider) {
+	sp.results = []runtime.LiveRuntime{{PID: 1234, IsTracked: false}}
+	sp.terminateErr = errors.New("terminate failed")
+}
+
+// armConfirmedDeadOrphan makes killExistingOrphans surface a same-session
+// untracked orphan that terminates cleanly (confirmed dead), so the gate lets
+// the Start proceed.
+func armConfirmedDeadOrphan(sp *orphanScanProvider) {
+	sp.results = []runtime.LiveRuntime{{PID: 1234, IsTracked: false}}
+	sp.terminateErr = nil
+}
+
+// TestStartRefusesResumeWhenOrphanNotConfirmedDead drives the real
+// Manager.Start -> ensureRunning path (chat.go ~388) with the same
+// not-confirmed-dead orphan fixture the Create behavioral test uses, and pins
+// the runtime behavior of the fix: Start returns a pre-start orphan cleanup
+// error and no replacement runtime is started (sp.Start is never called). A
+// regression that swallowed the gate error (e.g. `if orphanErr != nil { /*
+// no-op */ }`) would pass errcheck and the structural scan but fail here.
+func TestStartRefusesResumeWhenOrphanNotConfirmedDead(t *testing.T) {
+	mgr, sp, info := seedSuspendedResumeTarget(t)
+	armUnconfirmedOrphan(sp)
+
+	err := mgr.Start(context.Background(), info.ID, BuildResumeCommand(info), runtime.Config{WorkDir: info.WorkDir})
+	if err == nil {
+		t.Fatal("Start succeeded despite an orphan that could not be confirmed dead")
+	}
+	if !strings.Contains(err.Error(), "orphan cleanup") {
+		t.Fatalf("Start error = %v, want pre-start orphan cleanup refusal", err)
+	}
+	if hasEventPrefix(sp.events, "start:") {
+		t.Fatalf("Start was attempted despite unconfirmed orphan; events = %v", sp.events)
+	}
+	want := []string{"find:", "terminate:"}
+	for i, prefix := range want {
+		if i >= len(sp.events) || !strings.HasPrefix(sp.events[i], prefix) {
+			t.Fatalf("events = %v, want prefixes %v", sp.events, want)
+		}
+	}
+}
+
+// TestStartRuntimeOnlyRefusesRespawnWhenOrphanNotConfirmedDead is the
+// StartRuntimeOnly (reconciler respawn bridge, chat.go ~508) counterpart of
+// TestStartRefusesResumeWhenOrphanNotConfirmedDead.
+func TestStartRuntimeOnlyRefusesRespawnWhenOrphanNotConfirmedDead(t *testing.T) {
+	mgr, sp, info := seedSuspendedResumeTarget(t)
+	armUnconfirmedOrphan(sp)
+
+	err := mgr.StartRuntimeOnly(context.Background(), info.ID, BuildResumeCommand(info), runtime.Config{WorkDir: info.WorkDir})
+	if err == nil {
+		t.Fatal("StartRuntimeOnly succeeded despite an orphan that could not be confirmed dead")
+	}
+	if !strings.Contains(err.Error(), "orphan cleanup") {
+		t.Fatalf("StartRuntimeOnly error = %v, want pre-start orphan cleanup refusal", err)
+	}
+	if hasEventPrefix(sp.events, "start:") {
+		t.Fatalf("Start was attempted despite unconfirmed orphan; events = %v", sp.events)
+	}
+	want := []string{"find:", "terminate:"}
+	for i, prefix := range want {
+		if i >= len(sp.events) || !strings.HasPrefix(sp.events[i], prefix) {
+			t.Fatalf("events = %v, want prefixes %v", sp.events, want)
+		}
+	}
+}
+
+// TestStartProceedsWhenOrphanConfirmedDead is the positive counterpart: when
+// the same-session orphan IS confirmed dead, Manager.Start proceeds and starts
+// the replacement runtime. It proves the gate does not over-refuse.
+func TestStartProceedsWhenOrphanConfirmedDead(t *testing.T) {
+	mgr, sp, info := seedSuspendedResumeTarget(t)
+	armConfirmedDeadOrphan(sp)
+
+	if err := mgr.Start(context.Background(), info.ID, BuildResumeCommand(info), runtime.Config{WorkDir: info.WorkDir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	want := []string{"find:" + info.ID, "terminate:" + info.ID, "start:" + info.ID}
+	if got := strings.Join(sp.events, ","); got != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", sp.events, want)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatalf("runtime session %q not running after resume", info.SessionName)
+	}
+}
+
+// TestStartRuntimeOnlyProceedsWhenOrphanConfirmedDead is the StartRuntimeOnly
+// positive counterpart.
+func TestStartRuntimeOnlyProceedsWhenOrphanConfirmedDead(t *testing.T) {
+	mgr, sp, info := seedSuspendedResumeTarget(t)
+	armConfirmedDeadOrphan(sp)
+
+	if err := mgr.StartRuntimeOnly(context.Background(), info.ID, BuildResumeCommand(info), runtime.Config{WorkDir: info.WorkDir}); err != nil {
+		t.Fatalf("StartRuntimeOnly: %v", err)
+	}
+	want := []string{"find:" + info.ID, "terminate:" + info.ID, "start:" + info.ID}
+	if got := strings.Join(sp.events, ","); got != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", sp.events, want)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatalf("runtime session %q not running after respawn", info.SessionName)
+	}
+}
+
+// TestStartUnwindsACPRouteWhenOrphanNotConfirmedDead pins the route-unwinding
+// half of the fix: when the resume path reserved an ACP route before the
+// pre-start orphan gate, a refusal must call unroute() so the reservation is
+// released rather than leaked. It seeds an ACP-transport session bead directly
+// (mirroring the legacy-ACP fixtures elsewhere in this file) so ensureRunning
+// reserves a route via RouteACP, then arms a not-confirmed-dead orphan and
+// asserts Unroute fires and no runtime Start is attempted.
+func TestStartUnwindsACPRouteWhenOrphanNotConfirmedDead(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &acpOrphanScanProvider{orphanScanProvider: &orphanScanProvider{Fake: runtime.NewFake()}}
+	armUnconfirmedOrphan(sp.orphanScanProvider)
+	mgr := NewManagerWithOptions(store, sp)
+
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"state":     string(StateSuspended),
+			"provider":  "claude",
+			"transport": "acp",
+			"work_dir":  "/tmp",
+			"command":   "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create bead: %v", err)
+	}
+	sessName := sessionNameFor(b.ID)
+	if err := store.SetMetadata(b.ID, "session_name", sessName); err != nil {
+		t.Fatalf("SetMetadata(session_name): %v", err)
+	}
+	sp.events = nil
+
+	err = mgr.Start(context.Background(), b.ID, "claude", runtime.Config{WorkDir: "/tmp"})
+	if err == nil {
+		t.Fatal("Start succeeded despite an orphan that could not be confirmed dead")
+	}
+	if !strings.Contains(err.Error(), "orphan cleanup") {
+		t.Fatalf("Start error = %v, want pre-start orphan cleanup refusal", err)
+	}
+	if hasEventPrefix(sp.events, "start:") {
+		t.Fatalf("Start was attempted despite unconfirmed orphan; events = %v", sp.events)
+	}
+	if !hasEventPrefix(sp.events, "route:") {
+		t.Fatalf("expected an ACP route reservation before the gate; events = %v", sp.events)
+	}
+	if !hasEventPrefix(sp.events, "unroute:") {
+		t.Fatalf("ACP route reservation was not unwound on refusal; events = %v", sp.events)
+	}
+}
+
+func TestCreateWithProviderWithoutProcessScannerStillStarts(t *testing.T) {
+	store := beads.NewMemStore()
+	fake := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, &providerWithoutProcessScanner{Provider: fake})
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !fake.IsRunning(info.SessionName) {
+		t.Fatalf("runtime session %q was not started", info.SessionName)
+	}
+}
+
+func TestRuntimeStartCallSitesCleanOrphansFirst(t *testing.T) {
+	tests := []struct {
+		file   string
+		idExpr string
+	}{
+		{file: "manager.go", idExpr: "b.ID"},
+		{file: "chat.go", idExpr: "id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.file, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(".", tt.file))
+			if err != nil {
+				t.Fatalf("read %s: %v", tt.file, err)
+			}
+			lines := strings.Split(string(data), "\n")
+			starts := 0
+			for i, line := range lines {
+				if !strings.Contains(line, "m.sp.Start(ctx, sessName, cfg)") {
+					continue
+				}
+				starts++
+				// The cleanup call may sit a few lines above the Start when its
+				// result gates the Start (manager.go wraps it in an
+				// `if orphanErr := …; orphanErr != nil` refusal), so scan a
+				// short preceding window rather than only the immediate line.
+				if !orphanCleanupPrecedes(lines, i, tt.idExpr) {
+					t.Errorf("%s:%d Start is not preceded by orphan cleanup using %s", tt.file, i+1, tt.idExpr)
+				}
+			}
+			if starts == 0 {
+				t.Fatalf("%s contains no m.sp.Start(ctx, sessName, cfg) call sites", tt.file)
+			}
+		})
+	}
+}
+
+// orphanCleanupPrecedes reports whether m.killExistingOrphans(ctx, idExpr)
+// appears within the short window of non-blank lines preceding the Start at
+// index before. The window keeps the "every Start is guarded by orphan
+// cleanup" invariant while tolerating the gate wrapper that consumes the
+// cleanup's error.
+func orphanCleanupPrecedes(lines []string, before int, idExpr string) bool {
+	needle := "m.killExistingOrphans(ctx, " + idExpr + ")"
+	const window = 10
+	seen := 0
+	for i := before - 1; i >= 0 && seen < window; i-- {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		seen++
+		if strings.Contains(lines[i], needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestUpdateTemplateOverridesRejectsRunningSessionUnderLock(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"}); !errors.Is(err, ErrSessionActive) {
+		t.Fatalf("UpdateTemplateOverrides active error = %v, want ErrSessionActive", err)
+	}
+}
+
+func TestUpdateTemplateOverridesRejectsLiveRuntimeEvenWhenStateLooksDormant(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.SetMetadataBatch(info.ID, map[string]string{"state": string(StateAsleep)}); err != nil {
+		t.Fatalf("SetMetadataBatch: %v", err)
+	}
+
+	if _, err := mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"}); !errors.Is(err, ErrSessionActive) {
+		t.Fatalf("UpdateTemplateOverrides live-runtime error = %v, want ErrSessionActive", err)
+	}
+}
+
+func TestUpdateTemplateOverridesAllowsSuspendedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	overrides, err := mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if err != nil {
+		t.Fatalf("UpdateTemplateOverrides suspended: %v", err)
+	}
+	if got := overrides["permission_mode"]; got != "auto-edit" {
+		t.Fatalf("permission_mode = %q, want auto-edit", got)
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := b.Metadata["opt_permission_mode"]; got != "auto-edit" {
+		t.Fatalf("opt_permission_mode = %q, want auto-edit", got)
+	}
+}
+
+func TestUpdateTemplateOverridesRejectsRecentWakeInFlight(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "last_woke_at", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetMetadata(last_woke_at): %v", err)
+	}
+
+	_, err = mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if !errors.Is(err, ErrSessionActive) {
+		t.Fatalf("UpdateTemplateOverrides recent wake err = %v, want ErrSessionActive", err)
+	}
+}
+
+func TestUpdateTemplateOverridesRejectsPendingCreateClaim(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "pending_create_claim", "true"); err != nil {
+		t.Fatalf("SetMetadata(pending_create_claim): %v", err)
+	}
+
+	_, err = mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if !errors.Is(err, ErrSessionActive) {
+		t.Fatalf("UpdateTemplateOverrides pending create err = %v, want ErrSessionActive", err)
+	}
+}
+
+func TestUpdateTemplateOverridesWakeInFlightGraceBoundary(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	mgr.clk = &clock.Fake{Time: time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)}
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	insideGrace := mgr.clk.Now().Add(-templateOverrideWakeInFlightGrace() + time.Second).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(info.ID, "last_woke_at", insideGrace); err != nil {
+		t.Fatalf("SetMetadata(last_woke_at inside): %v", err)
+	}
+	_, err = mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if !errors.Is(err, ErrSessionActive) {
+		t.Fatalf("UpdateTemplateOverrides inside grace err = %v, want ErrSessionActive", err)
+	}
+
+	outsideGrace := mgr.clk.Now().Add(-templateOverrideWakeInFlightGrace() - time.Second).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(info.ID, "last_woke_at", outsideGrace); err != nil {
+		t.Fatalf("SetMetadata(last_woke_at outside): %v", err)
+	}
+	overrides, err := mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if err != nil {
+		t.Fatalf("UpdateTemplateOverrides outside grace: %v", err)
+	}
+	if got := overrides["permission_mode"]; got != "auto-edit" {
+		t.Fatalf("permission_mode = %q, want auto-edit", got)
+	}
+}
+
+func TestUpdateTemplateOverridesAllowsOldWakeTimestamp(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	oldWake := time.Now().UTC().Add(-2 * time.Minute).Format(time.RFC3339)
+	if err := store.SetMetadata(info.ID, "last_woke_at", oldWake); err != nil {
+		t.Fatalf("SetMetadata(last_woke_at): %v", err)
+	}
+
+	overrides, err := mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if err != nil {
+		t.Fatalf("UpdateTemplateOverrides old wake: %v", err)
+	}
+	if got := overrides["permission_mode"]; got != "auto-edit" {
+		t.Fatalf("permission_mode = %q, want auto-edit", got)
+	}
+}
+
+func TestUpdateTemplateOverridesUsesManagerClockForWakeWindow(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	mgr.clk = &clock.Fake{Time: time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)}
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	oldForManagerClock := mgr.clk.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(info.ID, "last_woke_at", oldForManagerClock); err != nil {
+		t.Fatalf("SetMetadata(last_woke_at): %v", err)
+	}
+
+	overrides, err := mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if err != nil {
+		t.Fatalf("UpdateTemplateOverrides old fake-clock wake: %v", err)
+	}
+	if got := overrides["permission_mode"]; got != "auto-edit" {
+		t.Fatalf("permission_mode = %q, want auto-edit", got)
+	}
+}
+
+func TestUpdateTemplateOverridesAllowsFailedCreateWithRecentWake(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	mgr.clk = &clock.Fake{Time: time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)}
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := store.SetMetadataBatch(info.ID, map[string]string{
+		"state":        string(StateFailedCreate),
+		"last_woke_at": mgr.clk.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("SetMetadataBatch: %v", err)
+	}
+
+	overrides, err := mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if err != nil {
+		t.Fatalf("UpdateTemplateOverrides failed-create recent wake: %v", err)
+	}
+	if got := overrides["permission_mode"]; got != "auto-edit" {
+		t.Fatalf("permission_mode = %q, want auto-edit", got)
+	}
+}
+
+func TestUpdateTemplateOverridesRepairsMalformedMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "template_overrides", "{not-json"); err != nil {
+		t.Fatalf("SetMetadata: %v", err)
+	}
+
+	overrides, err := mgr.UpdateTemplateOverrides(info.ID, map[string]string{"permission_mode": "auto-edit"})
+	if err != nil {
+		t.Fatalf("UpdateTemplateOverrides malformed metadata: %v", err)
+	}
+	if got := overrides["permission_mode"]; got != "auto-edit" {
+		t.Fatalf("permission_mode = %q, want auto-edit", got)
+	}
+}
+
+func TestCreateConfirmsStartedStateWithoutControllerDriftHash(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(
+		context.Background(), CreateOptions{Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: map[string]string{"BEADS_DIR": "/tmp/beads"}, Resume: ProviderResume{}, Hints: runtime.Config{
+			Env:              map[string]string{"GC_CITY": "test-city"},
+			FingerprintExtra: map[string]string{"depends_on": "db"},
+			SessionLive:      []string{"echo live"},
+		}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata["started_config_hash"]; got != "" {
+		t.Fatalf("started_config_hash = %q, want empty so controller owns drift hashes", got)
+	}
+	if got := b.Metadata["started_live_hash"]; got != "" {
+		t.Fatalf("started_live_hash = %q, want empty so controller owns drift hashes", got)
+	}
+	if got := b.Metadata["live_hash"]; got != "" {
+		t.Fatalf("live_hash = %q, want empty so controller owns drift hashes", got)
+	}
+	if got := b.Metadata["state_reason"]; got != "creation_complete" {
+		t.Fatalf("state_reason = %q, want creation_complete", got)
+	}
+	if got := b.Metadata["creation_complete_at"]; got == "" {
+		t.Fatal("creation_complete_at is empty")
+	}
+}
+
+func TestCreateDefaultsTitleToTemplate(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Title != "helper" {
+		t.Errorf("Title = %q, want %q", b.Title, "helper")
+	}
+}
+
+func TestCreateSessionBeadOnlyDefaultsTitleToTemplate(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Resume: ProviderResume{}})
+	if err != nil {
+		t.Fatalf("CreateSessionBeadOnly: %v", err)
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Title != "helper" {
+		t.Errorf("Title = %q, want %q", b.Title, "helper")
+	}
+}
+
+func TestCreateSessionBeadOnly(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Resume: ProviderResume{}})
+	if err != nil {
+		t.Fatalf("CreateSessionBeadOnly: %v", err)
+	}
+	if info.Template != "helper" {
+		t.Errorf("Template = %q, want %q", info.Template, "helper")
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Metadata["generation"] != "1" {
+		t.Errorf("generation = %q, want 1", b.Metadata["generation"])
+	}
+	if b.Metadata["continuation_epoch"] != "1" {
+		t.Errorf("continuation_epoch = %q, want 1", b.Metadata["continuation_epoch"])
+	}
+	if b.Metadata["instance_token"] == "" {
+		t.Error("instance_token is empty")
+	}
+	if info.ID == "" {
+		t.Error("ID is empty")
+	}
+
+	// Verify the runtime session was NOT started.
+	if sp.IsRunning(info.SessionName) {
+		t.Error("runtime session should not be started in bead-only mode")
+	}
+
+	// Verify bead was created with state "start-pending" (not "active").
+	if b.Metadata["state"] != string(StateStartPending) {
+		t.Errorf("bead state = %q, want %q", b.Metadata["state"], StateStartPending)
+	}
+	if b.Metadata["session_name"] == "" {
+		t.Error("bead missing session_name metadata")
+	}
+}
+
+func TestGetSurfacesAgentNameMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Resume: ProviderResume{}})
+	if err != nil {
+		t.Fatalf("CreateSessionBeadOnly: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "agent_name", "myrig/helper-adhoc-123"); err != nil {
+		t.Fatalf("SetMetadata(agent_name): %v", err)
+	}
+
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.AgentName != "myrig/helper-adhoc-123" {
+		t.Fatalf("AgentName = %q, want %q", got.AgentName, "myrig/helper-adhoc-123")
+	}
+}
+
+// TestGetSurfacesLastNudgeDeliveredAtMetadata verifies that
+// `metadata.last_nudge_delivered_at` (stamped by the nudge dispatcher on
+// successful delivery) round-trips through Info.LastNudgeDeliveredAt so
+// `gc session list` can render the "LAST NUDGE" column. The stamp lives
+// on the session bead so operators can spot warm sessions whose delivery
+// loop has stalled (queued items piling up while the timestamp stays old).
+func TestGetSurfacesLastNudgeDeliveredAtMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Resume: ProviderResume{}})
+	if err != nil {
+		t.Fatalf("CreateSessionBeadOnly: %v", err)
+	}
+
+	stamp := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
+	if err := store.SetMetadata(info.ID, MetadataLastNudgeDeliveredAt, stamp.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetMetadata(%s): %v", MetadataLastNudgeDeliveredAt, err)
+	}
+
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !got.LastNudgeDeliveredAt.Equal(stamp) {
+		t.Fatalf("LastNudgeDeliveredAt = %v, want %v", got.LastNudgeDeliveredAt, stamp)
+	}
+}
+
+// TestGetIgnoresInvalidLastNudgeDeliveredAtMetadata ensures a malformed
+// metadata value leaves Info.LastNudgeDeliveredAt zero rather than
+// surfacing a parser error. The stamp is best-effort observability —
+// any future schema drift must degrade gracefully instead of breaking
+// the read path that powers `gc session list`.
+func TestGetIgnoresInvalidLastNudgeDeliveredAtMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Resume: ProviderResume{}})
+	if err != nil {
+		t.Fatalf("CreateSessionBeadOnly: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, MetadataLastNudgeDeliveredAt, "not-a-timestamp"); err != nil {
+		t.Fatalf("SetMetadata: %v", err)
+	}
+
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !got.LastNudgeDeliveredAt.IsZero() {
+		t.Fatalf("LastNudgeDeliveredAt = %v, want zero (unparsable RFC3339 must not surface)", got.LastNudgeDeliveredAt)
+	}
+}
+
+func TestCreateSessionNamedWithTransport_UsesExplicitSessionName(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "my chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("CreateSessionNamedWithTransport: %v", err)
+	}
+	if info.SessionName != "sky" {
+		t.Fatalf("SessionName = %q, want sky", info.SessionName)
+	}
+	if !sp.IsRunning("sky") {
+		t.Fatal("expected runtime session named sky to be running")
+	}
+}
+
+func TestCreateSessionNamedWithTransport_RejectsReusedName(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "first", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}}); err != nil {
+		t.Fatalf("first CreateSessionNamedWithTransport: %v", err)
+	}
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "second", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}}); err == nil {
+		t.Fatal("expected session name conflict")
+	} else if !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("expected ErrSessionNameExists, got %v", err)
+	}
+}
+
+func TestCreateSessionNamedWithTransport_ClosedSessionStillReservesName(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "first", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("first CreateSessionNamedWithTransport: %v", err)
+	}
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "second", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}}); err == nil {
+		t.Fatal("expected closed session to keep reserving its explicit name")
+	} else if !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("expected ErrSessionNameExists, got %v", err)
+	}
+}
+
+func TestCreateSessionNamedWithTransport_FailedStartDoesNotBurnExplicitName(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	sp.StartErrors["sky"] = errors.New("boom")
+	mgr := NewManagerWithOptions(store, sp)
+
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "first", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}}); err == nil {
+		t.Fatal("expected start failure")
+	}
+	if err := ensureSessionNameAvailable(store, "sky"); err != nil {
+		t.Fatalf("ensureSessionNameAvailable after failed start = %v, want nil", err)
+	}
+
+	delete(sp.StartErrors, "sky")
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "second", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("retry CreateSessionNamedWithTransport: %v", err)
+	}
+	if info.SessionName != "sky" {
+		t.Fatalf("SessionName = %q, want sky", info.SessionName)
+	}
+}
+
+func TestCreateSessionNamedWithTransport_ConvergesLateSuccessStartError(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &lateSuccessStartProvider{
+		Fake:     runtime.NewFake(),
+		startErr: context.DeadlineExceeded,
+	}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "first", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("CreateSessionNamedWithTransport: %v", err)
+	}
+	if info.SessionName != "sky" {
+		t.Fatalf("SessionName = %q, want sky", info.SessionName)
+	}
+	if !sp.IsRunning("sky") {
+		t.Fatal("runtime session should remain running after late-success convergence")
+	}
+	got, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got.Status == "closed" {
+		t.Fatal("session bead should remain open after late-success convergence")
+	}
+}
+
+func TestCreateSessionNamedWithTransport_ClearsACPRouteAfterDuplicateRuntimeFailure(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	autoSP := sessionauto.New(defaultSP, acpSP)
+	mgr := NewManagerWithOptions(store, autoSP)
+
+	if err := acpSP.Start(context.Background(), "sky", runtime.Config{}); err != nil {
+		t.Fatalf("seed acp start: %v", err)
+	}
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "first", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "acp", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}}); err == nil {
+		t.Fatal("expected duplicate runtime failure")
+	} else if !errors.Is(err, ErrSessionNameExists) {
+		t.Fatalf("expected ErrSessionNameExists, got %v", err)
+	}
+	if err := acpSP.Stop("sky"); err != nil {
+		t.Fatalf("seed acp stop: %v", err)
+	}
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "second", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("retry CreateSessionNamedWithTransport: %v", err)
+	}
+	if !defaultSP.IsRunning(info.SessionName) {
+		t.Fatalf("default backend should own %q after ACP duplicate cleanup", info.SessionName)
+	}
+	if acpSP.IsRunning(info.SessionName) {
+		t.Fatalf("ACP backend should not own %q after cleanup", info.SessionName)
+	}
+}
+
+func TestCreateSessionBeadOnlyNamed_UsesExplicitSessionName(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, ExplicitName: "sky", Template: "helper", Title: "queued", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Resume: ProviderResume{}})
+	if err != nil {
+		t.Fatalf("CreateSessionBeadOnlyNamed: %v", err)
+	}
+	if info.SessionName != "sky" {
+		t.Fatalf("SessionName = %q, want sky", info.SessionName)
+	}
+	if sp.IsRunning("sky") {
+		t.Fatal("runtime session should not be started in bead-only mode")
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Metadata["pending_create_claim"] != "true" {
+		t.Fatalf("pending_create_claim = %q, want true", b.Metadata["pending_create_claim"])
+	}
+}
+
+func TestCreateSessionAliasedBeadOnlyNamed_SetsPendingCreateMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Alias: "worker", ExplicitName: "test-city--worker", Template: "worker", Title: "queued", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Resume: ProviderResume{}})
+	if err != nil {
+		t.Fatalf("CreateSessionAliasedBeadOnlyNamed: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata["pending_create_claim"]; got != "true" {
+		t.Fatalf("pending_create_claim = %q, want true", got)
+	}
+	startedAt := b.Metadata["pending_create_started_at"]
+	if startedAt == "" {
+		t.Fatal("pending_create_started_at is empty")
+	}
+	if _, err := time.Parse(time.RFC3339, startedAt); err != nil {
+		t.Fatalf("pending_create_started_at = %q, want RFC3339: %v", startedAt, err)
+	}
+}
+
+func TestCreateSessionBeadOnly_SetsPendingCreateClaimForWakeSignal(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{BeadOnly: true, Template: "helper", Title: "queued", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Resume: ProviderResume{}})
+	if err != nil {
+		t.Fatalf("CreateSessionBeadOnly: %v", err)
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Metadata["pending_create_claim"] != "true" {
+		t.Fatalf("pending_create_claim = %q, want %q", b.Metadata["pending_create_claim"], "true")
+	}
+}
+
+func TestCreateRoutesACPSessionsThroughAutoProvider(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sessionauto.New(defaultSP, acpSP))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "acp chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "acp", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if defaultSP.IsRunning(info.SessionName) {
+		t.Fatalf("default backend should not own ACP session %q", info.SessionName)
+	}
+	if !acpSP.IsRunning(info.SessionName) {
+		t.Fatalf("ACP backend should own session %q", info.SessionName)
+	}
+}
+
+func TestSuspendAndResume(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Suspend.
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	// Verify runtime session stopped.
+	if sp.IsRunning(info.SessionName) {
+		t.Error("runtime session should be stopped after suspend")
+	}
+
+	// Verify bead state updated.
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateSuspended {
+		t.Errorf("State = %q, want %q", got.State, StateSuspended)
+	}
+
+	// Suspend again is idempotent.
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend (idempotent): %v", err)
+	}
+
+	// Resume via Attach.
+	err = mgr.Attach(context.Background(), info.ID, "claude --resume", runtime.Config{})
+	if err != nil {
+		t.Fatalf("Attach (resume): %v", err)
+	}
+
+	// Verify runtime session restarted.
+	if !sp.IsRunning(info.SessionName) {
+		t.Error("runtime session should be running after resume")
+	}
+
+	// Verify state back to active.
+	got, err = mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateActive {
+		t.Errorf("State = %q, want %q", got.State, StateActive)
+	}
+}
+
+func TestClose(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	wait := createTestWait(t, store, info.ID)
+
+	// Close active session.
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Verify runtime stopped.
+	if sp.IsRunning(info.SessionName) {
+		t.Error("runtime session should be stopped after close")
+	}
+
+	// Verify bead closed.
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Status != "closed" {
+		t.Errorf("bead Status = %q, want %q", b.Status, "closed")
+	}
+	wait, err = store.Get(wait.ID)
+	if err != nil {
+		t.Fatalf("store.Get(wait): %v", err)
+	}
+	if wait.Metadata["state"] != waitStateCanceled {
+		t.Fatalf("wait state = %q, want %q", wait.Metadata["state"], waitStateCanceled)
+	}
+
+	// Close again is idempotent.
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close (idempotent): %v", err)
+	}
+}
+
+func TestCloseRemovesRuntimeMCPSnapshot(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	cityPath := t.TempDir()
+	mgr := NewManagerWithOptions(store, sp, WithCityPath(cityPath))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := PersistRuntimeMCPServersSnapshot(cityPath, info.ID, []runtime.MCPServerConfig{{
+		Name:      "identity",
+		Transport: runtime.MCPTransportHTTP,
+		URL:       "https://example.invalid/mcp",
+	}}); err != nil {
+		t.Fatalf("PersistRuntimeMCPServersSnapshot: %v", err)
+	}
+	if _, err := os.Stat(runtimeMCPServersSnapshotPath(cityPath, info.ID)); err != nil {
+		t.Fatalf("Stat(runtime snapshot): %v", err)
+	}
+
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(runtimeMCPServersSnapshotPath(cityPath, info.ID)); !os.IsNotExist(err) {
+		t.Fatalf("runtime snapshot still exists after close, stat err = %v", err)
+	}
+}
+
+func TestClose_ConfiguredNamedSessionRetiresIdentifiers(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(
+		context.Background(), CreateOptions{Alias: "mayor", ExplicitName: "test-city--mayor", Template: "mayor", Title: "Mayor", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{
+			"configured_named_session":  "true",
+			"configured_named_identity": "mayor",
+		}})
+	if err != nil {
+		t.Fatalf("CreateSessionAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Status; got != "closed" {
+		t.Fatalf("Status = %q, want closed", got)
+	}
+	if got := b.Metadata["alias"]; got != "" {
+		t.Fatalf("alias = %q, want empty", got)
+	}
+	if got := b.Metadata["session_name"]; got != "" {
+		t.Fatalf("session_name = %q, want empty", got)
+	}
+	if got := b.Metadata["session_name_explicit"]; got != "" {
+		t.Fatalf("session_name_explicit = %q, want empty", got)
+	}
+	if got := b.Metadata["alias_history"]; got != "mayor" {
+		t.Fatalf("alias_history = %q, want mayor", got)
+	}
+}
+
+// TestClose_NamedSessionByIdentityRetiresIdentifiers covers ga-841: a
+// configured named session recognized only by its configured_named_identity
+// (the boolean configured_named_session flag absent — e.g. a legacy or
+// partially-tagged bead) must still release its runtime name on close, and the
+// freed name must be reusable for a fresh same-named session. This is the
+// "create a named session, close it, assert its name is FREE" acceptance.
+func TestClose_NamedSessionByIdentityRetiresIdentifiers(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(
+		context.Background(), CreateOptions{Alias: "refinery", ExplicitName: "test-city--refinery", Template: "refinery", Title: "Refinery", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{
+			"configured_named_identity": "refinery",
+		}})
+	if err != nil {
+		t.Fatalf("CreateSessionAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata["session_name"]; got != "" {
+		t.Fatalf("session_name = %q, want empty after close", got)
+	}
+	if got := b.Metadata["alias"]; got != "" {
+		t.Fatalf("alias = %q, want empty after close", got)
+	}
+
+	// The freed runtime name must be available for a fresh session.
+	if err := ensureSessionNameAvailable(store, "test-city--refinery"); err != nil {
+		t.Fatalf("ensureSessionNameAvailable after close = %v, want nil", err)
+	}
+}
+
+func TestCreateInjectsUnifiedSessionRuntimeEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(
+		context.Background(), CreateOptions{Alias: "mayor", ExplicitName: "test-city--mayor", Template: "reviewer", Title: "Mayor", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: map[string]string{"GC_AGENT": "stale"}, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{
+			"configured_named_session":  "true",
+			"configured_named_identity": "mayor",
+			"session_origin":            "named",
+		}})
+	if err != nil {
+		t.Fatalf("CreateSessionAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	var start *runtime.Call
+	for i := range sp.Calls {
+		if sp.Calls[i].Method == "Start" {
+			start = &sp.Calls[i]
+			break
+		}
+	}
+	if start == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	env := start.Config.Env
+	for key, want := range map[string]string{
+		"GC_SESSION_ID":     info.ID,
+		"GC_SESSION_NAME":   "test-city--mayor",
+		"GC_ALIAS":          "mayor",
+		"GC_TEMPLATE":       "reviewer",
+		"GC_SESSION_ORIGIN": "named",
+		"GC_AGENT":          "mayor",
+	} {
+		if got := env[key]; got != want {
+			t.Fatalf("Env[%s] = %q, want %q (env=%v)", key, got, want, env)
+		}
+	}
+}
+
+func TestCreateUsesBuiltinAncestorForGCProviderEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(
+		context.Background(), CreateOptions{Alias: "mayor", ExplicitName: "test-city--mayor", Template: "reviewer", Title: "Mayor", Command: "claude", WorkDir: "/tmp", Provider: "claude-max", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{
+			"builtin_ancestor": "claude",
+			"provider_kind":    "claude-max",
+			"session_origin":   "named",
+		}})
+	if err != nil {
+		t.Fatalf("CreateSessionAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	cfg := sp.LastStartConfig("test-city--mayor")
+	if cfg == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	if got := cfg.Env["GC_PROVIDER"]; got != "claude" {
+		t.Fatalf("GC_PROVIDER = %q, want claude for %s", got, info.ID)
+	}
+}
+
+func TestAttachUsesBuiltinAncestorForGCProviderEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	b, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":     "test-city--worker",
+			"state":            string(StateSuspended),
+			"template":         "worker",
+			"work_dir":         "/tmp",
+			"provider":         "claude-max",
+			"provider_kind":    "claude-max",
+			"builtin_ancestor": "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("creating session bead: %v", err)
+	}
+
+	if err := mgr.Attach(context.Background(), b.ID, "claude --resume abc", runtime.Config{}); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	cfg := sp.LastStartConfig("test-city--worker")
+	if cfg == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	if got := cfg.Env["GC_PROVIDER"]; got != "claude" {
+		t.Fatalf("GC_PROVIDER = %q, want claude", got)
+	}
+}
+
+func TestCreateAliaslessMultiSessionUsesConcreteRuntimeIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(
+		context.Background(), CreateOptions{Alias: "", ExplicitName: "ant-adhoc-123", Template: "demo/ant", Title: "Ant", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{
+			"agent_name":     "demo/ant-adhoc-123",
+			"session_origin": "manual",
+		}})
+	if err != nil {
+		t.Fatalf("CreateSessionAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	var start *runtime.Call
+	for i := range sp.Calls {
+		if sp.Calls[i].Method == "Start" {
+			start = &sp.Calls[i]
+			break
+		}
+	}
+	if start == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	env := start.Config.Env
+	for key, want := range map[string]string{
+		"GC_SESSION_ID":     info.ID,
+		"GC_SESSION_NAME":   "ant-adhoc-123",
+		"GC_ALIAS":          "demo/ant-adhoc-123",
+		"GC_TEMPLATE":       "demo/ant",
+		"GC_SESSION_ORIGIN": "manual",
+		"GC_AGENT":          "demo/ant-adhoc-123",
+	} {
+		if got := env[key]; got != want {
+			t.Fatalf("Env[%s] = %q, want %q (env=%v)", key, got, want, env)
+		}
+	}
+}
+
+func TestCloseSuspended(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	// Close suspended session.
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Status != "closed" {
+		t.Errorf("bead Status = %q, want %q", b.Status, "closed")
+	}
+}
+
+func TestClose_IgnoresWaitCancellationFailure(t *testing.T) {
+	store := waitFailStore{MemStore: beads.NewMemStore()}
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close should succeed despite wait cancellation failure: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Status != "closed" {
+		t.Fatalf("bead Status = %q, want closed", b.Status)
+	}
+}
+
+func TestList(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Create two sessions with different templates.
+	_, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "first", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create 1: %v", err)
+	}
+	info2, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "review", Title: "second", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create 2: %v", err)
+	}
+
+	// Suspend the second one.
+	if err := mgr.Suspend(info2.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	// List all (default excludes closed).
+	sessions, err := mgr.List("", "")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("List returned %d sessions, want 2", len(sessions))
+	}
+	if sessions[0].ID != info2.ID {
+		t.Fatalf("List order first ID = %q, want newest %q", sessions[0].ID, info2.ID)
+	}
+
+	// Filter by state.
+	active, err := mgr.List("active", "")
+	if err != nil {
+		t.Fatalf("List active: %v", err)
+	}
+	if len(active) != 1 {
+		t.Errorf("List active returned %d, want 1", len(active))
+	}
+
+	suspended, err := mgr.List("suspended", "")
+	if err != nil {
+		t.Fatalf("List suspended: %v", err)
+	}
+	if len(suspended) != 1 {
+		t.Errorf("List suspended returned %d, want 1", len(suspended))
+	}
+
+	// Filter by template.
+	helpers, err := mgr.List("", "helper")
+	if err != nil {
+		t.Fatalf("List template: %v", err)
+	}
+	if len(helpers) != 1 {
+		t.Errorf("List template=helper returned %d, want 1", len(helpers))
+	}
+}
+
+func TestListNormalizesLegacyDrainedToAsleep(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	bead, err := store.Create(beads.Bead{
+		Title:  "legacy drained",
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"template":     "helper",
+			"state":        "drained",
+			"session_name": "legacy-drained",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy drained session: %v", err)
+	}
+
+	got, err := mgr.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != State("asleep") {
+		t.Fatalf("Get state = %q, want asleep", got.State)
+	}
+
+	sessions, err := mgr.List("asleep", "")
+	if err != nil {
+		t.Fatalf("List asleep: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("List asleep returned %d sessions, want 1", len(sessions))
+	}
+	if sessions[0].ID != bead.ID {
+		t.Fatalf("List asleep returned %q, want %q", sessions[0].ID, bead.ID)
+	}
+}
+
+func TestGetNormalizesAwakeToActive(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	bead, err := store.Create(beads.Bead{
+		Title:  "awake session",
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"template":     "helper",
+			"state":        "awake",
+			"session_name": "live-awake",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create awake session: %v", err)
+	}
+	if err := sp.Start(context.Background(), "live-awake", runtime.Config{Command: "true"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	got, err := mgr.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateActive {
+		t.Fatalf("Get state = %q, want %q", got.State, StateActive)
+	}
+}
+
+func TestGetDowngradesStaleActiveStateToAsleep(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	bead, err := store.Create(beads.Bead{
+		Title:  "stale awake session",
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"template":     "helper",
+			"state":        "awake",
+			"session_name": "stale-awake",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create stale awake session: %v", err)
+	}
+
+	got, err := mgr.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateAsleep {
+		t.Fatalf("Get state = %q, want %q", got.State, StateAsleep)
+	}
+}
+
+func TestPeek(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Set canned peek output on the session name.
+	sp.SetPeekOutput(info.SessionName, "hello world")
+
+	out, err := mgr.Peek(info.ID, 50)
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+	if out != "hello world" {
+		t.Errorf("Peek output = %q, want %q", out, "hello world")
+	}
+}
+
+func TestPeekSuspended(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	_, err = mgr.Peek(info.ID, 50)
+	if err == nil {
+		t.Error("Peek on suspended session should error")
+	}
+}
+
+func TestAttachClosedErrors(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	err = mgr.Attach(context.Background(), info.ID, "claude --resume", runtime.Config{})
+	if err == nil {
+		t.Error("Attach to closed session should error")
+	}
+}
+
+func TestSessionNameFor(t *testing.T) {
+	tests := []struct {
+		beadID string
+		want   string
+	}{
+		{"gc-1", "s-gc-1"},
+		{"gc-42", "s-gc-42"},
+	}
+	for _, tt := range tests {
+		got := sessionNameFor(tt.beadID)
+		if got != tt.want {
+			t.Errorf("sessionNameFor(%q) = %q, want %q", tt.beadID, got, tt.want)
+		}
+	}
+}
+
+func TestListExcludesClosedFromActiveFilter(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Filtering by "active" should NOT return the closed session.
+	active, err := mgr.List("active", "")
+	if err != nil {
+		t.Fatalf("List active: %v", err)
+	}
+	if len(active) != 0 {
+		t.Errorf("List active returned %d, want 0 (closed session leaked)", len(active))
+	}
+}
+
+func TestAttachActiveReattach(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Attach to an active session — should reattach without restarting.
+	err = mgr.Attach(context.Background(), info.ID, "claude --resume", runtime.Config{})
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	// Verify state is still active.
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateActive {
+		t.Errorf("State = %q, want %q", got.State, StateActive)
+	}
+}
+
+func TestSuspendCrashedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Simulate crash by stopping the runtime behind the manager's back.
+	_ = sp.Stop(info.SessionName)
+
+	// Suspend should succeed even though runtime is dead.
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend crashed session: %v", err)
+	}
+
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateSuspended {
+		t.Errorf("State = %q, want %q", got.State, StateSuspended)
+	}
+}
+
+func TestSuspendCleansDeadRuntimeArtifact(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &nonRunningStopRecorder{Fake: runtime.NewFake()}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	if sp.stopCalls != 1 {
+		t.Fatalf("Stop calls = %d, want 1 to clean dead runtime artifact", sp.stopCalls)
+	}
+}
+
+func TestSuspendKeepsNonRunningCleanupBestEffort(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &nonRunningStopRecorder{Fake: runtime.NewFake(), stopErr: errors.New("cleanup unavailable")}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if sp.stopCalls != 1 {
+		t.Fatalf("Stop calls = %d, want 1", sp.stopCalls)
+	}
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateSuspended {
+		t.Fatalf("State = %q, want %q", got.State, StateSuspended)
+	}
+}
+
+func TestCreateStoresCommand(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude --dangerously-skip-permissions", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Verify the command is stored in the bead metadata.
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Metadata["command"] != "claude --dangerously-skip-permissions" {
+		t.Errorf("stored command = %q, want %q", b.Metadata["command"], "claude --dangerously-skip-permissions")
+	}
+
+	// Verify it's accessible via Info.
+	if info.Command != "claude --dangerously-skip-permissions" {
+		t.Errorf("Info.Command = %q, want %q", info.Command, "claude --dangerously-skip-permissions")
+	}
+}
+
+func TestCreateWithSessionID(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	resume := ProviderResume{
+		ResumeFlag:    "--resume",
+		ResumeStyle:   "flag",
+		SessionIDFlag: "--session-id",
+	}
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude --dangerously-skip-permissions", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: resume, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Session key should be generated.
+	if info.SessionKey == "" {
+		t.Fatal("SessionKey is empty")
+	}
+	// Should look like a UUID.
+	if len(info.SessionKey) != 36 {
+		t.Errorf("SessionKey length = %d, want 36 (UUID)", len(info.SessionKey))
+	}
+
+	// Resume metadata should be stored.
+	if info.ResumeFlag != "--resume" {
+		t.Errorf("ResumeFlag = %q, want %q", info.ResumeFlag, "--resume")
+	}
+	if info.ResumeStyle != "flag" {
+		t.Errorf("ResumeStyle = %q, want %q", info.ResumeStyle, "flag")
+	}
+
+	// The start command should include --session-id <uuid>.
+	started := sp.LastStartConfig(info.SessionName)
+	if started == nil {
+		t.Fatal("session was not started")
+	}
+	if !strings.Contains(started.Command, "--session-id "+info.SessionKey) {
+		t.Errorf("start command = %q, should contain --session-id %s", started.Command, info.SessionKey)
+	}
+}
+
+func TestBuildResumeCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		info Info
+		want string
+	}{
+		{
+			name: "provider with resume flag",
+			info: Info{
+				Command:     "claude --dangerously-skip-permissions",
+				Provider:    "claude",
+				SessionKey:  "abc-123",
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+			},
+			want: "claude --dangerously-skip-permissions --resume abc-123",
+		},
+		{
+			name: "provider with subcommand style",
+			info: Info{
+				Command:     "codex",
+				Provider:    "codex",
+				SessionKey:  "abc-123",
+				ResumeFlag:  "resume",
+				ResumeStyle: "subcommand",
+			},
+			want: "codex resume abc-123",
+		},
+		{
+			name: "no resume flag falls back to command",
+			info: Info{
+				Command:    "claude --dangerously-skip-permissions",
+				Provider:   "claude",
+				SessionKey: "abc-123",
+			},
+			want: "claude --dangerously-skip-permissions",
+		},
+		{
+			name: "no session key falls back to command",
+			info: Info{
+				Command:    "claude --dangerously-skip-permissions",
+				Provider:   "claude",
+				ResumeFlag: "--resume",
+			},
+			want: "claude --dangerously-skip-permissions",
+		},
+		{
+			name: "no command falls back to provider",
+			info: Info{
+				Provider:   "claude",
+				SessionKey: "abc-123",
+				ResumeFlag: "--resume",
+			},
+			want: "claude --resume abc-123",
+		},
+		{
+			name: "subcommand with flags in command",
+			info: Info{
+				Command:     "codex --model o3",
+				Provider:    "codex",
+				SessionKey:  "abc-123",
+				ResumeFlag:  "resume",
+				ResumeStyle: "subcommand",
+			},
+			want: "codex resume abc-123 --model o3",
+		},
+		{
+			name: "explicit resume_command takes precedence",
+			info: Info{
+				Command:       "claude --dangerously-skip-permissions",
+				Provider:      "claude",
+				SessionKey:    "abc-123",
+				ResumeFlag:    "--resume",
+				ResumeCommand: "claude --resume {{.SessionKey}} --dangerously-skip-permissions",
+			},
+			want: "claude --resume abc-123 --dangerously-skip-permissions",
+		},
+		{
+			name: "resume_command without session key falls back",
+			info: Info{
+				Command:       "claude --dangerously-skip-permissions",
+				Provider:      "claude",
+				ResumeFlag:    "--resume",
+				ResumeCommand: "claude --resume {{.SessionKey}} --dangerously-skip-permissions",
+			},
+			want: "claude --dangerously-skip-permissions",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BuildResumeCommand(tt.info)
+			if got != tt.want {
+				t.Errorf("BuildResumeCommand() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStripResumeFlagArgRoundTripsBuildResumeCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		info Info
+	}{
+		{
+			name: "generated flag style",
+			info: Info{
+				Command:     "claude --dangerously-skip-permissions",
+				Provider:    "claude",
+				SessionKey:  "abc-123",
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+			},
+		},
+		{
+			name: "generated subcommand style",
+			info: Info{
+				Command:     "codex --model o3",
+				Provider:    "codex",
+				SessionKey:  "abc-123",
+				ResumeFlag:  "resume",
+				ResumeStyle: "subcommand",
+			},
+		},
+		{
+			name: "single token subcommand style",
+			info: Info{
+				Command:     "codex",
+				Provider:    "codex",
+				SessionKey:  "abc-123",
+				ResumeFlag:  "resume",
+				ResumeStyle: "subcommand",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resume := BuildResumeCommand(tt.info)
+			got := stripResumeFlagArg(resume, tt.info.ResumeFlag, tt.info.ResumeStyle)
+			if got != tt.info.Command {
+				t.Fatalf("stripResumeFlagArg(BuildResumeCommand()) = %q, want %q", got, tt.info.Command)
+			}
+		})
+	}
+}
+
+func TestCreateWithResumeFlagNoSessionIDFlag(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Provider supports resume but NOT Generate & Pass (no SessionIDFlag).
+	resume := ProviderResume{
+		ResumeFlag:  "resume",
+		ResumeStyle: "subcommand",
+		// SessionIDFlag deliberately empty.
+	}
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "codex --model o3", WorkDir: "/tmp", Provider: "codex", Env: nil, Resume: resume, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// No session key should be generated since SessionIDFlag is empty.
+	if info.SessionKey != "" {
+		t.Errorf("SessionKey = %q, want empty (no SessionIDFlag)", info.SessionKey)
+	}
+
+	// The start command should be the original command (no --session-id injection).
+	started := sp.LastStartConfig(info.SessionName)
+	if started == nil {
+		t.Fatal("session was not started")
+	}
+	if started.Command != "codex --model o3" {
+		t.Errorf("start command = %q, want %q", started.Command, "codex --model o3")
+	}
+
+	// BuildResumeCommand should fall back to stored command (no key to resume with).
+	resumeCmd := BuildResumeCommand(info)
+	if resumeCmd != "codex --model o3" {
+		t.Errorf("BuildResumeCommand() = %q, want %q (fallback to stored command)", resumeCmd, "codex --model o3")
+	}
+}
+
+func TestCreateFailsCleanup(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFailFake() // all operations fail
+	mgr := NewManagerWithOptions(store, sp)
+
+	_, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err == nil {
+		t.Fatal("Create should fail when provider fails")
+	}
+
+	// The bead should be closed (cleaned up).
+	all, _ := store.ListOpen()
+	for _, b := range all {
+		if b.Type == BeadType && b.Status == "open" {
+			t.Errorf("orphan session bead %s left open after failed create", b.ID)
+		}
+	}
+}
+
+func TestRename(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "old title", Command: "echo test", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.Rename(info.ID, "new title"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "new title" {
+		t.Errorf("Title = %q, want %q", got.Title, "new title")
+	}
+}
+
+func TestUpdatePresentationSyncsRuntimeAlias(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(
+		context.Background(), CreateOptions{Alias: "old-alias", ExplicitName: "", Template: "helper", Title: "old title", Command: "echo test", WorkDir: "/tmp", Provider: "test", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nextAlias := "new-alias"
+	if err := mgr.UpdatePresentation(info.ID, nil, &nextAlias); err != nil {
+		t.Fatalf("UpdatePresentation(alias): %v", err)
+	}
+
+	got, err := sp.GetMeta(info.SessionName, "GC_ALIAS")
+	if err != nil {
+		t.Fatalf("GetMeta(GC_ALIAS): %v", err)
+	}
+	if got != nextAlias {
+		t.Fatalf("GC_ALIAS = %q, want %q", got, nextAlias)
+	}
+
+	bead, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get(bead): %v", err)
+	}
+	if bead.Metadata["alias"] != nextAlias {
+		t.Fatalf("alias metadata = %q, want %q", bead.Metadata["alias"], nextAlias)
+	}
+	if bead.Metadata["alias_history"] != "old-alias" {
+		t.Fatalf("alias_history = %q, want old-alias", bead.Metadata["alias_history"])
+	}
+}
+
+func TestRenameNonSessionBead(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Create a plain bead (not a session).
+	b, err := store.Create(beads.Bead{Title: "not a session", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = mgr.Rename(b.ID, "new title")
+	if err == nil {
+		t.Error("Rename on non-session bead should error")
+	}
+}
+
+func TestLoadSessionBead_RepairsEmptyType(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Create a bead then corrupt its type to empty (simulates crash/migration).
+	b, err := store.Create(beads.Bead{
+		Title:  "mayor",
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyType := ""
+	if err := store.Update(b.ID, beads.UpdateOpts{Type: &emptyType}); err != nil {
+		t.Fatal(err)
+	}
+
+	// loadSessionBead should repair the type instead of returning ErrNotSession.
+	got, _, err := mgr.loadSessionBead(b.ID, false)
+	if err != nil {
+		t.Fatalf("loadSessionBead should repair empty type, got error: %v", err)
+	}
+	if got.Type != BeadType {
+		t.Errorf("type after repair = %q, want %q", got.Type, BeadType)
+	}
+
+	// Verify the store was updated.
+	stored, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Type != BeadType {
+		t.Errorf("stored type after repair = %q, want %q", stored.Type, BeadType)
+	}
+}
+
+func TestLoadSessionBead_RepairsEmptyTypeByLabel(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Create a bead with gc:session label but NO session_name metadata,
+	// then corrupt its type to empty. The label alone should be enough
+	// to trigger repair.
+	b, err := store.Create(beads.Bead{
+		Title:  "worker-1",
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"state": "active",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyType := ""
+	if err := store.Update(b.ID, beads.UpdateOpts{Type: &emptyType}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := mgr.loadSessionBead(b.ID, false)
+	if err != nil {
+		t.Fatalf("loadSessionBead should repair empty type via label, got error: %v", err)
+	}
+	if got.Type != BeadType {
+		t.Errorf("type after repair = %q, want %q", got.Type, BeadType)
+	}
+
+	stored, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Type != BeadType {
+		t.Errorf("stored type after repair = %q, want %q", stored.Type, BeadType)
+	}
+}
+
+func TestRenameNotFound(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	if err := mgr.Rename("nonexistent", "title"); err == nil {
+		t.Error("Rename should fail for nonexistent session")
+	}
+}
+
+func TestPrune(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Create and suspend two sessions.
+	s1, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "S1", Command: "echo s1", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "S2", Command: "echo s2", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.Suspend(s1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Suspend(s2.ID); err != nil {
+		t.Fatal(err)
+	}
+	wait1 := createTestWait(t, store, s1.ID)
+	wait2 := createTestWait(t, store, s2.ID)
+
+	// Prune with cutoff in the future — should prune both.
+	pruned, err := mgr.Prune(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 2 {
+		t.Errorf("pruned = %d, want 2", pruned)
+	}
+
+	// Both should be closed.
+	sessions, err := mgr.List("all", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range sessions {
+		if s.ID == s1.ID || s.ID == s2.ID {
+			if s.State != "" { // closed beads have empty state
+				t.Errorf("session %s state = %q after prune, want empty (closed)", s.ID, s.State)
+			}
+		}
+	}
+	wait1, err = store.Get(wait1.ID)
+	if err != nil {
+		t.Fatalf("store.Get(wait1): %v", err)
+	}
+	if wait1.Metadata["state"] != waitStateCanceled {
+		t.Fatalf("wait1 state = %q, want %q", wait1.Metadata["state"], waitStateCanceled)
+	}
+	wait2, err = store.Get(wait2.ID)
+	if err != nil {
+		t.Fatalf("store.Get(wait2): %v", err)
+	}
+	if wait2.Metadata["state"] != waitStateCanceled {
+		t.Fatalf("wait2 state = %q, want %q", wait2.Metadata["state"], waitStateCanceled)
+	}
+}
+
+func TestPruneDetailedReportsWaitNudges(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "S1", Command: "echo s1", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	wait := createTestWait(t, store, info.ID)
+	if err := store.SetMetadata(wait.ID, "nudge_id", "wait-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := mgr.PruneDetailed(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 {
+		t.Fatalf("result.Count = %d, want 1", result.Count)
+	}
+	if len(result.SessionIDs) != 1 || result.SessionIDs[0] != info.ID {
+		t.Fatalf("result.SessionIDs = %#v, want [%q]", result.SessionIDs, info.ID)
+	}
+	if len(result.WaitNudgeIDs) != 1 || result.WaitNudgeIDs[0] != "wait-1" {
+		t.Fatalf("result.WaitNudgeIDs = %#v, want [wait-1]", result.WaitNudgeIDs)
+	}
+}
+
+type falseNegativeRuntimeProvider struct {
+	*runtime.Fake
+	falseNames map[string]bool
+}
+
+func (p *falseNegativeRuntimeProvider) IsRunning(name string) bool {
+	if p.falseNames[name] {
+		return false
+	}
+	return p.Fake.IsRunning(name)
+}
+
+func TestObserveRuntime_TreatsLiveProcessAsRunningWhenSessionProbeFalseNegatives(t *testing.T) {
+	base := runtime.NewFake()
+	mgr := NewManagerWithOptions(beads.NewMemStore(), &falseNegativeRuntimeProvider{
+		Fake:       base,
+		falseNames: map[string]bool{"runtime-worker": true},
+	})
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "runtime-worker", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	obs := mgr.ObserveRuntimeForInfo(info, []string{"claude"})
+	if !obs.Running || !obs.Alive {
+		t.Fatalf("ObserveRuntimeForInfo() = %#v, want running+alive true despite IsRunning false-negative", obs)
+	}
+}
+
+func TestObserveRuntime_WithoutProcessNamesTreatsRunningSessionAsAlive(t *testing.T) {
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(beads.NewMemStore(), sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "runtime-worker", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	obs := mgr.ObserveRuntimeForInfo(info, nil)
+	if !obs.Running || !obs.Alive {
+		t.Fatalf("ObserveRuntimeForInfo() = %#v, want running+alive true when no process names are configured", obs)
+	}
+}
+
+func TestPruneDetailedContinuesAfterWaitLookupLimit(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "S1", Command: "echo s1", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < SessionWaitLookupLimit+1; i++ {
+		if _, err := store.Create(beads.Bead{
+			Title:  fmt.Sprintf("wait-%d", i),
+			Type:   WaitBeadType,
+			Labels: []string{WaitBeadLabel, "session:" + info.ID},
+			Metadata: map[string]string{
+				"session_id": info.ID,
+				"state":      "pending",
+				"nudge_id":   fmt.Sprintf("wait-nudge-%d", i),
+			},
+		}); err != nil {
+			t.Fatalf("create wait %d: %v", i, err)
+		}
+	}
+
+	result, err := mgr.PruneDetailed(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("PruneDetailed: %v", err)
+	}
+	if result.Count != 1 {
+		t.Fatalf("result.Count = %d, want 1", result.Count)
+	}
+	if len(result.SessionIDs) != 1 || result.SessionIDs[0] != info.ID {
+		t.Fatalf("result.SessionIDs = %#v, want [%q]", result.SessionIDs, info.ID)
+	}
+	if len(result.WaitNudgeIDs) != SessionWaitLookupLimit+1 {
+		t.Fatalf("result.WaitNudgeIDs count = %d, want full capped count %d", len(result.WaitNudgeIDs), SessionWaitLookupLimit+1)
+	}
+	seen := map[string]bool{}
+	for _, id := range result.WaitNudgeIDs {
+		seen[id] = true
+	}
+	for _, id := range []string{"wait-nudge-0", fmt.Sprintf("wait-nudge-%d", SessionWaitLookupLimit)} {
+		if !seen[id] {
+			t.Fatalf("result.WaitNudgeIDs missing %q from first or later capped page", id)
+		}
+	}
+	sessionBead, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get(session): %v", err)
+	}
+	if sessionBead.Status != "closed" {
+		t.Fatalf("session status = %q, want closed", sessionBead.Status)
+	}
+	waits, err := store.List(beads.ListQuery{Label: "session:" + info.ID, IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("list waits: %v", err)
+	}
+	for _, wait := range waits {
+		if !IsWaitBead(wait) {
+			continue
+		}
+		if wait.Status != "closed" || wait.Metadata["state"] != waitStateCanceled {
+			t.Fatalf("wait %s status/state = %q/%q, want closed/canceled", wait.ID, wait.Status, wait.Metadata["state"])
+		}
+	}
+}
+
+func TestPruneUsesSuspendedAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Create two sessions and suspend them.
+	old, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Old", Command: "echo old", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recent, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Recent", Command: "echo recent", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.Suspend(old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Suspend(recent.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Backdate the "old" session's suspended_at to 10 days ago.
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(old.ID, "suspended_at", tenDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cutoff at 7 days ago should prune only the old one.
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	pruned, err := mgr.Prune(cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 1 {
+		t.Errorf("pruned = %d, want 1", pruned)
+	}
+
+	// Old should be closed, recent should still be suspended.
+	gotOld, err := mgr.Get(old.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOld.State != "" {
+		t.Errorf("old session state = %q, want empty (closed)", gotOld.State)
+	}
+
+	gotRecent, err := mgr.Get(recent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRecent.State != StateSuspended {
+		t.Errorf("recent session state = %q, want %q", gotRecent.State, StateSuspended)
+	}
+}
+
+func TestSuspendSetsSuspendedAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := time.Now().Add(-time.Second)
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := b.Metadata["suspended_at"]
+	if raw == "" {
+		t.Fatal("suspended_at metadata not set")
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Fatalf("suspended_at not valid RFC3339: %v", err)
+	}
+	if ts.Before(before) {
+		t.Errorf("suspended_at = %v, expected after %v", ts, before)
+	}
+}
+
+func TestPruneSkipsActive(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	s1, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Active", Command: "echo a", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Active session should not be pruned.
+	pruned, err := mgr.Prune(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 0 {
+		t.Errorf("pruned = %d, want 0 (active session should be skipped)", pruned)
+	}
+
+	got, err := mgr.Get(s1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateActive {
+		t.Errorf("active session state = %q, want %q", got.State, StateActive)
+	}
+}
+
+func TestPruneDetailedSkipsAsleepByDefault(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Drained", Command: "echo d", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a drained-to-asleep session.
+	if err := store.SetMetadata(info.ID, "state", string(StateAsleep)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(info.ID, "sleep_reason", "drained"); err != nil {
+		t.Fatal(err)
+	}
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(info.ID, "slept_at", tenDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default prune (no states passed) targets only suspended — asleep stays put.
+	result, err := mgr.PruneDetailed(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Errorf("default prune count = %d, want 0 (asleep should be skipped by default)", result.Count)
+	}
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != StateAsleep {
+		t.Errorf("session state = %q, want %q (asleep should be untouched)", got.State, StateAsleep)
+	}
+}
+
+func TestPruneDetailedAsleepOptIn(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Drained-to-asleep session, 10 days old per slept_at.
+	drained, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Drained", Command: "echo d", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(drained.ID, "state", string(StateAsleep)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(drained.ID, "sleep_reason", "drained"); err != nil {
+		t.Fatal(err)
+	}
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(drained.ID, "slept_at", tenDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	// Suspended session, 10 days old per suspended_at.
+	suspended, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Suspended", Command: "echo s", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Suspend(suspended.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(suspended.ID, "suspended_at", tenDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	// Active session (no terminal state) — must always be skipped.
+	active, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Active", Command: "echo a", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	result, err := mgr.PruneDetailed(cutoff, StateAsleep, StateSuspended)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 2 {
+		t.Errorf("prune count = %d, want 2 (drained + suspended)", result.Count)
+	}
+	seen := map[string]bool{}
+	for _, id := range result.SessionIDs {
+		seen[id] = true
+	}
+	if !seen[drained.ID] {
+		t.Errorf("drained session %q not pruned; SessionIDs = %v", drained.ID, result.SessionIDs)
+	}
+	if !seen[suspended.ID] {
+		t.Errorf("suspended session %q not pruned; SessionIDs = %v", suspended.ID, result.SessionIDs)
+	}
+
+	gotActive, err := mgr.Get(active.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotActive.State != StateActive {
+		t.Errorf("active session state = %q, want %q (must never be pruned)", gotActive.State, StateActive)
+	}
+}
+
+func TestPruneDetailedAsleepUsesSleptAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Asleep session whose slept_at is recent — must NOT be pruned even though CreatedAt is older.
+	recent, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Recent", Command: "echo r", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(recent.ID, "state", string(StateAsleep)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(recent.ID, "slept_at", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Asleep session whose slept_at is 10d old — must be pruned.
+	old, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Old", Command: "echo o", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(old.ID, "state", string(StateAsleep)); err != nil {
+		t.Fatal(err)
+	}
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(old.ID, "slept_at", tenDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	result, err := mgr.PruneDetailed(cutoff, StateAsleep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 {
+		t.Errorf("prune count = %d, want 1", result.Count)
+	}
+	if len(result.SessionIDs) != 1 || result.SessionIDs[0] != old.ID {
+		t.Errorf("pruned %v, want [%s]", result.SessionIDs, old.ID)
+	}
+}
+
+func TestPruneDetailedSkipsAsleepWithoutValidSleptAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	missing, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Missing SleptAt", Command: "echo m", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(missing.ID, "state", string(StateAsleep)); err != nil {
+		t.Fatal(err)
+	}
+
+	malformed, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Malformed SleptAt", Command: "echo b", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(malformed.ID, "state", string(StateAsleep)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(malformed.ID, "slept_at", "not-a-time"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := mgr.PruneDetailed(time.Now().Add(time.Hour), StateAsleep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 0 {
+		t.Fatalf("prune count = %d, want 0; pruned=%v", result.Count, result.SessionIDs)
+	}
+}
+
+func TestPruneDetailedAsleepDrainedMissingSleptAtUsesUpdatedAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	drained, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Drained Missing SleptAt", Command: "echo d", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadataBatch(drained.ID, map[string]string{
+		"state":        string(StateAsleep),
+		"sleep_reason": "drained",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.Get(drained.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	beforeUpdatedAt, err := mgr.PruneDetailed(updated.UpdatedAt, StateAsleep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeUpdatedAt.Count != 0 {
+		t.Fatalf("prune count at UpdatedAt cutoff = %d, want 0; pruned=%v", beforeUpdatedAt.Count, beforeUpdatedAt.SessionIDs)
+	}
+
+	afterUpdatedAt, err := mgr.PruneDetailed(updated.UpdatedAt.Add(time.Nanosecond), StateAsleep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterUpdatedAt.Count != 1 {
+		t.Fatalf("prune count after UpdatedAt cutoff = %d, want 1; pruned=%v", afterUpdatedAt.Count, afterUpdatedAt.SessionIDs)
+	}
+	if len(afterUpdatedAt.SessionIDs) != 1 || afterUpdatedAt.SessionIDs[0] != drained.ID {
+		t.Fatalf("pruned %v, want [%s]", afterUpdatedAt.SessionIDs, drained.ID)
+	}
+}
+
+func TestPruneDetailedDrainedOptInIncludesAsleepDrainedMissingSleptAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	drained, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Legacy Drained Asleep", Command: "echo d", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadataBatch(drained.ID, map[string]string{
+		"state":        string(StateAsleep),
+		"sleep_reason": "drained",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.Get(drained.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := mgr.PruneDetailed(updated.UpdatedAt.Add(time.Nanosecond), StateDrained)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 {
+		t.Fatalf("prune count = %d, want 1; pruned=%v", result.Count, result.SessionIDs)
+	}
+	if len(result.SessionIDs) != 1 || result.SessionIDs[0] != drained.ID {
+		t.Fatalf("pruned %v, want [%s]", result.SessionIDs, drained.ID)
+	}
+}
+
+func TestPruneDetailedDrainedOptInUsesDrainAt(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	old, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Old Drained", Command: "echo o", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(old.ID, "state", string(StateDrained)); err != nil {
+		t.Fatal(err)
+	}
+	tenDaysAgo := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	if err := store.SetMetadata(old.ID, "drain_at", tenDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	missing, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "default", Title: "Missing DrainAt", Command: "echo m", WorkDir: "/tmp", Provider: "test", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMetadata(missing.ID, "state", string(StateDrained)); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	result, err := mgr.PruneDetailed(cutoff, StateDrained)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 {
+		t.Fatalf("prune count = %d, want 1; pruned=%v", result.Count, result.SessionIDs)
+	}
+	if len(result.SessionIDs) != 1 || result.SessionIDs[0] != old.ID {
+		t.Fatalf("pruned %v, want [%s]", result.SessionIDs, old.ID)
+	}
+}
+
+func TestSendResumesSuspendedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	if err := mgr.Send(context.Background(), info.ID, "hello", "claude --resume "+info.SessionKey, runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateActive {
+		t.Errorf("State = %q, want %q", got.State, StateActive)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatal("session should be running after Send resumes it")
+	}
+	found := false
+	for _, call := range sp.Calls {
+		if call.Method == "Nudge" && call.Name == info.SessionName && call.Message == "hello" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("calls = %#v, want Nudge hello", sp.Calls)
+	}
+}
+
+func TestSendImmediateUsesImmediateNudge(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	if err := mgr.SendImmediate(context.Background(), info.ID, "hello", "claude --resume "+info.SessionKey, runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("SendImmediate: %v", err)
+	}
+
+	found := false
+	for _, call := range sp.Calls {
+		if call.Method == "NudgeNow" && call.Name == info.SessionName && call.Message == "hello" {
+			found = true
+			break
+		}
+		if call.Method == "Nudge" && call.Name == info.SessionName {
+			t.Fatalf("calls = %#v, want immediate nudge without fallback", sp.Calls)
+		}
+	}
+	if !found {
+		t.Fatalf("calls = %#v, want NudgeNow hello", sp.Calls)
+	}
+}
+
+func TestSendImmediateFallsBackToDefaultNudge(t *testing.T) {
+	store := beads.NewMemStore()
+	fake := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, &noImmediateProvider{Provider: fake})
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := mgr.SendImmediate(context.Background(), info.ID, "hello", "", runtime.Config{}); err != nil {
+		t.Fatalf("SendImmediate: %v", err)
+	}
+
+	found := false
+	for _, call := range fake.Calls {
+		if call.Method == "Nudge" && call.Name == info.SessionName && call.Message == "hello" {
+			found = true
+		}
+		if call.Method == "NudgeNow" && call.Name == info.SessionName {
+			t.Fatalf("calls = %#v, want fallback Nudge only", fake.Calls)
+		}
+	}
+	if !found {
+		t.Fatalf("calls = %#v, want fallback Nudge hello", fake.Calls)
+	}
+}
+
+func TestSendResumesSuspendedSession_SyncsGCDirFromBeadWorkDir(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp/worktree", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	err = mgr.Send(context.Background(), info.ID, "hello", "claude --resume "+info.SessionKey, runtime.Config{
+		Env: map[string]string{"GC_DIR": "/stale/worktree"},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	starts := 0
+	var resumed runtime.Config
+	for _, call := range sp.Calls {
+		if call.Method == "Start" && call.Name == info.SessionName {
+			starts++
+			resumed = call.Config
+		}
+	}
+	if starts < 2 {
+		t.Fatalf("expected create + resume Start calls, got %d", starts)
+	}
+	if resumed.WorkDir != "/tmp/worktree" {
+		t.Fatalf("WorkDir = %q, want %q", resumed.WorkDir, "/tmp/worktree")
+	}
+	if got := resumed.Env["GC_DIR"]; got != "/tmp/worktree" {
+		t.Fatalf("GC_DIR = %q, want %q", got, "/tmp/worktree")
+	}
+}
+
+func TestSendResumesSuspendedSession_PersistsBackfilledInstanceToken(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "instance_token", ""); err != nil {
+		t.Fatalf("clear instance_token: %v", err)
+	}
+
+	if err := mgr.Send(context.Background(), info.ID, "hello", "claude --resume "+info.SessionKey, runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Metadata["instance_token"] == "" {
+		t.Fatal("instance_token should be persisted after backfill during resume")
+	}
+}
+
+func TestSendResumesSuspendedACPSessionOnACPBackend(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sessionauto.New(defaultSP, acpSP))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "acp", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	if err := mgr.Send(context.Background(), info.ID, "hello", "claude --resume", runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if defaultSP.IsRunning(info.SessionName) {
+		t.Fatalf("default backend should not own resumed ACP session %q", info.SessionName)
+	}
+	if !acpSP.IsRunning(info.SessionName) {
+		t.Fatalf("ACP backend should own resumed session %q", info.SessionName)
+	}
+	found := false
+	for _, call := range acpSP.Calls {
+		if call.Method == "Nudge" && call.Name == info.SessionName && call.Message == "hello" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ACP calls = %#v, want Nudge hello", acpSP.Calls)
+	}
+}
+
+func TestSendReRoutesActiveACPSessionBeforeNudge(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	autoSP := sessionauto.New(defaultSP, acpSP)
+	mgr := NewManagerWithOptions(store, autoSP)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "acp", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	autoSP.Unroute(info.SessionName)
+
+	if err := mgr.Send(context.Background(), info.ID, "hello again", "claude --resume", runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if defaultSP.IsRunning(info.SessionName) {
+		t.Fatalf("default backend should not own active ACP session %q", info.SessionName)
+	}
+	found := false
+	for _, call := range acpSP.Calls {
+		if call.Method == "Nudge" && call.Name == info.SessionName && call.Message == "hello again" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ACP calls = %#v, want rerouted Nudge", acpSP.Calls)
+	}
+}
+
+func TestSendBackfillsTransportForLegacyACPSession(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	autoSP := sessionauto.New(defaultSP, acpSP)
+
+	legacy, err := store.Create(beads.Bead{
+		Title: "legacy acp",
+		Type:  BeadType,
+		Labels: []string{
+			LabelSession,
+			"template:helper",
+		},
+		Metadata: map[string]string{
+			"template": "helper",
+			"state":    string(StateActive),
+			"provider": "claude",
+			"work_dir": "/tmp",
+			"command":  "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy bead: %v", err)
+	}
+	sessName := sessionNameFor(legacy.ID)
+	if err := store.SetMetadata(legacy.ID, "session_name", sessName); err != nil {
+		t.Fatalf("SetMetadata(session_name): %v", err)
+	}
+	if err := acpSP.Start(context.Background(), sessName, runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("Start ACP session: %v", err)
+	}
+
+	mgr := NewManagerWithOptions(store, autoSP, WithTransportResolver(func(template, _ string) string {
+		if template == "helper" {
+			return "acp"
+		}
+		return ""
+	}))
+
+	if err := mgr.Send(context.Background(), legacy.ID, "hello from legacy", "", runtime.Config{}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if defaultSP.IsRunning(sessName) {
+		t.Fatalf("default backend should not own legacy ACP session %q", sessName)
+	}
+	found := false
+	for _, call := range acpSP.Calls {
+		if call.Method == "Nudge" && call.Name == sessName && call.Message == "hello from legacy" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ACP calls = %#v, want Nudge for legacy session", acpSP.Calls)
+	}
+
+	updated, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get updated bead: %v", err)
+	}
+	if updated.Metadata["transport"] != "acp" {
+		t.Fatalf("transport metadata = %q, want %q", updated.Metadata["transport"], "acp")
+	}
+}
+
+func TestGetDoesNotPersistGuessedTransportForLegacySession(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	autoSP := sessionauto.New(defaultSP, acpSP)
+
+	legacy, err := store.Create(beads.Bead{
+		Title: "legacy acp",
+		Type:  BeadType,
+		Labels: []string{
+			LabelSession,
+			"template:helper",
+		},
+		Metadata: map[string]string{
+			"template": "helper",
+			"state":    string(StateActive),
+			"provider": "claude",
+			"work_dir": "/tmp",
+			"command":  "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy bead: %v", err)
+	}
+
+	mgr := NewManagerWithOptions(store, autoSP, WithTransportResolver(func(template, _ string) string {
+		if template == "helper" {
+			return "acp"
+		}
+		return ""
+	}))
+
+	if _, err := mgr.Get(legacy.ID); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	updated, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get updated bead: %v", err)
+	}
+	if updated.Metadata["transport"] != "" {
+		t.Fatalf("transport metadata = %q, want empty on read-only lookup", updated.Metadata["transport"])
+	}
+}
+
+func TestGetUsesConfiguredTransportForPendingCreateWithoutRuntimeProbe(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+
+	deferred, err := store.Create(beads.Bead{
+		Title: "deferred acp",
+		Type:  BeadType,
+		Labels: []string{
+			LabelSession,
+			"template:helper",
+		},
+		Metadata: map[string]string{
+			"template":             "helper",
+			"state":                string(StateCreating),
+			"pending_create_claim": "true",
+			"provider":             "claude",
+			"work_dir":             "/tmp",
+			"command":              "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create deferred bead: %v", err)
+	}
+
+	mgr := NewManagerWithOptions(store, sp, WithTransportResolver(func(template, _ string) string {
+		if template == "helper" {
+			return "acp"
+		}
+		return ""
+	}))
+
+	info, err := mgr.Get(deferred.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := info.Transport; got != "acp" {
+		t.Fatalf("Transport = %q, want acp", got)
+	}
+	if len(sp.Calls) != 0 {
+		t.Fatalf("runtime calls = %#v, want none for pending create", sp.Calls)
+	}
+}
+
+func TestGetPrefersLiveTransportDetectionOverConfiguredTransportInference(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	autoSP := sessionauto.New(defaultSP, acpSP)
+
+	legacy, err := store.Create(beads.Bead{
+		Title: "legacy tmux",
+		Type:  BeadType,
+		Labels: []string{
+			LabelSession,
+			"template:helper",
+		},
+		Metadata: map[string]string{
+			"template": "helper",
+			"state":    string(StateActive),
+			"provider": "claude",
+			"work_dir": "/tmp",
+			"command":  "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy bead: %v", err)
+	}
+	sessName := sessionNameFor(legacy.ID)
+	if err := store.SetMetadata(legacy.ID, "session_name", sessName); err != nil {
+		t.Fatalf("SetMetadata(session_name): %v", err)
+	}
+	if err := defaultSP.Start(context.Background(), sessName, runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("Start default session: %v", err)
+	}
+
+	mgr := NewManagerWithOptions(store, autoSP, WithTransportResolver(func(template, _ string) string {
+		if template == "helper" {
+			return "acp"
+		}
+		return ""
+	}))
+
+	info, err := mgr.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := info.Transport; got != "" {
+		t.Fatalf("Transport = %q, want empty for live tmux session", got)
+	}
+
+	updated, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get updated bead: %v", err)
+	}
+	if got := updated.Metadata["transport"]; got != "" {
+		t.Fatalf("transport metadata = %q, want empty for live tmux session", got)
+	}
+}
+
+func TestGetDoesNotInferConfiguredTransportForStoppedLegacySession(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	autoSP := sessionauto.New(defaultSP, acpSP)
+
+	legacy, err := store.Create(beads.Bead{
+		Title: "legacy tmux",
+		Type:  BeadType,
+		Labels: []string{
+			LabelSession,
+			"template:helper",
+		},
+		Metadata: map[string]string{
+			"template": "helper",
+			"state":    string(StateAsleep),
+			"provider": "claude",
+			"work_dir": "/tmp",
+			"command":  "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy bead: %v", err)
+	}
+	sessName := sessionNameFor(legacy.ID)
+	if err := store.SetMetadata(legacy.ID, "session_name", sessName); err != nil {
+		t.Fatalf("SetMetadata(session_name): %v", err)
+	}
+
+	mgr := NewManagerWithOptions(store, autoSP, WithTransportResolver(func(template, _ string) string {
+		if template == "helper" {
+			return "acp"
+		}
+		return ""
+	}))
+
+	info, err := mgr.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := info.Transport; got != "" {
+		t.Fatalf("Transport = %q, want empty for stopped legacy session without stored transport", got)
+	}
+
+	updated, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get updated bead: %v", err)
+	}
+	if got := updated.Metadata["transport"]; got != "" {
+		t.Fatalf("transport metadata = %q, want empty for read-only lookup", got)
+	}
+}
+
+func TestGetDoesNotInferConfiguredTransportForStoppedLegacySessionWithPolicyFallback(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	autoSP := sessionauto.New(defaultSP, acpSP)
+
+	legacy, err := store.Create(beads.Bead{
+		Title: "legacy acp",
+		Type:  BeadType,
+		Labels: []string{
+			LabelSession,
+			"template:helper",
+		},
+		Metadata: map[string]string{
+			"template": "helper",
+			"state":    string(StateAsleep),
+			"provider": "claude",
+			"work_dir": "/tmp",
+			"command":  "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy bead: %v", err)
+	}
+	sessName := sessionNameFor(legacy.ID)
+	if err := store.SetMetadata(legacy.ID, "session_name", sessName); err != nil {
+		t.Fatalf("SetMetadata(session_name): %v", err)
+	}
+
+	mgr := NewManagerWithOptions(store, autoSP, WithCityPath(""), WithTransportPolicyResolver(func(template, _ string) (string, bool) {
+		if template == "helper" {
+			return "acp", true
+		}
+		return "", false
+	}))
+
+	info, err := mgr.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := info.Transport; got != "" {
+		t.Fatalf("Transport = %q, want empty for stopped legacy session without stored evidence", got)
+	}
+
+	updated, err := store.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get updated bead: %v", err)
+	}
+	if got := updated.Metadata["transport"]; got != "" {
+		t.Fatalf("transport metadata = %q, want empty for read-only lookup", got)
+	}
+}
+
+func TestGetInfersACPTransportFromStoredMCPMetadata(t *testing.T) {
+	store := beads.NewMemStore()
+	defaultSP := runtime.NewFake()
+	acpSP := runtime.NewFake()
+	autoSP := sessionauto.New(defaultSP, acpSP)
+
+	legacy, err := store.Create(beads.Bead{
+		Title: "legacy acp",
+		Type:  BeadType,
+		Labels: []string{
+			LabelSession,
+			"template:helper",
+		},
+		Metadata: map[string]string{
+			"template":                    "helper",
+			"state":                       string(StateAsleep),
+			"provider":                    "claude",
+			"work_dir":                    "/tmp",
+			"command":                     "claude",
+			MCPServersSnapshotMetadataKey: `[{"name":"filesystem","transport":"stdio","command":"/bin/mcp"}]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create legacy bead: %v", err)
+	}
+
+	mgr := NewManagerWithOptions(store, autoSP, WithTransportResolver(nil))
+	info, err := mgr.Get(legacy.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := info.Transport; got != "acp" {
+		t.Fatalf("Transport = %q, want acp from stored MCP metadata", got)
+	}
+}
+
+func TestSendConvergesWhenSessionAlreadyResumed(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := sp.Start(context.Background(), info.SessionName, runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("fake concurrent Start: %v", err)
+	}
+
+	if err := mgr.Send(context.Background(), info.ID, "hello", "claude --resume", runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	got, err := mgr.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateActive {
+		t.Errorf("State = %q, want %q", got.State, StateActive)
+	}
+	found := false
+	for _, call := range sp.Calls {
+		if call.Method == "Nudge" && call.Name == info.SessionName && call.Message == "hello" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("calls = %#v, want Nudge hello after converged resume", sp.Calls)
+	}
+}
+
+func TestSendRequiresResumeCommandForSuspendedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	err = mgr.Send(context.Background(), info.ID, "hello", "", runtime.Config{})
+	if !errors.Is(err, ErrResumeRequired) {
+		t.Fatalf("Send error = %v, want ErrResumeRequired", err)
+	}
+}
+
+func TestSendClosedSessionReturnsErrSessionClosed(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	err = mgr.Send(context.Background(), info.ID, "hello", "claude --resume", runtime.Config{WorkDir: "/tmp"})
+	if !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("Send error = %v, want ErrSessionClosed", err)
+	}
+}
+
+func TestSendDoesNotSuppressNonDuplicateResumeError(t *testing.T) {
+	base := runtime.NewFake()
+	sp := &startOverrideProvider{Fake: base}
+	store := beads.NewMemStore()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := sp.Fake.Start(context.Background(), info.SessionName, runtime.Config{WorkDir: "/tmp"}); err != nil {
+		t.Fatalf("fake concurrent Start: %v", err)
+	}
+	sp.startErr = errors.New("out of memory")
+
+	err = mgr.Send(context.Background(), info.ID, "hello", "claude --resume", runtime.Config{WorkDir: "/tmp"})
+	if err == nil || !strings.Contains(err.Error(), "out of memory") {
+		t.Fatalf("Send error = %v, want underlying non-duplicate start failure", err)
+	}
+}
+
+func TestStopTurnInterruptsActiveSession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.StopTurn(info.ID); err != nil {
+		t.Fatalf("StopTurn: %v", err)
+	}
+
+	found := false
+	for _, call := range sp.Calls {
+		if call.Method == "Interrupt" && call.Name == info.SessionName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected Interrupt call")
+	}
+}
+
+func TestStopTurnAllowsPoolManagedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "pool-worker", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Mark the session bead as pool-managed.
+	if err := store.Update(info.ID, beads.UpdateOpts{
+		Metadata: map[string]string{"pool_managed": "true"},
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if err := mgr.StopTurn(info.ID); err != nil {
+		t.Fatalf("StopTurn: %v", err)
+	}
+
+	found := false
+	for _, call := range sp.Calls {
+		if call.Method == "Interrupt" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected Interrupt call for pool-managed session")
+	}
+}
+
+func TestStopTurnAllowsPoolSlotOnlySession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "pool-slot-worker", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Mark the session bead with pool_slot only (no pool_managed).
+	if err := store.Update(info.ID, beads.UpdateOpts{
+		Metadata: map[string]string{"pool_slot": "1"},
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if err := mgr.StopTurn(info.ID); err != nil {
+		t.Fatalf("StopTurn: %v", err)
+	}
+
+	found := false
+	for _, call := range sp.Calls {
+		if call.Method == "Interrupt" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected Interrupt call for pool-slot session")
+	}
+}
+
+func TestPendingAndRespond(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	sp.SetPendingInteraction(info.SessionName, &runtime.PendingInteraction{
+		RequestID: "req-1",
+		Kind:      "approval",
+		Prompt:    "approve?",
+	})
+
+	pending, supported, err := mgr.Pending(info.ID)
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if !supported {
+		t.Fatal("Pending should report supported for runtime.Fake")
+	}
+	if pending == nil || pending.RequestID != "req-1" {
+		t.Fatalf("Pending = %#v, want req-1", pending)
+	}
+
+	if err := mgr.Respond(info.ID, runtime.InteractionResponse{Action: "approve"}); err != nil {
+		t.Fatalf("Respond: %v", err)
+	}
+	if got, _, err := mgr.Pending(info.ID); err != nil {
+		t.Fatalf("Pending after Respond: %v", err)
+	} else if got != nil {
+		t.Fatalf("pending should be cleared after Respond, got %#v", got)
+	}
+}
+
+// TestPendingByNameProbesProviderWithoutBeadLookup verifies the name-based
+// probe path the city-wide pending aggregate uses: given an already-resolved
+// runtime session name it returns the provider's interaction directly, and an
+// unknown name yields no pending (still supported) — neither call requires the
+// bead-store id->name resolution that Pending(id) performs.
+func TestPendingByNameProbesProviderWithoutBeadLookup(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	sp.SetPendingInteraction(info.SessionName, &runtime.PendingInteraction{
+		RequestID: "req-1",
+		Kind:      "approval",
+		Prompt:    "approve?",
+	})
+
+	pending, supported, err := mgr.PendingByName(info.SessionName)
+	if err != nil {
+		t.Fatalf("PendingByName: %v", err)
+	}
+	if !supported {
+		t.Fatal("PendingByName should report supported for runtime.Fake")
+	}
+	if pending == nil || pending.RequestID != "req-1" || pending.Kind != "approval" {
+		t.Fatalf("PendingByName = %#v, want req-1/approval", pending)
+	}
+
+	// A name with no pending interaction is still a supported probe with no
+	// result — the aggregate skips it rather than recording a partial error.
+	none, supported, err := mgr.PendingByName("no-such-session")
+	if err != nil {
+		t.Fatalf("PendingByName(unknown): %v", err)
+	}
+	if !supported {
+		t.Fatal("PendingByName(unknown) should still report supported")
+	}
+	if none != nil {
+		t.Fatalf("PendingByName(unknown) = %#v, want nil", none)
+	}
+}
+
+type pendingSessionGoneProvider struct {
+	*runtime.Fake
+}
+
+func (p *pendingSessionGoneProvider) Pending(_ string) (*runtime.PendingInteraction, error) {
+	return nil, fmt.Errorf("capturing pane: %w", runtime.ErrSessionNotFound)
+}
+
+type pendingSessionErrorProvider struct {
+	*runtime.Fake
+	err error
+}
+
+func (p *pendingSessionErrorProvider) Pending(_ string) (*runtime.PendingInteraction, error) {
+	return nil, p.err
+}
+
+type respondSessionGoneProvider struct {
+	*runtime.Fake
+}
+
+func (p *respondSessionGoneProvider) Pending(_ string) (*runtime.PendingInteraction, error) {
+	return &runtime.PendingInteraction{
+		RequestID: "req-1",
+		Kind:      "approval",
+		Prompt:    "approve?",
+	}, nil
+}
+
+func (p *respondSessionGoneProvider) Respond(_ string, _ runtime.InteractionResponse) error {
+	return fmt.Errorf("send-keys failed: %w", runtime.ErrSessionNotFound)
+}
+
+func TestPendingAndRespondTreatMissingRuntimeSessionAsNoPending(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &pendingSessionGoneProvider{Fake: runtime.NewFake()}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	pending, supported, err := mgr.Pending(info.ID)
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if !supported {
+		t.Fatal("Pending should report supported when the provider supports interactions")
+	}
+	if pending != nil {
+		t.Fatalf("Pending = %#v, want nil for missing runtime session", pending)
+	}
+
+	err = mgr.Respond(info.ID, runtime.InteractionResponse{Action: "approve"})
+	if !errors.Is(err, ErrNoPendingInteraction) {
+		t.Fatalf("Respond error = %v, want ErrNoPendingInteraction", err)
+	}
+}
+
+func TestRespondTreatsRuntimeSessionGoneDuringResponseAsNoPending(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &respondSessionGoneProvider{Fake: runtime.NewFake()}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	err = mgr.Respond(info.ID, runtime.InteractionResponse{Action: "approve"})
+	if !errors.Is(err, ErrNoPendingInteraction) {
+		t.Fatalf("Respond error = %v, want ErrNoPendingInteraction", err)
+	}
+}
+
+func TestPendingAndRespondDoNotSwallowUnrelatedNotFoundErrors(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &pendingSessionErrorProvider{
+		Fake: runtime.NewFake(),
+		err:  fmt.Errorf("loading config file: not found"),
+	}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	pending, supported, err := mgr.Pending(info.ID)
+	if err == nil {
+		t.Fatalf("Pending err = nil, want unrelated provider error")
+	}
+	if !supported {
+		t.Fatal("Pending should report supported when provider returned a non-session-gone error")
+	}
+	if pending != nil {
+		t.Fatalf("Pending = %#v, want nil on provider error", pending)
+	}
+	if !strings.Contains(err.Error(), "loading config file: not found") {
+		t.Fatalf("Pending err = %v, want original provider error", err)
+	}
+
+	err = mgr.Respond(info.ID, runtime.InteractionResponse{Action: "approve"})
+	if err == nil {
+		t.Fatalf("Respond err = nil, want unrelated provider error")
+	}
+	if errors.Is(err, ErrNoPendingInteraction) {
+		t.Fatalf("Respond err = %v, must not downgrade unrelated provider errors to ErrNoPendingInteraction", err)
+	}
+	if !strings.Contains(err.Error(), "loading config file: not found") {
+		t.Fatalf("Respond err = %v, want original provider error", err)
+	}
+}
+
+func TestSendRejectsPendingInteraction(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	sp.SetPendingInteraction(info.SessionName, &runtime.PendingInteraction{
+		RequestID: "req-1",
+		Kind:      "approval",
+		Prompt:    "approve?",
+	})
+
+	err = mgr.Send(context.Background(), info.ID, "hello", "", runtime.Config{})
+	if !errors.Is(err, ErrPendingInteraction) {
+		t.Fatalf("Send error = %v, want %v", err, ErrPendingInteraction)
+	}
+	for _, call := range sp.Calls {
+		if call.Method == "Nudge" && call.Name == info.SessionName {
+			t.Fatalf("unexpected Nudge while pending interaction is active: %#v", sp.Calls)
+		}
+	}
+}
+
+func TestSendImmediateRejectsPendingInteraction(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	sp.SetPendingInteraction(info.SessionName, &runtime.PendingInteraction{
+		RequestID: "req-1",
+		Kind:      "approval",
+		Prompt:    "approve?",
+	})
+
+	err = mgr.SendImmediate(context.Background(), info.ID, "hello", "", runtime.Config{})
+	if !errors.Is(err, ErrPendingInteraction) {
+		t.Fatalf("SendImmediate error = %v, want %v", err, ErrPendingInteraction)
+	}
+	for _, call := range sp.Calls {
+		if (call.Method == "Nudge" || call.Method == "NudgeNow") && call.Name == info.SessionName {
+			t.Fatalf("unexpected nudge while pending interaction is active: %#v", sp.Calls)
+		}
+	}
+}
+
+func TestTranscriptPathPrefersSessionKey(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	workDir := t.TempDir()
+	resume := ProviderResume{
+		ResumeFlag:    "--resume",
+		ResumeStyle:   "flag",
+		SessionIDFlag: "--session-id",
+	}
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: workDir, Provider: "claude", Env: nil, Resume: resume, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	searchBase := t.TempDir()
+	slugDir := filepath.Join(searchBase, sessionlog.ProjectSlug(workDir))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	keyPath := filepath.Join(slugDir, info.SessionKey+".jsonl")
+	if err := os.WriteFile(keyPath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(key): %v", err)
+	}
+	latestPath := filepath.Join(slugDir, "latest.jsonl")
+	if err := os.WriteFile(latestPath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(latest): %v", err)
+	}
+
+	path, err := mgr.TranscriptPath(info.ID, []string{searchBase})
+	if err != nil {
+		t.Fatalf("TranscriptPath: %v", err)
+	}
+	if path != keyPath {
+		t.Errorf("TranscriptPath = %q, want %q", path, keyPath)
+	}
+}
+
+func TestTranscriptPathAllowsClosedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	workDir := t.TempDir()
+	resume := ProviderResume{
+		ResumeFlag:    "--resume",
+		ResumeStyle:   "flag",
+		SessionIDFlag: "--session-id",
+	}
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "", Command: "claude", WorkDir: workDir, Provider: "claude", Env: nil, Resume: resume, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Close(info.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	searchBase := t.TempDir()
+	slugDir := filepath.Join(searchBase, sessionlog.ProjectSlug(workDir))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	keyPath := filepath.Join(slugDir, info.SessionKey+".jsonl")
+	if err := os.WriteFile(keyPath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	path, err := mgr.TranscriptPath(info.ID, []string{searchBase})
+	if err != nil {
+		t.Fatalf("TranscriptPath: %v", err)
+	}
+	if path != keyPath {
+		t.Errorf("TranscriptPath = %q, want %q for closed session", path, keyPath)
+	}
+}
+
+func TestTranscriptPathSkipsAmbiguousWorkDirFallback(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	workDir := t.TempDir()
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "one", Command: "claude", WorkDir: workDir, Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}}); err != nil {
+		t.Fatalf("Create one: %v", err)
+	}
+	info2, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "two", Command: "claude", WorkDir: workDir, Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create two: %v", err)
+	}
+
+	searchBase := t.TempDir()
+	slugDir := filepath.Join(searchBase, sessionlog.ProjectSlug(workDir))
+	if err := os.MkdirAll(slugDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	fallbackPath := filepath.Join(slugDir, "latest.jsonl")
+	if err := os.WriteFile(fallbackPath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	path, err := mgr.TranscriptPath(info2.ID, []string{searchBase})
+	if err != nil {
+		t.Fatalf("TranscriptPath: %v", err)
+	}
+	if path != "" {
+		t.Errorf("TranscriptPath = %q, want empty when workdir fallback is ambiguous", path)
+	}
+}
+
+func TestTranscriptPathClosedSessionSkipsAmbiguousHistoricalWorkDirFallback(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	workDir := t.TempDir()
+	info1, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "one", Command: "codex", WorkDir: workDir, Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create one: %v", err)
+	}
+	info2, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "two", Command: "codex", WorkDir: workDir, Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create two: %v", err)
+	}
+	if err := mgr.Close(info1.ID); err != nil {
+		t.Fatalf("Close one: %v", err)
+	}
+	if err := mgr.Close(info2.ID); err != nil {
+		t.Fatalf("Close two: %v", err)
+	}
+
+	searchBase := t.TempDir()
+	dayDir := filepath.Join(searchBase, "2026", "05", "04")
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	codexPath := filepath.Join(dayDir, "rollout-current.jsonl")
+	meta := `{"type":"session_meta","payload":{"cwd":"` + workDir + `"}}`
+	if err := os.WriteFile(codexPath, []byte(meta+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	path, err := mgr.TranscriptPath(info1.ID, []string{searchBase})
+	if err != nil {
+		t.Fatalf("TranscriptPath: %v", err)
+	}
+	if path != "" {
+		t.Errorf("TranscriptPath = %q, want empty for ambiguous historical codex workdir", path)
+	}
+}
+
+func TestTranscriptPathSameWorkDirDifferentProvidersUsesProviderSpecificFallback(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	workDir := t.TempDir()
+	if _, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "claude", Command: "claude", WorkDir: workDir, Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}}); err != nil {
+		t.Fatalf("Create claude: %v", err)
+	}
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "codex", Command: "codex", WorkDir: workDir, Provider: "codex", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create codex: %v", err)
+	}
+
+	searchBase := t.TempDir()
+	dayDir := filepath.Join(searchBase, "2026", "03", "27")
+	if err := os.MkdirAll(dayDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	codexPath := filepath.Join(dayDir, "rollout-current.jsonl")
+	meta := `{"type":"session_meta","payload":{"cwd":"` + workDir + `"}}`
+	if err := os.WriteFile(codexPath, []byte(meta+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	path, err := mgr.TranscriptPath(info.ID, []string{searchBase})
+	if err != nil {
+		t.Fatalf("TranscriptPath: %v", err)
+	}
+	if path != codexPath {
+		t.Errorf("TranscriptPath = %q, want %q", path, codexPath)
+	}
+}
+
+func TestKill_ActiveState(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "test", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Kill(info.ID); err != nil {
+		t.Fatalf("Kill active session: %v", err)
+	}
+}
+
+func TestKill_AwakeState(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{ExplicitName: "sky", Template: "helper", Title: "test", Command: "claude", WorkDir: "/tmp", Provider: "claude", Transport: "", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "state", string(StateAwake)); err != nil {
+		t.Fatalf("SetMetadata: %v", err)
+	}
+	if err := mgr.Kill(info.ID); err != nil {
+		t.Fatalf("Kill awake session: %v", err)
+	}
+}
+
+func TestKill_StoppedState_NotRunning(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	b, err := store.Create(beads.Bead{
+		Title:    "helper",
+		Type:     BeadType,
+		Labels:   []string{LabelSession},
+		Metadata: map[string]string{"session_name": "sky", "state": "stopped"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Kill(b.ID); err == nil {
+		t.Fatal("expected Kill to fail for stopped non-running session")
+	}
+}
+
+func TestKill_UnknownState_ButRunning(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	_ = sp.Start(context.Background(), "sky", runtime.Config{Command: "claude"})
+	mgr := NewManagerWithOptions(store, sp)
+
+	b, err := store.Create(beads.Bead{
+		Title:    "helper",
+		Type:     BeadType,
+		Labels:   []string{LabelSession},
+		Metadata: map[string]string{"session_name": "sky", "state": "some-future-state"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Kill(b.ID); err != nil {
+		t.Fatalf("Kill running session with unknown state: %v", err)
+	}
+}
+
+// PR #203 — When ensureRunning resumes with --resume <key> and the
+// process dies immediately (stale session key), it should clear the key and
+// retry fresh without the --resume flag.
+func TestEnsureRunning_RetriesWithoutStaleSessionKey(t *testing.T) {
+	store := beads.NewMemStore()
+	base := runtime.NewFake()
+
+	sp := &failOnceStartProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp, WithStaleKeyDetectionWaiter(immediateStaleKeyDetectionWaiter))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: "claude --dangerously", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{
+		ResumeFlag:    "--resume",
+		SessionIDFlag: "--session-id",
+	}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead: %v", err)
+	}
+	sessionKey := b.Metadata["session_key"]
+	if sessionKey == "" {
+		t.Fatal("expected session_key in bead metadata after Create with ResumeFlag")
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+
+	resumeCmd := "claude --dangerously --resume " + sessionKey
+	err = mgr.Send(context.Background(), info.ID, "hello", resumeCmd, runtime.Config{WorkDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("Send should retry without stale resume flag but failed: %v", err)
+	}
+
+	if !base.IsRunning(info.SessionName) {
+		t.Fatal("session should be running after fresh retry")
+	}
+
+	b, _ = store.Get(info.ID)
+	if b.Metadata["session_key"] != "" {
+		t.Errorf("session_key should be cleared after stale key retry, got %q", b.Metadata["session_key"])
+	}
+}
+
+// TestEnsureRunning_StaleKeyRetryAlsoFails verifies that when the stale-key
+// resume detects death and the fresh retry also fails, the error propagates.
+func TestEnsureRunning_StaleKeyRetryAlsoFails(t *testing.T) {
+	store := beads.NewMemStore()
+	base := runtime.NewFake()
+
+	sp := &dieAndFailProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp, WithStaleKeyDetectionWaiter(immediateStaleKeyDetectionWaiter))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: "claude --dangerously", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{
+		ResumeFlag:    "--resume",
+		SessionIDFlag: "--session-id",
+	}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead: %v", err)
+	}
+	if b.Metadata["session_key"] == "" {
+		t.Fatal("expected session_key in bead metadata")
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.callCount = 0
+	resumeCmd := "claude --dangerously --resume " + b.Metadata["session_key"]
+	err = mgr.Send(context.Background(), info.ID, "hello", resumeCmd, runtime.Config{WorkDir: "/tmp"})
+
+	if err == nil {
+		t.Fatal("Send should fail when both stale-key resume and fresh retry fail")
+	}
+	b, _ = store.Get(info.ID)
+	if b.Metadata["session_key"] != "" {
+		t.Errorf("session_key should be cleared even on retry failure, got %q", b.Metadata["session_key"])
+	}
+}
+
+func TestEnsureRunning_StaleKeyDetectionWaitHonorsContextCancellation(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	waiter := newManualStaleKeyDetectionWaiter(t)
+	mgr := NewManagerWithOptions(store, sp, WithStaleKeyDetectionWaiter(waiter.wait))
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		Template: "worker",
+		Command:  "claude",
+		WorkDir:  "/tmp",
+		Provider: "claude",
+		Resume: ProviderResume{
+			ResumeFlag:    "--resume",
+			SessionIDFlag: "--session-id",
+		},
+		ExtraMeta: map[string]string{"session_origin": "manual"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- mgr.Send(ctx, info.ID, "hello", "claude --resume "+info.SessionKey, runtime.Config{WorkDir: "/tmp"})
+	}()
+	awaitStaleKeyWaiterEntry(t, waiter, info.SessionName)
+	cancel()
+	if err := awaitSessionOperation(t, result, "canceled resume"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Send error = %v, want context.Canceled", err)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatal("runtime should remain started for the next reconciliation pass")
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get session: %v", err)
+	}
+	if got := State(b.Metadata["state"]); got != StateSuspended {
+		t.Fatalf("state after canceled stability wait = %q, want %q", got, StateSuspended)
+	}
+}
+
+func TestManagersUseIndependentStaleKeyDetectionWaiters(t *testing.T) {
+	type resumable struct {
+		mgr    *Manager
+		sp     *runtime.Fake
+		info   Info
+		waiter *manualStaleKeyDetectionWaiter
+	}
+	store := beads.NewMemStore()
+	newResumable := func(label string) resumable {
+		t.Helper()
+		sp := runtime.NewFake()
+		waiter := newManualStaleKeyDetectionWaiter(t)
+		mgr := NewManagerWithOptions(store, sp, WithStaleKeyDetectionWaiter(waiter.wait))
+		info, err := mgr.CreateSession(context.Background(), CreateOptions{
+			Template: label,
+			Command:  "claude",
+			WorkDir:  "/tmp",
+			Provider: "claude",
+			Resume: ProviderResume{
+				ResumeFlag:    "--resume",
+				SessionIDFlag: "--session-id",
+			},
+			ExtraMeta: map[string]string{"session_origin": "manual"},
+		})
+		if err != nil {
+			t.Fatalf("CreateSession(%s): %v", label, err)
+		}
+		if err := mgr.Suspend(info.ID); err != nil {
+			t.Fatalf("Suspend(%s): %v", label, err)
+		}
+		return resumable{mgr: mgr, sp: sp, info: info, waiter: waiter}
+	}
+
+	first := newResumable("first")
+	second := newResumable("second")
+	resume := func(r resumable) <-chan error {
+		result := make(chan error, 1)
+		go func() {
+			result <- r.mgr.Send(context.Background(), r.info.ID, "hello", "claude --resume "+r.info.SessionKey, runtime.Config{WorkDir: "/tmp"})
+		}()
+		return result
+	}
+	firstResult := resume(first)
+	secondResult := resume(second)
+	awaitStaleKeyWaiterEntry(t, first.waiter, first.info.SessionName)
+	awaitStaleKeyWaiterEntry(t, second.waiter, second.info.SessionName)
+
+	first.waiter.allow()
+	if err := awaitSessionOperation(t, firstResult, "first independently released resume"); err != nil {
+		t.Fatalf("first Send: %v", err)
+	}
+	select {
+	case err := <-secondResult:
+		t.Fatalf("second resume completed when only first waiter was released: %v", err)
+	default:
+	}
+	if !first.sp.IsRunning(first.info.SessionName) {
+		t.Fatal("first runtime should be running after its waiter release")
+	}
+
+	second.waiter.allow()
+	if err := awaitSessionOperation(t, secondResult, "second independently released resume"); err != nil {
+		t.Fatalf("second Send: %v", err)
+	}
+	if !second.sp.IsRunning(second.info.SessionName) {
+		t.Fatal("second runtime should be running after its waiter release")
+	}
+}
+
+func TestEnsureRunning_RetriesAfterStartupDeathError(t *testing.T) {
+	store := beads.NewMemStore()
+	base := runtime.NewFake()
+
+	sp := &startupDeathProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: "claude --dangerously", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{
+		ResumeFlag:    "--resume",
+		SessionIDFlag: "--session-id",
+	}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead: %v", err)
+	}
+	sessionKey := b.Metadata["session_key"]
+	if sessionKey == "" {
+		t.Fatal("expected session_key in bead metadata after Create with ResumeFlag")
+	}
+	if err := store.SetMetadata(info.ID, "started_config_hash", "hash-before"); err != nil {
+		t.Fatalf("SetMetadata started_config_hash: %v", err)
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+
+	resumeCmd := "claude --dangerously --resume " + sessionKey
+	err = mgr.Send(context.Background(), info.ID, "hello", resumeCmd, runtime.Config{WorkDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("Send should retry after startup-death error but failed: %v", err)
+	}
+
+	if !base.IsRunning(info.SessionName) {
+		t.Fatal("session should be running after fresh retry")
+	}
+
+	b, _ = store.Get(info.ID)
+	if b.Metadata["session_key"] != "" {
+		t.Errorf("session_key should be cleared after startup-death retry, got %q", b.Metadata["session_key"])
+	}
+	if b.Metadata["started_config_hash"] != "" {
+		t.Errorf("started_config_hash should be cleared after startup-death retry, got %q", b.Metadata["started_config_hash"])
+	}
+	if b.Metadata["continuation_reset_pending"] != "true" {
+		t.Errorf("continuation_reset_pending should be set after startup-death retry, got %q", b.Metadata["continuation_reset_pending"])
+	}
+}
+
+// When a startup-death recovery's resume command carries no resume flag/key
+// at all (it is already a fresh-start command), retryFreshStartAfterStaleKey
+// must clear the stale metadata and start fresh successfully. Previously it
+// hard-errored ("resume command could not be stripped") because the keyed
+// strip was a no-op — but a command with no --resume token is already fresh,
+// so failing only wedged the session. Same fragile-strip class of bug as the
+// diverged-key case in TestEnsureRunning_RetriesWhenResumeKeyDiverged.
+func TestEnsureRunning_StartupDeathWithoutStrippableResumeRecovers(t *testing.T) {
+	store := beads.NewMemStore()
+	base := runtime.NewFake()
+
+	sp := &startupDeathProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: "claude --dangerously", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{
+		ResumeFlag:    "--resume",
+		SessionIDFlag: "--session-id",
+	}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "started_config_hash", "hash-before"); err != nil {
+		t.Fatalf("SetMetadata started_config_hash: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead: %v", err)
+	}
+	if b.Metadata["session_key"] == "" {
+		t.Fatal("expected session_key in bead metadata after Create with ResumeFlag")
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+
+	// The resume command carries no --resume token, so it is already a valid
+	// fresh-start command. Recovery must succeed rather than wedge.
+	err = mgr.Send(context.Background(), info.ID, "hello", "claude --dangerously", runtime.Config{WorkDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("Send should recover via fresh start when resume command has no key to strip, got: %v", err)
+	}
+
+	if !base.IsRunning(info.SessionName) {
+		t.Fatal("session should be running after no-strippable-key fresh retry")
+	}
+
+	b, _ = store.Get(info.ID)
+	if b.Metadata["session_key"] != "" {
+		t.Errorf("session_key should be cleared after startup-death fallback, got %q", b.Metadata["session_key"])
+	}
+	if b.Metadata["started_config_hash"] != "" {
+		t.Errorf("started_config_hash should be cleared after startup-death fallback, got %q", b.Metadata["started_config_hash"])
+	}
+	if b.Metadata["continuation_reset_pending"] != "true" {
+		t.Errorf("continuation_reset_pending should be set after startup-death fallback, got %q", b.Metadata["continuation_reset_pending"])
+	}
+}
+
+// A resume-capable session whose embedded resume key has diverged from the
+// bead's current session_key (e.g. a concurrent fresh start minted a new key,
+// or a stale store read returned a different one) must still recover with a
+// fresh start. Previously retryFreshStartAfterStaleKey hard-errored with
+// "resume command could not be stripped" because the keyed strip could not
+// match the diverged key — wedging the session into a respawn/SIGTERM loop.
+// The fix falls back to a value-agnostic strip so the fresh start proceeds.
+func TestEnsureRunning_RetriesWhenResumeKeyDiverged(t *testing.T) {
+	store := beads.NewMemStore()
+	base := runtime.NewFake()
+
+	sp := &startupDeathProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: "claude --dangerously", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{
+		ResumeFlag:    "--resume",
+		SessionIDFlag: "--session-id",
+	}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The bead's stored session_key is KEY_B...
+	if err := store.SetMetadata(info.ID, "session_key", "key-B-current"); err != nil {
+		t.Fatalf("SetMetadata session_key: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+
+	// ...but the resume command was built with a DIVERGED key (KEY_A). The
+	// keyed strip ("--resume key-B-current") is a no-op against this command;
+	// only the value-agnostic fallback can produce a clean fresh start.
+	resumeCommand := "claude --dangerously --resume key-A-diverged"
+	err = mgr.Send(context.Background(), info.ID, "hello", resumeCommand, runtime.Config{WorkDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("Send should recover via fresh start when resume key diverged, got: %v", err)
+	}
+
+	if !base.IsRunning(info.SessionName) {
+		t.Fatal("session should be running after diverged-key fresh retry")
+	}
+
+	b, _ := store.Get(info.ID)
+	if b.Metadata["session_key"] != "" {
+		t.Errorf("session_key should be cleared after diverged-key retry, got %q", b.Metadata["session_key"])
+	}
+	if b.Metadata["continuation_reset_pending"] != "true" {
+		t.Errorf("continuation_reset_pending should be set after diverged-key retry, got %q", b.Metadata["continuation_reset_pending"])
+	}
+}
+
+func TestEnsureRunning_RetriesWhenResumeKeyDivergedKeepsEarlierResumeText(t *testing.T) {
+	store := beads.NewMemStore()
+	base := runtime.NewFake()
+
+	sp := &startupDeathProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: `claude --label "--resume keep-me"`, WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{
+		ResumeFlag:    "--resume",
+		ResumeStyle:   "flag",
+		SessionIDFlag: "--session-id",
+	}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := store.SetMetadata(info.ID, "session_key", "key-B-current"); err != nil {
+		t.Fatalf("SetMetadata session_key: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+
+	resumeCommand := `claude --label "--resume keep-me" --resume key-A-diverged`
+	err = mgr.Send(context.Background(), info.ID, "hello", resumeCommand, runtime.Config{WorkDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("Send should recover via fresh start when resume key diverged, got: %v", err)
+	}
+
+	var retryCommand string
+	for _, call := range base.Calls {
+		if call.Method == "Start" && call.Name == info.SessionName {
+			retryCommand = call.Config.Command
+		}
+	}
+	if retryCommand == "" {
+		t.Fatalf("fresh retry Start call not recorded: %#v", base.Calls)
+	}
+	want := `claude --label "--resume keep-me"`
+	if retryCommand != want {
+		t.Fatalf("fresh retry command = %q, want %q", retryCommand, want)
+	}
+}
+
+func TestEnsureRunning_RetriesExplicitResumeCommandWhenResumeKeyDiverged(t *testing.T) {
+	store := beads.NewMemStore()
+	base := runtime.NewFake()
+
+	sp := &startupDeathProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: "claude --dangerously-skip-permissions", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{
+		ResumeFlag:    "--resume",
+		SessionIDFlag: "--session-id",
+		ResumeCommand: "claude --resume {{.SessionKey}} --dangerously-skip-permissions",
+	}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := store.SetMetadata(info.ID, "session_key", "key-B-current"); err != nil {
+		t.Fatalf("SetMetadata session_key: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+
+	resumeCommand := "claude --resume key-A-diverged --dangerously-skip-permissions"
+	err = mgr.Send(context.Background(), info.ID, "hello", resumeCommand, runtime.Config{WorkDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("Send should recover via fresh start when explicit resume_command key diverged, got: %v", err)
+	}
+
+	var retryCommand string
+	for _, call := range base.Calls {
+		if call.Method == "Start" && call.Name == info.SessionName {
+			retryCommand = call.Config.Command
+		}
+	}
+	if retryCommand == "" {
+		t.Fatalf("fresh retry Start call not recorded: %#v", base.Calls)
+	}
+	if want := "claude --dangerously-skip-permissions"; retryCommand != want {
+		t.Fatalf("fresh retry command = %q, want %q", retryCommand, want)
+	}
+}
+
+// Issue #1655 — a session created without resume capability
+// (ProviderResume{} on Create → empty resume_flag in bead metadata)
+// must still be able to recover from a stale session_key. The
+// named-always case in the issue body is one instance of this shape;
+// the invariant is general — any session whose start command was
+// never resume-capable should clear a stale key and start fresh
+// rather than bail. Previously retryFreshStartAfterStaleKey refused
+// the retry because stripResumeFlag is a no-op when resume_flag is
+// empty, and the function misclassified that as a strip failure.
+func TestEnsureRunning_RetriesWhenResumeFlagIsEmpty(t *testing.T) {
+	store := beads.NewMemStore()
+	base := runtime.NewFake()
+
+	sp := &startupDeathProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp)
+
+	// Create a session without resume capability — ProviderResume{}
+	// yields an empty resume_flag in bead metadata. The same shape
+	// arises for any configured-named-always session whose start
+	// command lacks a --resume-style flag.
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: "fakecmd --follow worker", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead: %v", err)
+	}
+	if b.Metadata["resume_flag"] != "" {
+		t.Fatalf("expected empty resume_flag for ProviderResume{}, got %q", b.Metadata["resume_flag"])
+	}
+
+	// Simulate the post-run state described in #1655: the session ran
+	// once and a session_key landed in bead metadata even though the
+	// start command never accepted a resume flag.
+	if err := store.SetMetadata(info.ID, "session_key", "stale-key-1"); err != nil {
+		t.Fatalf("SetMetadata session_key: %v", err)
+	}
+	if err := store.SetMetadata(info.ID, "started_config_hash", "hash-before"); err != nil {
+		t.Fatalf("SetMetadata started_config_hash: %v", err)
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+
+	// For a session without resume capability the "resume command"
+	// passed to Send is just the original start command — there is no
+	// --resume flag to add or strip.
+	err = mgr.Send(context.Background(), info.ID, "hello", "fakecmd --follow worker", runtime.Config{WorkDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("Send should retry fresh when resume_flag is empty but failed: %v", err)
+	}
+
+	if !base.IsRunning(info.SessionName) {
+		t.Fatal("session should be running after empty-resume_flag fresh retry")
+	}
+
+	b, _ = store.Get(info.ID)
+	if b.Metadata["session_key"] != "" {
+		t.Errorf("session_key should be cleared after empty-resume_flag retry, got %q", b.Metadata["session_key"])
+	}
+	if b.Metadata["started_config_hash"] != "" {
+		t.Errorf("started_config_hash should be cleared after empty-resume_flag retry, got %q", b.Metadata["started_config_hash"])
+	}
+	if b.Metadata["continuation_reset_pending"] != "true" {
+		t.Errorf("continuation_reset_pending should be set after empty-resume_flag retry, got %q", b.Metadata["continuation_reset_pending"])
+	}
+}
+
+func TestEnsureRunning_StartupDeathClearMetadataFailurePropagates(t *testing.T) {
+	store := failMetadataKeyStore{MemStore: beads.NewMemStore(), key: "session_key"}
+	base := runtime.NewFake()
+	sp := &startupDeathProvider{Fake: base}
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "worker", Title: "", Command: "claude --dangerously", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{
+		ResumeFlag:    "--resume",
+		SessionIDFlag: "--session-id",
+	}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead: %v", err)
+	}
+	sessionKey := b.Metadata["session_key"]
+	if sessionKey == "" {
+		t.Fatal("expected session_key in bead metadata after Create with ResumeFlag")
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+	resumeCmd := "claude --dangerously --resume " + sessionKey
+	err = mgr.Send(context.Background(), info.ID, "hello", resumeCmd, runtime.Config{WorkDir: "/tmp"})
+	if err == nil {
+		t.Fatal("Send should fail when stale resume metadata cannot be cleared")
+	}
+	if !strings.Contains(err.Error(), "clearing stale resume metadata session_key") {
+		t.Fatalf("Send error = %v, want stale metadata clear failure", err)
+	}
+
+	b, err = store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead after failure: %v", err)
+	}
+	if b.Metadata["session_key"] == "" {
+		t.Fatal("session_key should remain set after failed metadata clear")
+	}
+}
+
+// TestCloseDetailed_StopErrorLeavesBeadOpen verifies the secondary fix for the
+// self-close wedge: when the runtime terminate genuinely fails, CloseDetailed
+// must propagate the error and leave the bead open rather than reporting a
+// "closed but still running" session. The previous code discarded the Stop
+// error and closed the bead unconditionally.
+func TestCloseDetailed_StopErrorLeavesBeadOpen(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Arm a non-idempotent terminate failure (not "session gone").
+	sp.StopErrors[info.SessionName] = errors.New("kill failed")
+
+	if _, err := mgr.CloseDetailed(info.ID); err == nil {
+		t.Fatal("CloseDetailed: expected error when runtime Stop fails, got nil")
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Status == "closed" {
+		t.Error("bead was closed despite the runtime Stop failing")
+	}
+}
+
+// TestCloseDetailed_StopSuccessClosesBead is the happy-path companion: when the
+// runtime terminate succeeds, the bead closes normally.
+func TestCloseDetailed_StopSuccessClosesBead(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := mgr.CloseDetailed(info.ID); err != nil {
+		t.Fatalf("CloseDetailed: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Status != "closed" {
+		t.Errorf("bead Status = %q, want closed", b.Status)
+	}
+}
+
+func TestPersistInvocationUsageCursor(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{Template: "helper", Title: "chat", Command: "claude", WorkDir: "/tmp", Provider: "claude", Env: nil, Resume: ProviderResume{}, Hints: runtime.Config{}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := mgr.PersistInvocationUsageCursor(info.ID, "u1"); err != nil {
+		t.Fatalf("PersistInvocationUsageCursor(u1): %v", err)
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata[MetadataKeyInvocationUsageCursor]; got != "u1" {
+		t.Fatalf("cursor metadata = %q, want u1", got)
+	}
+
+	// Unlike PersistSessionKey, the cursor must overwrite on every call.
+	if err := mgr.PersistInvocationUsageCursor(info.ID, "u2"); err != nil {
+		t.Fatalf("PersistInvocationUsageCursor(u2): %v", err)
+	}
+	b, err = store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata[MetadataKeyInvocationUsageCursor]; got != "u2" {
+		t.Fatalf("cursor metadata after overwrite = %q, want u2", got)
+	}
+
+	// Empty id or cursor is a no-op, not an error.
+	if err := mgr.PersistInvocationUsageCursor("", "u3"); err != nil {
+		t.Fatalf("PersistInvocationUsageCursor(empty id): %v", err)
+	}
+	if err := mgr.PersistInvocationUsageCursor(info.ID, "  "); err != nil {
+		t.Fatalf("PersistInvocationUsageCursor(blank cursor): %v", err)
+	}
+	b, err = store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata[MetadataKeyInvocationUsageCursor]; got != "u2" {
+		t.Fatalf("cursor metadata after no-ops = %q, want u2", got)
+	}
+}

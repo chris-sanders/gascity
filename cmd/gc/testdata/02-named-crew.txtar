@@ -1,0 +1,14 @@
+env GC_SESSION=fake
+env GC_BEADS=file
+env GC_DOLT=skip
+
+exec gc init $WORK/bright-lights
+cd $WORK/bright-lights
+
+exec gc agent add --name worker
+stdout 'Scaffolded agent'
+stdout 'worker'
+
+exec gc config show
+stdout 'mayor'
+stdout 'worker'

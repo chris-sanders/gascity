@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "usage: $0 <package> <shard-index> <shard-total>" >&2
+  exit 1
+fi
+
+test_pkg="$1"
+shard_index="$2"
+shard_total="$3"
+
+if ! [[ "$shard_index" =~ ^[0-9]+$ && "$shard_total" =~ ^[0-9]+$ ]]; then
+  echo "shard index and total must be positive integers" >&2
+  exit 1
+fi
+if (( shard_index < 1 || shard_total < 1 || shard_index > shard_total )); then
+  echo "invalid shard ${shard_index} of ${shard_total}" >&2
+  exit 1
+fi
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+source "$repo_root/scripts/lib/common.sh"
+# shellcheck source=lib/test-slice.sh
+source "$repo_root/scripts/lib/test-slice.sh"
+gc_test_slice_reexec "$repo_root/scripts/test-go-test-shard" "$@"
+
+timeout="${GO_TEST_TIMEOUT:-20m}"
+
+gopath_val="$(go env GOPATH)"
+gocache_val="$(go env GOCACHE)"
+gomodcache_val="$(go env GOMODCACHE)"
+gotmpdir_val="$(go env GOTMPDIR)"
+goroot_val="$(go env GOROOT)"
+
+# Mirror the Makefile's CGO path detection here so tests run via this script
+# see the same system dependency paths as `make`. When invoked from
+# test-integration-shard, CGO_CPPFLAGS/CGO_LDFLAGS may already be set by that
+# script; the helper avoids double-adding duplicate words.
+cgo_cppflags="${CGO_CPPFLAGS:-}"
+cgo_ldflags="${CGO_LDFLAGS:-}"
+configure_cgo_platform_paths
+
+extra_env=()
+while IFS='=' read -r name _; do
+  case "$name" in
+    ANTHROPIC_*|CLAUDE_CODE_*|GC_ACCEPTANCE_KEEP|GC_TIERC_FORCE|GC_TUTORIAL_GOLDENS_USE_CLAUDE_FOR_CODEX)
+      extra_env+=("${name}=${!name}")
+      ;;
+  esac
+done < <(env)
+
+run_in_test_env() {
+  local base_env=(
+    PATH="${PATH}" \
+    HOME="${HOME:-}" \
+    USER="${USER:-}" \
+    LOGNAME="${LOGNAME:-}" \
+    SHELL="${SHELL:-/bin/sh}" \
+    LANG="${LANG:-C.UTF-8}" \
+    TMPDIR="${TMPDIR:-/tmp}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+    GOPATH="${gopath_val}" \
+    GOCACHE="${gocache_val}" \
+    GOMODCACHE="${gomodcache_val}" \
+    GOTMPDIR="${gotmpdir_val}" \
+    GOROOT="${GOROOT:-$goroot_val}" \
+    GOENV="${GOENV-}" \
+    GOFLAGS="${GOFLAGS-}" \
+    GO111MODULE="${GO111MODULE-}" \
+    GOEXPERIMENT="${GOEXPERIMENT-}" \
+    GOPROXY="${GOPROXY-}" \
+    GOPRIVATE="${GOPRIVATE-}" \
+    GONOPROXY="${GONOPROXY-}" \
+    GONOSUMDB="${GONOSUMDB-}" \
+    GOSUMDB="${GOSUMDB-}" \
+    GOINSECURE="${GOINSECURE-}" \
+    GOVCS="${GOVCS-}" \
+    GOWORK="${GOWORK-}" \
+    GC_FAST_UNIT="${GC_FAST_UNIT:-0}" \
+    CGO_CPPFLAGS="${cgo_cppflags}" \
+    CGO_LDFLAGS="${cgo_ldflags}" \
+    GC_TEST_SHARD_INDEX="${shard_index}" \
+    GC_TEST_SHARD_TOTAL="${shard_total}"
+  )
+  if (( ${#extra_env[@]} > 0 )); then
+    env -i "${base_env[@]}" "${extra_env[@]}" "$@"
+  else
+    env -i "${base_env[@]}" "$@"
+  fi
+}
+
+run_go_test() {
+  run_in_test_env go test "$@"
+}
+
+run_observable_go_test() {
+  local timing_name="${GO_TEST_TIMING_NAME:-${test_pkg#./}-shard-${shard_index}-of-${shard_total}}"
+  local observable_env=(
+    OBSERVABLE_TIMING_FILE="${GO_TEST_TIMING_FILE}"
+    OBSERVABLE_SHARD_ID="${timing_name}"
+    OBSERVABLE_VARIANT="${GO_TEST_TIMING_VARIANT:-default}"
+    OBSERVABLE_COMMIT_SHA="${GITHUB_SHA:-}"
+    OBSERVABLE_WORKFLOW="${GITHUB_WORKFLOW:-}"
+    OBSERVABLE_RUN_ID="${GITHUB_RUN_ID:-}"
+    OBSERVABLE_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-}"
+    OBSERVABLE_JOB="${GITHUB_JOB:-}"
+    OBSERVABLE_RUNNER_LABEL="${GO_TEST_RUNNER_LABEL:-}"
+    OBSERVABLE_RUNNER_NAME="${RUNNER_NAME:-}"
+    OBSERVABLE_RUNNER_OS="${RUNNER_OS:-}"
+    OBSERVABLE_RUNNER_ARCH="${RUNNER_ARCH:-}"
+    OBSERVABLE_RUNNER_CPU_COUNT="${GO_TEST_RUNNER_CPU_COUNT:-}"
+  )
+  if [[ "${GC_TEST_NO_SLICE:-0}" == "1" ]]; then
+    observable_env+=(GC_TEST_NO_SLICE=1)
+  fi
+  run_in_test_env "${observable_env[@]}" \
+    "$repo_root/scripts/go-test-observable" "$timing_name" -- "$@"
+}
+
+go_test_args=(-timeout "$timeout")
+if [[ -n "${GO_TEST_TAGS:-}" ]]; then
+  go_test_args=(-tags "$GO_TEST_TAGS" "${go_test_args[@]}")
+fi
+if [[ -n "${GO_TEST_COUNT:-}" ]]; then
+  go_test_args=(-count="$GO_TEST_COUNT" "${go_test_args[@]}")
+fi
+if [[ -n "${GO_TEST_COVERPROFILE:-}" ]]; then
+  go_test_args+=(-coverpkg=./... -coverprofile "$GO_TEST_COVERPROFILE")
+fi
+
+# Capture the enumeration separately so a build/compile failure here surfaces
+# its output. `go test -list` builds the test binary; if that fails, the bare
+# assignment's non-zero status is swallowed by `set -e` (the script dies before
+# the "no tests discovered" branch below), producing an undebuggable empty
+# shard failure. Check the status explicitly and print what go printed.
+if ! list_output="$(run_go_test "${go_test_args[@]}" "$test_pkg" -list '^Test' 2>&1)"; then
+  echo "go test -list failed for ${test_pkg} (build/compile error); output:" >&2
+  printf '%s\n' "$list_output" >&2
+  exit 1
+fi
+tests=()
+while IFS= read -r line; do
+  [[ "$line" == Test* ]] || continue
+  tests+=("$line")
+done <<< "$list_output"
+
+if [[ ${#tests[@]} -eq 0 ]]; then
+  echo "no tests discovered for ${test_pkg}; go test -list output:" >&2
+  printf '%s\n' "$list_output" >&2
+  exit 1
+fi
+
+selected=()
+for i in "${!tests[@]}"; do
+  if (( i % shard_total == shard_index - 1 )); then
+    selected+=("${tests[$i]}")
+  fi
+done
+
+if [[ ${#selected[@]} -eq 0 ]]; then
+  echo "no tests selected for ${test_pkg} shard ${shard_index} of ${shard_total}" >&2
+  exit 1
+fi
+
+join_regex() {
+  local IFS='|'
+  printf '%s' "$*"
+}
+
+regex="^($(join_regex "${selected[@]}"))$"
+echo "Running ${test_pkg} shard ${shard_index} of ${shard_total} (${#selected[@]} tests)"
+printf '  %s\n' "${selected[@]}"
+if [[ -n "${GO_TEST_TIMING_FILE:-}" ]]; then
+  run_observable_go_test "${go_test_args[@]}" "$test_pkg" -run "$regex"
+else
+  run_go_test "${go_test_args[@]}" "$test_pkg" -run "$regex"
+fi

@@ -1,0 +1,344 @@
+package supervisor
+
+import (
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/pathutil"
+)
+
+// isTestBinary reports whether the current process is a Go test binary.
+// Go test binaries are named *.test (e.g., "supervisor.test").
+func isTestBinary() bool {
+	if len(os.Args) == 0 {
+		return false
+	}
+	return strings.HasSuffix(os.Args[0], ".test") ||
+		strings.Contains(os.Args[0], ".test")
+}
+
+// Config holds machine-wide supervisor configuration loaded from
+// ~/.gc/supervisor.toml (or $GC_HOME/supervisor.toml).
+type Config struct {
+	Supervisor  Section           `toml:"supervisor"`
+	Publication PublicationConfig `toml:"publication,omitempty"`
+	Events      EventsSection     `toml:"events,omitempty"`
+}
+
+// Section holds the [supervisor] table fields.
+type Section struct {
+	Port           int      `toml:"port,omitempty"`
+	Bind           string   `toml:"bind,omitempty"`
+	PatrolInterval string   `toml:"patrol_interval,omitempty"`
+	AllowMutations bool     `toml:"allow_mutations,omitempty"`
+	AllowedOrigins []string `toml:"allowed_origins,omitempty"`
+	AllowedHosts   []string `toml:"allowed_hosts,omitempty"`
+	// WriteAuthVerifyKey / WriteAuthRequired require a signed write grant on
+	// every mutating request to an already-registered city (the per-city routes
+	// under /v0/city/{cityName}); city registry creation (POST /v0/city) stays
+	// on the supervisor-registry guards. See config.APIConfig for the key format
+	// and full semantics.
+	WriteAuthVerifyKey string `toml:"write_auth_verify_key,omitempty"`
+	WriteAuthRequired  bool   `toml:"write_auth_required,omitempty"`
+	// WriteAuthAllowUnverified acknowledges a non-loopback bind with
+	// allow_mutations and no verify key (an unauthenticated write plane behind a
+	// network front); without it that combination is a fail-closed boot error
+	// (gate G10). See config.APIConfig for the full semantics.
+	WriteAuthAllowUnverified bool `toml:"write_auth_allow_unverified,omitempty"`
+	// ReadAuthVerifyKey / ReadAuthRequired require a signed read grant on every
+	// read (GET/HEAD) of an already-registered city (the per-city routes under
+	// /v0/city/{cityName}); supervisor-scope reads (/v0/cities, /health) stay
+	// open. See config.APIConfig for the key format and full semantics.
+	ReadAuthVerifyKey string `toml:"read_auth_verify_key,omitempty"`
+	ReadAuthRequired  bool   `toml:"read_auth_required,omitempty"`
+}
+
+// PublicationConfig holds machine-wide publication policy for workspace
+// services. Hosted publication is the only supported provider in v0.
+type PublicationConfig struct {
+	Provider         string                      `toml:"provider,omitempty"`
+	TenantSlug       string                      `toml:"tenant_slug,omitempty"`
+	PublicBaseDomain string                      `toml:"public_base_domain,omitempty"`
+	TenantBaseDomain string                      `toml:"tenant_base_domain,omitempty"`
+	TenantAuth       PublicationTenantAuthConfig `toml:"tenant_auth,omitempty"`
+}
+
+// PublicationTenantAuthConfig configures tenant-route auth policy.
+type PublicationTenantAuthConfig struct {
+	PolicyRef string `toml:"policy_ref,omitempty"`
+}
+
+// EventsSection holds the [events] table of supervisor.toml.
+type EventsSection struct {
+	Export ExportConfig `toml:"export,omitempty"`
+}
+
+// ExportConfig configures the redacted event export ([events.export]). Export is
+// off unless Endpoint is set: that absence is the opt-in gate, so configuring a
+// supervisor never starts shipping events without an explicit endpoint.
+type ExportConfig struct {
+	// Endpoint is the HTTP URL that receives batched, envelope-only events.
+	Endpoint string `toml:"endpoint,omitempty"`
+	// Token, when set, is sent as an Authorization: Bearer header.
+	Token string `toml:"token,omitempty"`
+	// TokenFile, when set, is a path to a file holding the bearer token. It is
+	// re-read on each POST so the token can be rotated out of band, and takes
+	// precedence over Token.
+	TokenFile string `toml:"token_file,omitempty"`
+	// ActorSalt salts the actor hash so it is stable yet non-reversible. It must
+	// be at least 16 bytes: a shorter salt makes the hash brute-forceable, so the
+	// projection fails closed and drops every event (the supervisor warns at
+	// startup). Leave empty to use a random per-install salt.
+	ActorSalt string `toml:"actor_salt,omitempty"`
+	// BatchMaxEvents caps events per POST (default 1000).
+	BatchMaxEvents int `toml:"batch_max_events,omitempty"`
+	// BatchInterval caps the time between POSTs (default 5s).
+	BatchInterval string `toml:"batch_interval,omitempty"`
+	// ExportRef toggles the id-gated ref field (default true).
+	ExportRef *bool `toml:"export_ref,omitempty"`
+}
+
+// Enabled reports whether event export is configured.
+func (x ExportConfig) Enabled() bool { return strings.TrimSpace(x.Endpoint) != "" }
+
+// ExportRefEnabled reports whether the id-gated ref is exported (default true).
+func (x ExportConfig) ExportRefEnabled() bool { return x.ExportRef == nil || *x.ExportRef }
+
+// BatchIntervalDuration parses BatchInterval, defaulting to 5s.
+func (x ExportConfig) BatchIntervalDuration() time.Duration {
+	if x.BatchInterval == "" {
+		return 5 * time.Second
+	}
+	d, err := time.ParseDuration(x.BatchInterval)
+	if err != nil || d <= 0 {
+		return 5 * time.Second
+	}
+	return d
+}
+
+// BindOrDefault returns the bind address, defaulting to "127.0.0.1".
+func (s Section) BindOrDefault() string {
+	if s.Bind == "" {
+		return "127.0.0.1"
+	}
+	return s.Bind
+}
+
+// PortOrDefault returns the API port, defaulting to 8372.
+func (s Section) PortOrDefault() int {
+	if s.Port <= 0 {
+		return 8372
+	}
+	return s.Port
+}
+
+// PatrolIntervalDuration returns the patrol interval as a time.Duration.
+// Defaults to 10s on empty or unparseable values.
+func (s Section) PatrolIntervalDuration() time.Duration {
+	if s.PatrolInterval == "" {
+		return 10 * time.Second
+	}
+	d, err := time.ParseDuration(s.PatrolInterval)
+	if err != nil || d <= 0 {
+		return 10 * time.Second
+	}
+	return d
+}
+
+// ProviderOrDefault returns the normalized publication provider.
+func (p PublicationConfig) ProviderOrDefault() string {
+	return strings.ToLower(strings.TrimSpace(p.Provider))
+}
+
+// Enabled reports whether machine publication is configured.
+func (p PublicationConfig) Enabled() bool {
+	return p.ProviderOrDefault() != ""
+}
+
+// BaseDomainForVisibility returns the base domain for a publication visibility.
+func (p PublicationConfig) BaseDomainForVisibility(visibility string) string {
+	switch strings.ToLower(strings.TrimSpace(visibility)) {
+	case "public":
+		return normalizePublicationDomain(p.PublicBaseDomain)
+	case "tenant":
+		return normalizePublicationDomain(p.TenantBaseDomain)
+	default:
+		return ""
+	}
+}
+
+// TenantSlugOrDefault returns the normalized tenant slug.
+func (p PublicationConfig) TenantSlugOrDefault() string {
+	return normalizePublicationDomain(p.TenantSlug)
+}
+
+func normalizePublicationDomain(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	value = strings.TrimPrefix(value, ".")
+	value = strings.TrimSuffix(value, ".")
+	return value
+}
+
+// LoadConfig loads supervisor config from the given path. Returns a
+// zero-value Config (with defaults) if the file doesn't exist.
+func LoadConfig(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		seeded, seedErr := seedIsolatedSupervisorConfig(path)
+		if seedErr != nil {
+			return cfg, seedErr
+		}
+		if !seeded {
+			return cfg, nil
+		}
+		data, err = os.ReadFile(path)
+	}
+	if err != nil {
+		return cfg, err
+	}
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// DefaultHome returns the default GC home directory (~/.gc). Respects
+// the GC_HOME environment variable override.
+//
+// Guard: in test binaries, GC_HOME must be set explicitly to prevent
+// silent fallback to the user's real ~/.gc directory.
+func DefaultHome() string {
+	if v := os.Getenv("GC_HOME"); v != "" {
+		return pathutil.NormalizePathForCompare(v)
+	}
+	if isTestBinary() {
+		panic("supervisor.DefaultHome: GC_HOME must be set during tests to prevent host supervisor interference")
+	}
+	return builtinDefaultHome()
+}
+
+func builtinDefaultHome() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".gc")
+	}
+	// Home unresolved. Never fall back to a fixed os.TempDir()/.gc: that path
+	// is shared and world-writable, so concurrent processes clobber each
+	// other's state and unrelated city scans pick it up as a real city
+	// (#3506). Hand out a process-unique directory instead.
+	if dir, err := os.MkdirTemp("", "gc-home-*"); err == nil {
+		return dir
+	}
+	// MkdirTemp failed, so the temp directory itself is unusable. Return a
+	// process-unique path under it rather than "" (which callers would join
+	// into a CWD-relative path, silently writing state to the wrong place) or
+	// the shared os.TempDir()/.gc that #3506 is about. The caller then fails
+	// loudly when it cannot create or write this path.
+	return filepath.Join(os.TempDir(), fmt.Sprintf("gc-home-%d", os.Getpid()))
+}
+
+// UsesIsolatedGCHomeOverride reports whether GC_HOME points away from the builtin ~/.gc default.
+func UsesIsolatedGCHomeOverride() bool {
+	gcHome := strings.TrimSpace(os.Getenv("GC_HOME"))
+	if gcHome == "" {
+		return false
+	}
+	return pathutil.NormalizePathForCompare(gcHome) != pathutil.NormalizePathForCompare(builtinDefaultHome())
+}
+
+// RuntimeDir returns the directory for ephemeral runtime files (lock,
+// socket). Uses $XDG_RUNTIME_DIR/gc for the default machine-wide home, but
+// keeps isolated GC_HOME overrides self-contained under their own home so
+// they do not collide with the host supervisor socket.
+//
+// Guard: in test binaries, XDG_RUNTIME_DIR or GC_HOME must be set to
+// prevent connecting to the host supervisor socket.
+func RuntimeDir() string {
+	if UsesIsolatedGCHomeOverride() {
+		return DefaultHome()
+	}
+	if v := os.Getenv("XDG_RUNTIME_DIR"); v != "" {
+		return filepath.Join(v, "gc")
+	}
+	return DefaultHome() // DefaultHome has its own test guard
+}
+
+// RegistryPath returns the path to the cities.toml registry file.
+func RegistryPath() string {
+	return filepath.Join(DefaultHome(), "cities.toml")
+}
+
+// ConfigPath returns the path to the supervisor.toml config file.
+func ConfigPath() string {
+	return filepath.Join(DefaultHome(), "supervisor.toml")
+}
+
+// PublicationsPath returns the authoritative publication store path for a city
+// runtime when cityPath is set. When cityPath is empty, it falls back to the
+// legacy GC_HOME-scoped location.
+func PublicationsPath(cityPath string) string {
+	if cityPath != "" {
+		return citylayout.RuntimePath(cityPath, "supervisor", "publications.json")
+	}
+	return filepath.Join(DefaultHome(), "supervisor", "publications.json")
+}
+
+func seedIsolatedSupervisorConfig(path string) (bool, error) {
+	if !shouldSeedIsolatedSupervisorConfig(path) {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return false, err
+	}
+	port, err := reserveLoopbackPort()
+	if err != nil {
+		return false, err
+	}
+	data := []byte(fmt.Sprintf("[supervisor]\nport = %d\n", port))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	defer f.Close() //nolint:errcheck // best-effort cleanup
+	if _, err := f.Write(data); err != nil {
+		return false, err
+	}
+	if err := f.Sync(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func shouldSeedIsolatedSupervisorConfig(path string) bool {
+	// GC_ISOLATED=1 lets non-test CI/dev sandboxes seed private supervisor configs.
+	if !isTestBinary() && os.Getenv("GC_ISOLATED") != "1" {
+		return false
+	}
+	gcHome := os.Getenv("GC_HOME")
+	if gcHome == "" {
+		return false
+	}
+	return pathutil.SamePath(path, ConfigPath())
+}
+
+func reserveLoopbackPort() (int, error) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer lis.Close() //nolint:errcheck // best-effort cleanup
+	addr, ok := lis.Addr().(*net.TCPAddr)
+	if !ok || addr.Port <= 0 {
+		return 0, fmt.Errorf("unexpected supervisor listener address %T", lis.Addr())
+	}
+	return addr.Port, nil
+}

@@ -1,0 +1,98 @@
+---
+title: Architecture Overview
+description: Current-state subsystem documentation for Gas City.
+---
+
+Current-state documentation for Gas City's subsystems. Each document
+describes how the subsystem works **today**, not how we wish it worked.
+For proposed changes, write a design doc in [`engdocs/design/`](../design/).
+
+## Reading Order
+
+Start with the overview, then dive into the subsystem you need.
+
+### Foundation
+
+1. **[Glossary](./glossary.md)** — authoritative definitions of all terms
+2. **[Primitives](../../docs/getting-started/how-gas-city-works.md)** — the six-primitive user-facing
+   model (Agent, Bead, Formula, Rig, Pack, Event); start here for the
+   conceptual overview
+3. **[Code-layering View](./nine-concepts.md)** — the deeper
+   implementation-layering reference: how the Go code substrate maps onto
+   the six primitives
+4. **[Architecture Invariants](./invariants.md)** — the normative
+   cross-cutting rules: object model at the center, CLI and API as
+   projections over it, typed wire end-to-end
+
+### Layer 0-1: Primitives
+
+These are irreducible. Removing any makes it impossible to build a
+multi-agent orchestration system.
+
+3. **[Bead Store](./beads.md)** — universal persistence substrate for all
+   work units (tasks, mail, molecules, convoys)
+4. **[Event Bus](./event-bus.md)** — append-only pub/sub log of all system
+   activity
+5. **[Config System](./config.md)** — TOML loading, progressive activation,
+   multi-layer override resolution
+6. **[Session](./session.md)** — session lifecycle backed by runtime
+   providers (tmux, subprocess, exec, k8s)
+7. **[Prompt Templates](./prompt-templates.md)** — Go `text/template` in
+   Markdown defining role behavior
+
+### Layer 2-4: Derived Mechanisms
+
+Each is provably composable from the primitives.
+
+8. **[Messaging](./messaging.md)** — inter-agent mail via beads + nudge
+   via the Session primitive
+9. **[Formulas & Molecules](./formulas.md)** — work definitions (TOML) and
+   their runtime instances (bead trees)
+10. **[Dispatch](./dispatch.md)** — sling: agent selection + formula
+    instantiation + convoy creation
+11. **[Health Patrol](./health-patrol.md)** — supervision model,
+    reconciliation, crash tracking, idle detection
+
+### Infrastructure
+
+12. **[API Control Plane](./api-control-plane.md)** — CLI/API projections,
+    typed HTTP + SSE wire contract, generated clients, and event payload
+    registry
+13. **[Controller](./controller.md)** — the main loop: config watch,
+    reconciliation tick, order dispatch
+14. **[Orders](./orders.md)** — trigger-conditioned formula/exec
+    dispatch, rig-scoped labels
+15. **[Gas City Pack Specification (2.0)](../../docs/reference/specs/pack-spec.md)** —
+    authoritative pack data model, file format, and loader semantics
+
+### End-to-End Traces
+
+These trace a concrete operation through all layers. The most effective
+way to understand how the system fits together.
+
+16. **[Life of a Bead](./life-of-a-bead.md)** — create → hook → claim →
+    execute → close
+17. **[Life of a Molecule](./life-of-a-molecule.md)** — formula parse →
+    dispatch → molecule create → step execution → completion
+
+## Document Types
+
+Gas City uses four document types (following CockroachDB's tech-note /
+RFC distinction):
+
+| Type | Directory | Purpose | Lifecycle |
+|---|---|---|---|
+| Architecture doc | `engdocs/architecture/` | How it works **now** | Living; update when code changes |
+| Design doc | `engdocs/design/` | How we **want** it to work | Proposal → accepted → implemented → obsolete |
+| Reference doc | `docs/reference/` | Exhaustive lookup (CLI, config, API) | Must stay in sync; partially generated |
+| Tutorial | `docs/tutorials/` | Learning path with exercises | Ordered progression |
+
+## Conventions
+
+- **Code references** use repo-relative paths: `internal/beads/store.go`
+- **Cross-references** use descriptive link text explaining why you'd
+  follow the link
+- **No role names** in examples — Gas City has zero hardcoded roles
+- **Invariants** are stated as testable assertions
+- **Update date** at the top of each doc tracks when it was last
+  verified against code

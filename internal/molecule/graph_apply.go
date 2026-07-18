@@ -1,0 +1,537 @@
+package molecule
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"os"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/formula"
+)
+
+// graphApplyEnabled controls whether Instantiate uses the GraphApplyStore
+// batch path. When false, falls back to sequential bead creation.
+// Set by the daemon config loader from [daemon] formula_v2.
+//
+// Stored as atomic.Bool so config reload can race safely with in-flight
+// instantiation. Each instantiate call snapshots the value once via
+// IsGraphApplyEnabled.
+var graphApplyEnabled atomic.Bool
+
+// SetGraphApplyEnabled sets the graph-apply batch instantiation flag. Safe
+// for concurrent use with IsGraphApplyEnabled; intended for the daemon
+// config loader and tests.
+func SetGraphApplyEnabled(v bool) {
+	graphApplyEnabled.Store(v)
+}
+
+// IsGraphApplyEnabled reports whether graph-apply batch instantiation is
+// allowed. Safe for concurrent use.
+func IsGraphApplyEnabled() bool {
+	return graphApplyEnabled.Load()
+}
+
+func graphApplyTracef(format string, args ...any) {
+	path := os.Getenv("GC_SLING_TRACE")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()                                                                                    //nolint:errcheck // best-effort trace log
+	fmt.Fprintf(f, "%s %s\n", time.Now().UTC().Format(time.RFC3339Nano), fmt.Sprintf(format, args...)) //nolint:errcheck
+}
+
+func instantiateViaGraphApply(ctx context.Context, applier beads.GraphApplyStore, recipe *formula.Recipe, opts Options) (*Result, error) {
+	graphApplyTracef("graph-apply enter recipe=%s applier=%T", recipe.Name, applier)
+	plan, graphWorkflow, rootKey, err := buildRecipeApplyPlan(recipe, opts)
+	if err != nil {
+		graphApplyTracef("graph-apply plan-error recipe=%s err=%v", recipe.Name, err)
+		return nil, err
+	}
+	applied, err := applier.ApplyGraphPlan(ctx, plan)
+	if err != nil {
+		graphApplyTracef("graph-apply apply-error recipe=%s err=%v", recipe.Name, err)
+		return nil, err
+	}
+	if err := beads.ValidateGraphApplyResult(plan, applied); err != nil {
+		graphApplyTracef("graph-apply validate-error recipe=%s err=%v", recipe.Name, err)
+		return nil, err
+	}
+	graphApplyTracef("graph-apply applied recipe=%s nodes=%d", recipe.Name, len(applied.IDs))
+	rootID := applied.IDs[rootKey]
+	if rootID == "" {
+		return nil, fmt.Errorf("graph apply result missing root ID for %q", rootKey)
+	}
+	return &Result{
+		RootID:        rootID,
+		GraphWorkflow: graphWorkflow,
+		IDMapping:     applied.IDs,
+		Created:       len(applied.IDs),
+	}, nil
+}
+
+func isTransientGraphApplyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	if !isGraphApplyErrorText(text) {
+		return false
+	}
+	return strings.Contains(text, "i/o timeout") ||
+		strings.Contains(text, "timed out after") ||
+		strings.Contains(text, "deadline exceeded") ||
+		strings.Contains(text, "invalid connection") ||
+		strings.Contains(text, "bad connection") ||
+		strings.Contains(text, "connection reset") ||
+		strings.Contains(text, "broken pipe")
+}
+
+func isGraphApplyErrorText(text string) bool {
+	return strings.Contains(text, "bd create --graph") ||
+		strings.Contains(text, "native graph apply") ||
+		strings.Contains(text, "failed to check for dependency cycle") ||
+		strings.Contains(text, "graph create: adding edge") ||
+		strings.Contains(text, "adding edge ")
+}
+
+func instantiateFragmentViaGraphApply(ctx context.Context, store beads.Store, applier beads.GraphApplyStore, recipe *formula.FragmentRecipe, opts FragmentOptions) (*FragmentResult, error) {
+	graphApplyTracef("graph-apply fragment-enter root=%s applier=%T", opts.RootID, applier)
+	plan, err := buildFragmentApplyPlan(store, recipe, opts)
+	if err != nil {
+		graphApplyTracef("graph-apply fragment-plan-error root=%s err=%v", opts.RootID, err)
+		return nil, err
+	}
+	applied, err := applier.ApplyGraphPlan(ctx, plan)
+	if err != nil {
+		graphApplyTracef("graph-apply fragment-apply-error root=%s err=%v", opts.RootID, err)
+		return nil, err
+	}
+	if err := beads.ValidateGraphApplyResult(plan, applied); err != nil {
+		graphApplyTracef("graph-apply fragment-validate-error root=%s err=%v", opts.RootID, err)
+		return nil, err
+	}
+	graphApplyTracef("graph-apply fragment-applied root=%s nodes=%d", opts.RootID, len(applied.IDs))
+	return &FragmentResult{
+		IDMapping: applied.IDs,
+		Created:   len(applied.IDs),
+	}, nil
+}
+
+func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApplyPlan, bool, string, error) {
+	if recipe == nil {
+		return nil, false, "", fmt.Errorf("recipe is nil")
+	}
+	if len(recipe.Steps) == 0 {
+		return nil, false, "", fmt.Errorf("recipe %q has no steps", recipe.Name)
+	}
+
+	vars := applyVarDefaults(opts.Vars, recipe.Vars)
+	priorityOverride := clonePriority(opts.PriorityOverride)
+	graphWorkflow := preservesGraphActionTypes(recipe)
+	rootKey := recipe.Steps[0].ID
+	rootIncluded := false
+	externalDepsByStep, err := groupExternalDeps(opts.ExternalDeps)
+	if err != nil {
+		return nil, false, "", err
+	}
+	recipeParentByStep := recipeParentDeps(recipe.Deps)
+
+	plan := &beads.GraphApplyPlan{
+		CommitMessage: fmt.Sprintf("gc: instantiate %s", recipe.Name),
+		Nodes:         make([]beads.GraphApplyNode, 0, len(recipe.Steps)),
+		Edges:         make([]beads.GraphApplyEdge, 0, len(recipe.Deps)+len(opts.ExternalDeps)),
+	}
+
+	for i, step := range recipe.Steps {
+		if recipe.RootOnly && i > 0 {
+			break
+		}
+		node, err := recipeStepToGraphNode(step, vars, priorityOverride)
+		if err != nil {
+			return nil, false, "", err
+		}
+		if opts.DeferAssignees {
+			deferGraphNodeRouting(&node)
+		}
+		if step.IsRoot {
+			rootIncluded = true
+			if !opts.PreserveRootType && !preserveExecutableRootType(step) {
+				node.Type = "molecule"
+			}
+			if opts.Title != "" {
+				node.Title = formula.Substitute(opts.Title, vars)
+			}
+			if opts.ParentID != "" && step.Metadata[beadmeta.KindMetadataKey] != beadmeta.KindWorkflow {
+				node.ParentID = opts.ParentID
+			}
+			if opts.IdempotencyKey != "" {
+				if node.Metadata == nil {
+					node.Metadata = make(map[string]string, 1)
+				}
+				node.Metadata["idempotency_key"] = opts.IdempotencyKey
+			}
+			if len(vars) > 0 {
+				if node.Metadata == nil {
+					node.Metadata = make(map[string]string, len(vars))
+				}
+				for k, v := range vars {
+					if v != "" {
+						node.Metadata[formulaVarMetadataPrefix+k] = v
+					}
+				}
+			}
+			if recipe.ContentHash != "" {
+				if node.Metadata == nil {
+					node.Metadata = make(map[string]string, 2)
+				}
+				node.Metadata[beadmeta.FormulaHashMetadataKey] = recipe.ContentHash
+			}
+			if recipe.FormulaSource != "" {
+				if node.Metadata == nil {
+					node.Metadata = make(map[string]string, 1)
+				}
+				node.Metadata[beadmeta.FormulaSourceMetadataKey] = recipe.FormulaSource
+			}
+		} else {
+			// graph.v2 workflows and their retry/Ralph attempt sub-recipes
+			// use step beads as independently routable actionable work, not
+			// scaffolding — skip the #1039 coercion so Ready() still surfaces
+			// them for worker claim.
+			if !graphWorkflow {
+				node.Type = nonRootStepBeadType(node.Type)
+			}
+			if node.Metadata == nil {
+				node.Metadata = make(map[string]string, 1)
+			}
+			if node.Metadata[beadmeta.StepRefMetadataKey] == "" {
+				node.Metadata[beadmeta.StepRefMetadataKey] = step.ID
+			}
+			if (graphWorkflow || step.Metadata[beadmeta.KindMetadataKey] != "") && node.Metadata[beadmeta.RootBeadIDMetadataKey] == "" {
+				if node.MetadataRefs == nil {
+					node.MetadataRefs = make(map[string]string, 1)
+				}
+				node.MetadataRefs[beadmeta.RootBeadIDMetadataKey] = rootKey
+			}
+			if logicalStepID, ok := logicalRecipeStepID(step); ok {
+				if node.MetadataRefs == nil {
+					node.MetadataRefs = make(map[string]string, 1)
+				}
+				node.MetadataRefs[beadmeta.LogicalBeadIDMetadataKey] = logicalStepID
+			}
+			if node.Assignee != "" {
+				node.AssignAfterCreate = true
+			}
+		}
+		for _, dep := range externalDepsByStep[step.ID] {
+			if dep.Type == "parent-child" && recipeParentByStep[step.ID] != "" {
+				continue
+			}
+			if dep.Type == "parent-child" {
+				node.ParentID = dep.DependsOnID
+			}
+			plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
+				FromKey: step.ID,
+				ToID:    dep.DependsOnID,
+				Type:    dep.Type,
+			})
+		}
+		// Same residual-var guard as Instantiate — see #618.
+		if strings.Contains(node.Title, "{{") {
+			if residual := formula.CheckResidualVars(node.Title); len(residual) > 0 {
+				return nil, false, "", fmt.Errorf("step %q: bead title contains unresolved variable(s) %s — missing or misspelled --var(s)?", step.ID, strings.Join(residual, ", "))
+			}
+		}
+		if err := validateTimeoutMetadataVars(step.ID, node.Metadata); err != nil {
+			return nil, false, "", err
+		}
+
+		plan.Nodes = append(plan.Nodes, node)
+	}
+	if !rootIncluded {
+		return nil, false, "", fmt.Errorf("recipe %q root step was not included", recipe.Name)
+	}
+
+	included := make(map[string]bool, len(plan.Nodes))
+	for _, node := range plan.Nodes {
+		included[node.Key] = true
+	}
+
+	for _, dep := range recipe.Deps {
+		if !included[dep.StepID] || !included[dep.DependsOnID] {
+			continue
+		}
+		plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
+			FromKey:  dep.StepID,
+			ToKey:    dep.DependsOnID,
+			Type:     dep.Type,
+			Metadata: dep.Metadata,
+		})
+		if dep.Type == "parent-child" {
+			setNodeParentRef(plan.Nodes, dep.StepID, dep.DependsOnID, "")
+		}
+	}
+
+	// Connect non-root steps to the root via a non-blocking dependency so
+	// bd delete --cascade from the root still discovers all workflow beads
+	// through the dependency graph without making the workflow root a
+	// readiness blocker for finalizers and teardown work.
+	if graphWorkflow && rootKey != "" {
+		singleStep := graphWorkflowIsSingleStep(plan.Nodes, rootKey)
+		for _, node := range plan.Nodes {
+			if node.Key == rootKey {
+				continue
+			}
+			// Single-step workflows deadlock if the generated workflow-finalize
+			// gains a "tracks" edge back to the root: the compiler already emits
+			// root --blocks--> workflow-finalize (addWorkflowRootDeps), so a
+			// workflow-finalize --tracks--> root edge closes a mutual finalize
+			// <-> root cycle that neither controller-managed bead can ever
+			// break — both stay open forever (su-mla5h). The root already
+			// reaches the finalizer through that blocks edge and the finalizer
+			// carries gc.root_bead_id, so the ownership tracks edge is redundant
+			// here. Multi-step workflows keep the tracks edge unchanged.
+			if singleStep && node.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflowFinalize {
+				continue
+			}
+			if graphApplyPlanHasEdgeFromKeyToTarget(plan.Edges, node.Key, rootKey, "") {
+				continue
+			}
+			plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
+				FromKey: node.Key,
+				ToKey:   rootKey,
+				Type:    "tracks",
+			})
+		}
+	}
+
+	return plan, graphWorkflow, rootKey, nil
+}
+
+func deferGraphNodeRouting(node *beads.GraphApplyNode) {
+	if node.Assignee != "" {
+		ensureGraphNodeMetadata(node)
+		node.Metadata[DeferredAssigneeMetadataKey] = node.Assignee
+		node.Assignee = ""
+		node.AssignAfterCreate = false
+	}
+	deferGraphNodeMetadataValue(node, beadmeta.RoutedToMetadataKey, DeferredRoutedToMetadataKey)
+	deferGraphNodeMetadataValue(node, beadmeta.ExecutionRoutedToMetadataKey, DeferredExecutionRoutedToMetadataKey)
+}
+
+func deferGraphNodeMetadataValue(node *beads.GraphApplyNode, sourceKey, deferredKey string) {
+	if node.Metadata == nil {
+		return
+	}
+	if value := node.Metadata[sourceKey]; value != "" {
+		node.Metadata[deferredKey] = value
+		delete(node.Metadata, sourceKey)
+	}
+}
+
+func ensureGraphNodeMetadata(node *beads.GraphApplyNode) {
+	if node.Metadata == nil {
+		node.Metadata = make(map[string]string, 1)
+	}
+}
+
+// graphWorkflowIsSingleStep reports whether a graph workflow plan carries a
+// single worker-executed step. Control beads (workflow-finalize, scope-check,
+// fanout, ...) and spec sidecars are compiler-generated scaffolding, not
+// authored work, so they are excluded from the count. A single-step workflow
+// is the shape that deadlocks on the generated finalize <-> root edge pair
+// (su-mla5h).
+func graphWorkflowIsSingleStep(nodes []beads.GraphApplyNode, rootKey string) bool {
+	workSteps := 0
+	for _, node := range nodes {
+		if node.Key == rootKey {
+			continue
+		}
+		kind := node.Metadata[beadmeta.KindMetadataKey]
+		if beadmeta.IsControlKind(kind) || kind == beadmeta.KindSpec {
+			continue
+		}
+		workSteps++
+		if workSteps > 1 {
+			return false
+		}
+	}
+	return workSteps == 1
+}
+
+func graphApplyPlanHasEdgeFromKeyToTarget(edges []beads.GraphApplyEdge, fromKey, toKey, toID string) bool {
+	for _, edge := range edges {
+		if edge.FromKey != fromKey {
+			continue
+		}
+		if toKey != "" && edge.ToKey == toKey {
+			return true
+		}
+		if toID != "" && edge.ToID == toID {
+			return true
+		}
+	}
+	return false
+}
+
+func buildFragmentApplyPlan(store beads.Store, recipe *formula.FragmentRecipe, opts FragmentOptions) (*beads.GraphApplyPlan, error) {
+	if recipe == nil {
+		return nil, fmt.Errorf("recipe is nil")
+	}
+	if opts.RootID == "" {
+		return nil, fmt.Errorf("fragment instantiation requires RootID")
+	}
+	if len(recipe.Steps) == 0 {
+		return &beads.GraphApplyPlan{}, nil
+	}
+
+	existingLogicalBeadIDs, err := existingLogicalBeadIDIndex(store, opts.RootID)
+	if err != nil {
+		return nil, fmt.Errorf("indexing existing logical beads: %w", err)
+	}
+	priorityOverride := clonePriority(opts.PriorityOverride)
+	if priorityOverride == nil {
+		root, err := store.Get(opts.RootID)
+		if err != nil {
+			return nil, fmt.Errorf("loading root bead %s: %w", opts.RootID, err)
+		}
+		priorityOverride = clonePriority(root.Priority)
+	}
+	vars := applyVarDefaults(opts.Vars, recipe.Vars)
+	externalDepsByStep, err := groupExternalDeps(opts.ExternalDeps)
+	if err != nil {
+		return nil, err
+	}
+	recipeParentByStep := recipeParentDeps(recipe.Deps)
+
+	plan := &beads.GraphApplyPlan{
+		CommitMessage: fmt.Sprintf("gc: instantiate fragment into %s", opts.RootID),
+		Nodes:         make([]beads.GraphApplyNode, 0, len(recipe.Steps)),
+		Edges:         make([]beads.GraphApplyEdge, 0, len(recipe.Deps)+len(opts.ExternalDeps)),
+	}
+
+	for _, step := range recipe.Steps {
+		node, err := recipeStepToGraphNode(step, vars, priorityOverride)
+		if err != nil {
+			return nil, err
+		}
+		// Fragment entries stay "task" — unlike formula scaffolding steps,
+		// fanout-expanded fragment nodes are actionable work that pool
+		// workers claim from `bd ready`. Do not apply nonRootStepBeadType
+		// here (#1039).
+		if node.Metadata == nil {
+			node.Metadata = make(map[string]string, 2)
+		}
+		if node.Metadata[beadmeta.StepRefMetadataKey] == "" {
+			node.Metadata[beadmeta.StepRefMetadataKey] = step.ID
+		}
+		node.Metadata[beadmeta.RootBeadIDMetadataKey] = opts.RootID
+		if logicalStepID, ok := logicalRecipeStepID(step); ok {
+			if existingLogicalBeadID := existingLogicalBeadIDs[logicalStepID]; existingLogicalBeadID != "" {
+				node.Metadata[beadmeta.LogicalBeadIDMetadataKey] = existingLogicalBeadID
+			} else {
+				if node.MetadataRefs == nil {
+					node.MetadataRefs = make(map[string]string, 1)
+				}
+				node.MetadataRefs[beadmeta.LogicalBeadIDMetadataKey] = logicalStepID
+			}
+		}
+		if node.Assignee != "" {
+			node.AssignAfterCreate = true
+		}
+		for _, dep := range externalDepsByStep[step.ID] {
+			if dep.Type == "parent-child" && recipeParentByStep[step.ID] != "" {
+				continue
+			}
+			if dep.Type == "parent-child" {
+				node.ParentID = dep.DependsOnID
+			}
+			plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
+				FromKey: step.ID,
+				ToID:    dep.DependsOnID,
+				Type:    dep.Type,
+			})
+		}
+		// Same residual-var guard as buildRecipeApplyPlan — see #618.
+		if strings.Contains(node.Title, "{{") {
+			if residual := formula.CheckResidualVars(node.Title); len(residual) > 0 {
+				return nil, fmt.Errorf("step %q: bead title contains unresolved variable(s) %s — missing or misspelled --var(s)?", step.ID, strings.Join(residual, ", "))
+			}
+		}
+		if err := validateTimeoutMetadataVars(step.ID, node.Metadata); err != nil {
+			return nil, err
+		}
+
+		plan.Nodes = append(plan.Nodes, node)
+	}
+
+	for _, dep := range recipe.Deps {
+		plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
+			FromKey:  dep.StepID,
+			ToKey:    dep.DependsOnID,
+			Type:     dep.Type,
+			Metadata: dep.Metadata,
+		})
+		if dep.Type == "parent-child" {
+			setNodeParentRef(plan.Nodes, dep.StepID, dep.DependsOnID, "")
+		}
+	}
+
+	// Connect fragment steps to the root via a non-blocking dependency so
+	// cascade deletion from the root still discovers them through the
+	// dependency graph without introducing artificial blockers.
+	if opts.RootID != "" {
+		for _, node := range plan.Nodes {
+			if graphApplyPlanHasEdgeFromKeyToTarget(plan.Edges, node.Key, "", opts.RootID) {
+				continue
+			}
+			plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
+				FromKey: node.Key,
+				ToID:    opts.RootID,
+				Type:    "tracks",
+			})
+		}
+	}
+
+	return plan, nil
+}
+
+func recipeStepToGraphNode(step formula.RecipeStep, vars map[string]string, priorityOverride *int) (beads.GraphApplyNode, error) { //nolint:unparam // error return reserved for future validation
+	b := stepToBead(step, vars, priorityOverride)
+	return beads.GraphApplyNode{
+		Key:         step.ID,
+		Title:       b.Title,
+		Type:        b.Type,
+		Priority:    clonePriority(b.Priority),
+		Description: b.Description,
+		Assignee:    b.Assignee,
+		From:        b.From,
+		Labels:      slices.Clone(b.Labels),
+		Metadata:    maps.Clone(b.Metadata),
+	}, nil
+}
+
+func setNodeParentRef(nodes []beads.GraphApplyNode, stepID, parentKey, parentID string) {
+	for i := range nodes {
+		if nodes[i].Key != stepID {
+			continue
+		}
+		if parentKey != "" {
+			nodes[i].ParentKey = parentKey
+			nodes[i].ParentID = ""
+		}
+		if parentID != "" {
+			nodes[i].ParentID = parentID
+		}
+		return
+	}
+}

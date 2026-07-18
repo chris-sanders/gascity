@@ -1,0 +1,640 @@
+package beads
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+)
+
+// MemStore is an in-memory Store implementation backed by a slice. It is
+// exported for use as a test double in cross-package tests. It is safe for
+// concurrent use.
+type MemStore struct {
+	condWritesStamp
+
+	mu    sync.Mutex
+	beads []Bead
+	deps  []Dep
+	seq   int
+
+	// DisableConditionalWrites makes the ConditionalWriter methods return
+	// ErrConditionalWriteUnsupported while leaving every other interface intact,
+	// so tests can drive the auto-degrade / require-fail-closed resolver cells
+	// against a store that reports incapable at runtime (no interface-stripping
+	// wrapper — see the class_store optional-capability lesson).
+	DisableConditionalWrites bool
+}
+
+var _ ConditionalAssignmentReleaser = (*MemStore)(nil)
+
+// NewMemStore returns a new empty MemStore.
+func NewMemStore() *MemStore {
+	return &MemStore{}
+}
+
+// NewMemStoreFrom returns a MemStore seeded with existing beads, deps, and
+// sequence counter. Used by FileStore to restore state from disk.
+func NewMemStoreFrom(seq int, existing []Bead, deps []Dep) *MemStore {
+	b := make([]Bead, len(existing))
+	copy(b, existing)
+	d := make([]Dep, len(deps))
+	copy(d, deps)
+	return &MemStore{seq: seq, beads: b, deps: d}
+}
+
+// restoreFrom replaces the in-memory state with the given snapshot.
+// Used by FileStore to roll back mutations when a disk flush fails.
+func (m *MemStore) restoreFrom(seq int, beads []Bead, deps []Dep) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seq = seq
+	m.beads = beads
+	m.deps = deps
+}
+
+// snapshot returns the current sequence counter, a deep copy of all beads, and
+// a copy of all deps. Used by FileStore for serialization. Caller must hold m.mu.
+func (m *MemStore) snapshot() (int, []Bead, []Dep) {
+	b := make([]Bead, len(m.beads))
+	for i, bead := range m.beads {
+		b[i] = cloneBead(bead)
+	}
+	d := make([]Dep, len(m.deps))
+	copy(d, m.deps)
+	return m.seq, b, d
+}
+
+// cloneBead returns a deep copy of a bead, cloning reference fields
+// (Metadata, Labels, Needs) to prevent shared-state races between callers
+// and the store.
+func cloneBead(b Bead) Bead {
+	b.Priority = cloneIntPtr(b.Priority)
+	b.DeferUntil = cloneTimePtr(b.DeferUntil)
+	b.IsBlocked = cloneBoolPtr(b.IsBlocked)
+	b.Metadata = maps.Clone(b.Metadata)
+	b.Labels = slices.Clone(b.Labels)
+	b.Needs = slices.Clone(b.Needs)
+	b.Dependencies = slices.Clone(b.Dependencies)
+	return b
+}
+
+// Create persists a new bead in memory with a sequential ID.
+func (m *MemStore) Create(b Bead) (Bead, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.seq++
+	b.ID = fmt.Sprintf("gc-%d", m.seq)
+	b.Status = "open"
+	if b.Type == "" {
+		b.Type = "task"
+	}
+	b.CreatedAt = time.Now()
+	b.UpdatedAt = b.CreatedAt
+	b.Revision = 1   // first version; every subsequent mutation bumps it
+	b.ClaimFence = 0 // no ownership history yet; the first claim bumps it to 1
+
+	stored := cloneBead(b)
+	m.beads = append(m.beads, stored)
+	for _, need := range stored.Needs {
+		depType := "blocks"
+		dependsOnID := need
+		if strings.Contains(need, ":") {
+			parts := strings.SplitN(need, ":", 2)
+			if parts[0] != "" && parts[1] != "" {
+				depType = parts[0]
+				dependsOnID = parts[1]
+			}
+		}
+		m.deps = append(m.deps, Dep{
+			IssueID:     stored.ID,
+			DependsOnID: dependsOnID,
+			Type:        depType,
+		})
+	}
+	return cloneBead(stored), nil
+}
+
+// indexOfLocked returns the slice index of the bead with the given ID, or -1 if
+// no bead matches. The caller must hold m.mu.
+func (m *MemStore) indexOfLocked(id string) int {
+	for i := range m.beads {
+		if m.beads[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// isOwnershipTransition reports whether an update changes a bead's ownership
+// context — an assignee change, or a reopen (closed→open, after which a fresh
+// claim starts a new ownership generation). It mirrors beads'
+// issueops.IsOwnershipTransition so the ClaimFence bump discipline matches the
+// bd-backed store. Deliberate exclusions: a close is not a transition (guarded
+// verbs reject closed rows anyway, and bumping on close would invalidate a
+// legitimate ownership snapshot for no gain); an in_progress→open change that
+// keeps the assignee is not one either — the row stays claimable only by the
+// same owner, and the eventual release bumps at the real boundary.
+func isOwnershipTransition(oldStatus, oldAssignee string, opts UpdateOpts) bool {
+	if opts.Assignee != nil && *opts.Assignee != oldAssignee {
+		return true
+	}
+	// A reopen is closed→a real non-closed status. An empty status string is not
+	// a status write beads recognizes (its IsOwnershipTransition short-circuits
+	// on statusStr == ""), so exclude it here too to keep the predicates literally
+	// aligned.
+	if opts.Status != nil && *opts.Status != "" && oldStatus == "closed" && *opts.Status != "closed" {
+		return true
+	}
+	return false
+}
+
+// applyUpdateLocked applies the non-nil fields of opts to the bead at index i,
+// stamps UpdatedAt, bumps the revision, and — when the update is an ownership
+// transition (assignee change or reopen) — bumps the ownership fence. The
+// caller must hold m.mu. It is shared by Update and UpdateIfMatch so both bump
+// identically.
+func (m *MemStore) applyUpdateLocked(i int, opts UpdateOpts) {
+	oldStatus, oldAssignee := m.beads[i].Status, m.beads[i].Assignee
+	if opts.Title != nil {
+		m.beads[i].Title = *opts.Title
+	}
+	if opts.Status != nil {
+		m.beads[i].Status = *opts.Status
+	}
+	if opts.Description != nil {
+		m.beads[i].Description = *opts.Description
+	}
+	if opts.Priority != nil {
+		m.beads[i].Priority = cloneIntPtr(opts.Priority)
+	}
+	if opts.ParentID != nil {
+		m.beads[i].ParentID = *opts.ParentID
+	}
+	if opts.Assignee != nil {
+		m.beads[i].Assignee = *opts.Assignee
+	}
+	if opts.Type != nil {
+		m.beads[i].Type = *opts.Type
+	}
+	if len(opts.Metadata) > 0 {
+		if m.beads[i].Metadata == nil {
+			m.beads[i].Metadata = make(map[string]string, len(opts.Metadata))
+		}
+		for k, v := range opts.Metadata {
+			m.beads[i].Metadata[k] = v
+		}
+	}
+	if len(opts.Labels) > 0 {
+		m.beads[i].Labels = append(m.beads[i].Labels, opts.Labels...)
+	}
+	if len(opts.RemoveLabels) > 0 {
+		remove := make(map[string]bool, len(opts.RemoveLabels))
+		for _, rl := range opts.RemoveLabels {
+			remove[rl] = true
+		}
+		filtered := m.beads[i].Labels[:0]
+		for _, l := range m.beads[i].Labels {
+			if !remove[l] {
+				filtered = append(filtered, l)
+			}
+		}
+		m.beads[i].Labels = filtered
+	}
+	m.beads[i].UpdatedAt = time.Now()
+	m.beads[i].Revision++
+	if isOwnershipTransition(oldStatus, oldAssignee, opts) {
+		m.beads[i].ClaimFence++
+	}
+}
+
+// Update modifies fields of an existing bead. Only non-nil fields in opts
+// are applied. Returns a wrapped ErrNotFound if the ID does not exist.
+func (m *MemStore) Update(id string, opts UpdateOpts) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i := m.indexOfLocked(id)
+	if i < 0 {
+		return fmt.Errorf("updating bead %q: %w", id, ErrNotFound)
+	}
+	m.applyUpdateLocked(i, opts)
+	return nil
+}
+
+// ReleaseIfCurrent clears an in-progress assignment only when the bead still
+// has the expected assignee.
+func (m *MemStore) ReleaseIfCurrent(id, expectedAssignee string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.beads {
+		if m.beads[i].ID != id {
+			continue
+		}
+		if m.beads[i].Status != "in_progress" || m.beads[i].Assignee != expectedAssignee {
+			return false, nil
+		}
+		m.beads[i].Status = "open"
+		m.beads[i].Assignee = ""
+		m.beads[i].UpdatedAt = time.Now()
+		m.beads[i].Revision++
+		m.beads[i].ClaimFence++ // clearing an owner is an ownership transition
+		return true, nil
+	}
+	return false, nil
+}
+
+// Close sets a bead's status to "closed". Returns a wrapped ErrNotFound if
+// the ID does not exist. Closing an already-closed bead is a no-op.
+func (m *MemStore) Close(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.beads {
+		if m.beads[i].ID == id {
+			if m.beads[i].Status == "closed" {
+				return nil
+			}
+			m.beads[i].Status = "closed"
+			m.beads[i].UpdatedAt = time.Now()
+			m.beads[i].Revision++
+			return nil
+		}
+	}
+	return fmt.Errorf("closing bead %q: %w", id, ErrNotFound)
+}
+
+// Reopen sets a bead's status to "open". Returns a wrapped ErrNotFound if the
+// ID does not exist.
+func (m *MemStore) Reopen(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.beads {
+		if m.beads[i].ID == id {
+			if m.beads[i].Status == "open" {
+				return nil
+			}
+			wasClosed := m.beads[i].Status == "closed"
+			m.beads[i].Status = "open"
+			m.beads[i].UpdatedAt = time.Now()
+			m.beads[i].Revision++
+			if wasClosed {
+				// closed→open starts a new ownership generation; an
+				// in_progress→open reopen keeps the same owner and is not a
+				// transition.
+				m.beads[i].ClaimFence++
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("reopening bead %q: %w", id, ErrNotFound)
+}
+
+// CloseAll closes multiple beads in a single batch and sets metadata on each.
+func (m *MemStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idSet := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		idSet[id] = true
+	}
+	closed := 0
+	for i := range m.beads {
+		if !idSet[m.beads[i].ID] || m.beads[i].Status == "closed" {
+			continue
+		}
+		m.beads[i].Status = "closed"
+		m.beads[i].UpdatedAt = time.Now()
+		m.beads[i].Revision++
+		if m.beads[i].Metadata == nil {
+			m.beads[i].Metadata = make(map[string]string, len(metadata))
+		}
+		for k, v := range metadata {
+			m.beads[i].Metadata[k] = v
+		}
+		closed++
+	}
+	return closed, nil
+}
+
+// List returns beads matching the query.
+func (m *MemStore) List(query ListQuery) ([]Bead, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !query.HasFilter() && !query.AllowScan {
+		return nil, fmt.Errorf("listing beads: %w", ErrQueryRequiresScan)
+	}
+	var result []Bead
+	for _, b := range m.beads {
+		if !query.Matches(b) {
+			continue
+		}
+		result = append(result, cloneBead(b))
+	}
+	sortBeadsForQuery(result, query.Sort)
+	if query.Limit > 0 && len(result) > query.Limit {
+		result = result[:query.Limit]
+	}
+	return result, nil
+}
+
+// ListOpen returns non-closed beads in creation order by default.
+func (m *MemStore) ListOpen(status ...string) ([]Bead, error) {
+	query := ListQuery{AllowScan: true}
+	if len(status) > 0 {
+		query.Status = status[0]
+	}
+	return m.List(query)
+}
+
+// Ready returns all open beads with no open blocking dependencies, in
+// creation order.
+func (m *MemStore) Ready(query ...ReadyQuery) ([]Bead, error) {
+	q := readyQueryFromArgs(query)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.readyLocked(context.Background(), q)
+}
+
+// ReadyContext implements ContextReadyReader for the in-memory store. Lock
+// acquisition and the projection scan both observe ctx, so a status request
+// never abandons a goroutine behind a concurrent in-memory writer.
+func (m *MemStore) ReadyContext(ctx context.Context, query ...ReadyQuery) ([]Bead, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !m.mu.TryLock() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for !m.mu.TryLock() {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-ticker.C:
+			}
+		}
+	}
+	defer m.mu.Unlock()
+	return m.readyLocked(ctx, readyQueryFromArgs(query))
+}
+
+func (m *MemStore) readyLocked(ctx context.Context, q ReadyQuery) ([]Bead, error) {
+	cancellable := ctx != nil && ctx.Done() != nil
+	contextErr := func() error {
+		if !cancellable {
+			return nil
+		}
+		return ctx.Err()
+	}
+
+	statusByID := make(map[string]string, len(m.beads))
+	for _, bead := range m.beads {
+		if err := contextErr(); err != nil {
+			return nil, err
+		}
+		statusByID[bead.ID] = bead.Status
+	}
+
+	var result []Bead
+	now := time.Now().UTC()
+	for _, b := range m.beads {
+		if err := contextErr(); err != nil {
+			return nil, err
+		}
+		if !IsReadyCandidateForTier(b, now, q.TierMode) {
+			continue
+		}
+		if q.Assignee != "" && b.Assignee != q.Assignee {
+			continue
+		}
+		blocked := false
+		for _, dep := range m.deps {
+			if err := contextErr(); err != nil {
+				return nil, err
+			}
+			if dep.IssueID != b.ID {
+				continue
+			}
+			switch dep.Type {
+			case "blocks", "waits-for", "conditional-blocks":
+			default:
+				continue
+			}
+			if statusByID[dep.DependsOnID] != "closed" {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			result = append(result, cloneBead(b))
+			if q.Limit > 0 && len(result) >= q.Limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+// Get retrieves a bead by ID. Returns a wrapped ErrNotFound if the ID does
+// not exist.
+func (m *MemStore) Get(id string) (Bead, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, b := range m.beads {
+		if b.ID == id {
+			return cloneBead(b), nil
+		}
+	}
+	return Bead{}, fmt.Errorf("getting bead %q: %w", id, ErrNotFound)
+}
+
+// Children returns all non-closed beads whose ParentID matches the given ID,
+// in creation order by default.
+func (m *MemStore) Children(parentID string, opts ...QueryOpt) ([]Bead, error) {
+	return m.List(ListQuery{
+		ParentID:      parentID,
+		IncludeClosed: HasOpt(opts, IncludeClosed),
+		Sort:          SortCreatedAsc,
+		TierMode:      TierModeFromOpts(opts),
+	})
+}
+
+// ListByLabel returns non-closed beads matching an exact label string by
+// default. Results are returned in reverse creation order (newest first).
+// Limit controls max results (0 = unlimited).
+func (m *MemStore) ListByLabel(label string, limit int, opts ...QueryOpt) ([]Bead, error) {
+	return m.List(ListQuery{
+		Label:         label,
+		Limit:         limit,
+		IncludeClosed: HasOpt(opts, IncludeClosed),
+		Sort:          SortCreatedDesc,
+		TierMode:      TierModeFromOpts(opts),
+	})
+}
+
+// ListByAssignee returns beads assigned to the given agent with the specified
+// status. Limit controls max results (0 = unlimited).
+func (m *MemStore) ListByAssignee(assignee, status string, limit int) ([]Bead, error) {
+	return m.List(ListQuery{
+		Assignee: assignee,
+		Status:   status,
+		Limit:    limit,
+		Sort:     SortCreatedDesc,
+	})
+}
+
+// ListByMetadata returns non-closed beads whose metadata contains all
+// key-value pairs in filters by default. Limit controls max results
+// (0 = unlimited).
+func (m *MemStore) ListByMetadata(filters map[string]string, limit int, opts ...QueryOpt) ([]Bead, error) {
+	return m.List(ListQuery{
+		Metadata:      filters,
+		Limit:         limit,
+		IncludeClosed: HasOpt(opts, IncludeClosed),
+		Sort:          SortCreatedDesc,
+		TierMode:      TierModeFromOpts(opts),
+	})
+}
+
+// SetMetadata sets a key-value metadata pair on a bead. Returns a wrapped
+// ErrNotFound if the bead does not exist.
+func (m *MemStore) SetMetadata(id, key, value string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, b := range m.beads {
+		if b.ID == id {
+			if b.Metadata == nil {
+				m.beads[i].Metadata = make(map[string]string)
+			}
+			m.beads[i].Metadata[key] = value
+			m.beads[i].UpdatedAt = time.Now()
+			m.beads[i].Revision++
+			return nil
+		}
+	}
+	return fmt.Errorf("setting metadata on %q: %w", id, ErrNotFound)
+}
+
+// SetMetadataBatch atomically sets multiple key-value metadata pairs on a bead.
+func (m *MemStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	if len(kvs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, b := range m.beads {
+		if b.ID == id {
+			if b.Metadata == nil {
+				m.beads[i].Metadata = make(map[string]string)
+			}
+			for k, v := range kvs {
+				m.beads[i].Metadata[k] = v
+			}
+			m.beads[i].UpdatedAt = time.Now()
+			m.beads[i].Revision++
+			return nil
+		}
+	}
+	return fmt.Errorf("setting metadata batch on %q: %w", id, ErrNotFound)
+}
+
+// Tx executes fn sequentially against the MemStore.
+func (m *MemStore) Tx(_ string, fn func(Tx) error) error {
+	return runSequentialTx(m, fn)
+}
+
+// Delete removes a bead from the in-memory store.
+func (m *MemStore) Delete(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, b := range m.beads {
+		if b.ID == id {
+			m.beads = append(m.beads[:i], m.beads[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("deleting bead %q: %w", id, ErrNotFound)
+}
+
+// Ping always succeeds for MemStore (in-memory, always available).
+func (m *MemStore) Ping() error {
+	return nil
+}
+
+// DepAdd records a dependency: issueID depends on dependsOnID.
+func (m *MemStore) DepAdd(issueID, dependsOnID, depType string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, d := range m.deps {
+		if d.IssueID == issueID && d.DependsOnID == dependsOnID && d.Type == depType {
+			return nil
+		}
+		if d.IssueID == issueID && d.DependsOnID == dependsOnID && d.Type != "parent-child" && depType != "parent-child" {
+			m.deps[i].Type = depType
+			return nil
+		}
+	}
+	m.deps = append(m.deps, Dep{
+		IssueID:     issueID,
+		DependsOnID: dependsOnID,
+		Type:        depType,
+	})
+	return nil
+}
+
+// DepRemove removes a dependency between two beads.
+func (m *MemStore) DepRemove(issueID, dependsOnID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, d := range m.deps {
+		if d.IssueID == issueID && d.DependsOnID == dependsOnID {
+			m.deps = append(m.deps[:i], m.deps[i+1:]...)
+			return nil
+		}
+	}
+	return nil // removing nonexistent dep is a no-op
+}
+
+// DepList returns dependencies for a bead. Direction "down" (default)
+// returns what this bead depends on; "up" returns what depends on this bead.
+func (m *MemStore) DepList(id, direction string) ([]Dep, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []Dep
+	for _, d := range m.deps {
+		switch direction {
+		case "up":
+			if d.DependsOnID == id {
+				result = append(result, d)
+			}
+		default: // "down" or empty
+			if d.IssueID == id {
+				result = append(result, d)
+			}
+		}
+	}
+	return result, nil
+}
+
+// DepListBatch returns "down" dependencies for multiple beads from memory.
+func (m *MemStore) DepListBatch(ids []string) (map[string][]Dep, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idSet := make(map[string]struct{}, len(ids))
+	result := make(map[string][]Dep, len(ids))
+	for _, id := range ids {
+		idSet[id] = struct{}{}
+	}
+	for _, d := range m.deps {
+		if _, ok := idSet[d.IssueID]; ok {
+			result[d.IssueID] = append(result[d.IssueID], d)
+		}
+	}
+	return result, nil
+}

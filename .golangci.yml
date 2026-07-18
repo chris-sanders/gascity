@@ -1,0 +1,74 @@
+version: "2"
+
+severity:
+  default: error
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+
+linters:
+  # Default linters (errcheck, govet, ineffassign, staticcheck, unused)
+  # are always enabled. Add extras here.
+  enable:
+    - errorlint
+    - misspell
+    - gocritic
+    - revive
+    - unconvert
+    - unparam
+
+  settings:
+    misspell:
+      locale: US
+
+  exclusions:
+    rules:
+      # runtime shadows stdlib but is isolated to internal/.
+      - path: internal/runtime/
+        linters:
+          - revive
+        text: "var-naming"
+      # exec is an established package name — renaming would break imports.
+      - path: internal/runtime/exec/
+        linters:
+          - revive
+        text: "var-naming"
+      - path: internal/beads/exec/
+        linters:
+          - revive
+        text: "var-naming"
+      # api is an established package name for the HTTP API server.
+      - path: internal/api/
+        linters:
+          - revive
+        text: "var-naming"
+      # mail is an established package name — renaming would break imports.
+      - path: internal/mail/
+        linters:
+          - revive
+        text: "var-naming"
+      # extmsg is an established package name for external messaging.
+      - path: internal/extmsg/
+        linters:
+          - revive
+        text: "var-naming"
+      # These domain packages intentionally use package-qualified exported names
+      # (for example sling.SlingResult) to keep adapter call sites explicit.
+      - path: internal/convoy/
+        linters:
+          - revive
+        text: "stutters"
+      - path: internal/graphroute/
+        linters:
+          - revive
+        text: "stutters"
+      - path: internal/sling/
+        linters:
+          - revive
+        text: "stutters"

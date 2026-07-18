@@ -1,0 +1,540 @@
+package doctor
+
+import (
+	"bytes"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+// mockCheck is a configurable Check for testing the runner.
+type mockCheck struct {
+	name     string
+	status   CheckStatus
+	severity CheckSeverity
+	msg      string
+	canFix   bool
+	fixErr   error
+	fixed    bool // set by Fix
+}
+
+func (m *mockCheck) Name() string { return m.name }
+func (m *mockCheck) Run(_ *CheckContext) *CheckResult {
+	st := m.status
+	if m.fixed {
+		st = StatusOK
+	}
+	return &CheckResult{
+		Name:     m.name,
+		Status:   st,
+		Severity: m.severity,
+		Message:  m.msg,
+	}
+}
+func (m *mockCheck) CanFix() bool { return m.canFix }
+func (m *mockCheck) Fix(_ *CheckContext) error {
+	if m.fixErr != nil {
+		return m.fixErr
+	}
+	m.fixed = true
+	return nil
+}
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
+func (m *mockCheck) WarmupEligible() bool { return false }
+
+func TestCheckWarmupEligibleDefaultsFalse(t *testing.T) {
+	checks := []Check{
+		&AgentSessionsCheck{},
+		&BDSplitStoreCheck{},
+		&BdBackupSizeCheck{},
+		&BeadsRoleCheck{},
+		&BeadsStoreCheck{},
+		&BinaryCheck{},
+		&BuiltinPackFamilyCheck{},
+		&CityConfigCheck{},
+		&CityStructureCheck{},
+		&ConfigRefsCheck{},
+		&ConfigSemanticsCheck{},
+		&ConfigValidCheck{},
+		&ControllerCheck{},
+		&CustomTypesCheck{},
+		&DeprecatedAttachmentFieldsCheck{},
+		&DoltConfigCheck{},
+		&DoltNomsSizeCheck{},
+		&DoltServerCheck{},
+		&DoltVersionCheck{},
+		&DurationRangeCheck{},
+		&EventLogSizeCheck{},
+		&EventsLogCheck{},
+		&ImplicitImportCacheCheck{},
+		&NestedWorktreePruneCheck{},
+		&OrphanSessionsCheck{},
+		&OrderFiringCurrentCheck{},
+		&PackCacheCheck{},
+		&PreStartScriptsCheck{},
+		&ProviderParityCheck{},
+		&RigBeadsCheck{},
+		&RigDoltServerCheck{},
+		&RigGitCheck{},
+		&RigPathCheck{},
+		&SkillCollisionCheck{},
+		&WorktreeCheck{},
+		&WorktreeDiskSizeCheck{},
+		&ZombieSessionsCheck{},
+	}
+
+	for _, c := range checks {
+		t.Run(fmt.Sprintf("%T", c), func(t *testing.T) {
+			if c.WarmupEligible() {
+				t.Errorf("%T.WarmupEligible() = true, want false", c)
+			}
+		})
+	}
+
+	t.Run("pack_script_check_default_false", func(t *testing.T) {
+		c := &PackScriptCheck{CheckName: "x:y"}
+		if c.WarmupEligible() {
+			t.Error("zero-value PackScriptCheck.WarmupEligible() = true, want false")
+		}
+	})
+
+	t.Run("pack_script_check_opted_in", func(t *testing.T) {
+		c := &PackScriptCheck{CheckName: "x:y", Warmup: true}
+		if !c.WarmupEligible() {
+			t.Error("PackScriptCheck{Warmup: true}.WarmupEligible() = false, want true")
+		}
+	})
+}
+
+func TestDoctor_AllPass(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&mockCheck{name: "a", status: StatusOK, msg: "ok"})
+	d.Register(&mockCheck{name: "b", status: StatusOK, msg: "ok"})
+
+	var buf bytes.Buffer
+	r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, false)
+
+	if r.Passed != 2 {
+		t.Errorf("Passed = %d, want 2", r.Passed)
+	}
+	if r.Warned != 0 || r.Failed != 0 || r.Fixed != 0 {
+		t.Errorf("unexpected counts: warned=%d failed=%d fixed=%d", r.Warned, r.Failed, r.Fixed)
+	}
+	if !strings.Contains(buf.String(), "✓ a") {
+		t.Errorf("output missing check a: %q", buf.String())
+	}
+}
+
+func TestDoctor_MixedResults(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&mockCheck{name: "ok-check", status: StatusOK, msg: "fine"})
+	d.Register(&mockCheck{name: "warn-check", status: StatusWarning, msg: "hmm"})
+	d.Register(&mockCheck{name: "fail-check", status: StatusError, msg: "bad"})
+
+	var buf bytes.Buffer
+	r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, false)
+
+	if r.Passed != 1 {
+		t.Errorf("Passed = %d, want 1", r.Passed)
+	}
+	if r.Warned != 1 {
+		t.Errorf("Warned = %d, want 1", r.Warned)
+	}
+	if r.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", r.Failed)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "✓ ok-check") {
+		t.Errorf("missing ok icon: %q", out)
+	}
+	if !strings.Contains(out, "⚠ warn-check") {
+		t.Errorf("missing warning icon: %q", out)
+	}
+	if !strings.Contains(out, "✗ fail-check") {
+		t.Errorf("missing error icon: %q", out)
+	}
+}
+
+func TestDoctor_FixFlow(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&mockCheck{name: "fixable", status: StatusWarning, msg: "problem", canFix: true})
+
+	var buf bytes.Buffer
+	r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, true)
+
+	if r.Fixed != 1 {
+		t.Errorf("Fixed = %d, want 1", r.Fixed)
+	}
+	if r.Passed != 1 {
+		t.Errorf("Passed = %d, want 1 (fixed counts as passed)", r.Passed)
+	}
+	if !strings.Contains(buf.String(), "(fixed)") {
+		t.Errorf("output missing (fixed): %q", buf.String())
+	}
+}
+
+func TestDoctor_FixNotRequested(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&mockCheck{name: "fixable", status: StatusWarning, msg: "problem", canFix: true})
+
+	var buf bytes.Buffer
+	r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, false)
+
+	if r.Fixed != 0 {
+		t.Errorf("Fixed = %d, want 0 (fix not requested)", r.Fixed)
+	}
+	if r.Warned != 1 {
+		t.Errorf("Warned = %d, want 1", r.Warned)
+	}
+}
+
+func TestDoctor_FixFails(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&mockCheck{
+		name: "broken-fix", status: StatusError, msg: "bad",
+		canFix: true, fixErr: fmt.Errorf("fix failed"),
+	})
+
+	var buf bytes.Buffer
+	r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, true)
+
+	if r.Fixed != 0 {
+		t.Errorf("Fixed = %d, want 0 (fix errored)", r.Fixed)
+	}
+	if r.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", r.Failed)
+	}
+	if !strings.Contains(buf.String(), "fix failed: fix failed") {
+		t.Errorf("output missing fix error: %q", buf.String())
+	}
+}
+
+func TestDoctor_FixSucceedsButCheckStillFails(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&unchangedFixCheck{})
+
+	var buf bytes.Buffer
+	r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, true)
+
+	if r.Fixed != 0 {
+		t.Errorf("Fixed = %d, want 0", r.Fixed)
+	}
+	if r.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", r.Failed)
+	}
+	if !strings.Contains(buf.String(), "fix attempted; check still failing") {
+		t.Errorf("output missing fix-attempt signal: %q", buf.String())
+	}
+}
+
+func TestDoctor_NoChecks(t *testing.T) {
+	d := &Doctor{}
+	var buf bytes.Buffer
+	r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, false)
+
+	if r.Passed != 0 || r.Warned != 0 || r.Failed != 0 || r.Fixed != 0 {
+		t.Errorf("empty doctor should have all zeros: %+v", r)
+	}
+}
+
+func TestDoctor_VerboseDetails(t *testing.T) {
+	d := &Doctor{}
+	c := &mockCheck{name: "detail-check", status: StatusOK, msg: "ok"}
+	d.Register(c)
+
+	// We need a check that returns details — override with a custom one.
+	d2 := &Doctor{}
+	d2.Register(&detailCheck{})
+
+	var buf bytes.Buffer
+	d2.Run(&CheckContext{CityPath: "/tmp", Verbose: true}, &buf, false)
+
+	if !strings.Contains(buf.String(), "extra info") {
+		t.Errorf("verbose output missing details: %q", buf.String())
+	}
+}
+
+func TestDoctor_VerboseHidden(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&detailCheck{})
+
+	var buf bytes.Buffer
+	d.Run(&CheckContext{CityPath: "/tmp", Verbose: false}, &buf, false)
+
+	if strings.Contains(buf.String(), "extra info") {
+		t.Errorf("non-verbose output should hide details: %q", buf.String())
+	}
+}
+
+func TestPrintSummary(t *testing.T) {
+	tests := []struct {
+		name   string
+		report *Report
+		want   string
+	}{
+		{"all pass", &Report{Passed: 3}, "3 passed"},
+		{"mixed", &Report{Passed: 2, Warned: 1, Failed: 1}, "2 passed, 1 warnings, 1 failed"},
+		{"with fixes", &Report{Passed: 2, Fixed: 1}, "2 passed, 1 fixed"},
+		{"empty", &Report{}, "No checks ran."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			PrintSummary(&buf, tt.report)
+			if !strings.Contains(buf.String(), tt.want) {
+				t.Errorf("summary = %q, want to contain %q", buf.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestDoctor_ReportResultsInOrder(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&mockCheck{name: "first", status: StatusOK, msg: "fine"})
+	d.Register(&mockCheck{name: "second", status: StatusWarning, msg: "hmm"})
+	d.Register(&mockCheck{name: "third", status: StatusError, msg: "bad"})
+
+	var buf bytes.Buffer
+	r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, false)
+
+	if len(r.Results) != 3 {
+		t.Fatalf("Results length = %d, want 3", len(r.Results))
+	}
+	names := []string{r.Results[0].Name, r.Results[1].Name, r.Results[2].Name}
+	want := []string{"first", "second", "third"}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("Results[%d].Name = %q, want %q", i, names[i], want[i])
+		}
+	}
+}
+
+func TestDoctor_RunCollectSuppressesStreaming(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&mockCheck{name: "silent", status: StatusError, msg: "bad"})
+
+	r := d.RunCollect(&CheckContext{CityPath: "/tmp"}, false)
+
+	if len(r.Results) != 1 || r.Results[0].Name != "silent" {
+		t.Fatalf("Results = %#v, want one result named 'silent'", r.Results)
+	}
+	if r.Failed != 1 {
+		t.Errorf("Failed = %d, want 1", r.Failed)
+	}
+}
+
+func TestDoctor_FixHint(t *testing.T) {
+	d := &Doctor{}
+	d.Register(&hintCheck{})
+
+	var buf bytes.Buffer
+	d.Run(&CheckContext{CityPath: "/tmp"}, &buf, false)
+
+	if !strings.Contains(buf.String(), "hint: try this") {
+		t.Errorf("output missing fix hint: %q", buf.String())
+	}
+}
+
+// detailCheck returns a result with Details for verbose testing.
+type detailCheck struct{}
+
+func (c *detailCheck) Name() string { return "detail-check" }
+func (c *detailCheck) Run(_ *CheckContext) *CheckResult {
+	return &CheckResult{
+		Name:    "detail-check",
+		Status:  StatusOK,
+		Message: "ok",
+		Details: []string{"extra info"},
+	}
+}
+func (c *detailCheck) CanFix() bool              { return false }
+func (c *detailCheck) Fix(_ *CheckContext) error { return nil }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
+func (c *detailCheck) WarmupEligible() bool { return false }
+
+// hintCheck returns a failing result with a FixHint.
+type hintCheck struct{}
+
+func (c *hintCheck) Name() string { return "hint-check" }
+func (c *hintCheck) Run(_ *CheckContext) *CheckResult {
+	return &CheckResult{
+		Name:    "hint-check",
+		Status:  StatusError,
+		Message: "problem",
+		FixHint: "try this",
+	}
+}
+func (c *hintCheck) CanFix() bool              { return false }
+func (c *hintCheck) Fix(_ *CheckContext) error { return nil }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
+func (c *hintCheck) WarmupEligible() bool { return false }
+
+type unchangedFixCheck struct{}
+
+func (c *unchangedFixCheck) Name() string { return "unchanged-fix" }
+func (c *unchangedFixCheck) Run(_ *CheckContext) *CheckResult {
+	return &CheckResult{
+		Name:    "unchanged-fix",
+		Status:  StatusError,
+		Message: "still bad",
+	}
+}
+func (c *unchangedFixCheck) CanFix() bool              { return true }
+func (c *unchangedFixCheck) Fix(_ *CheckContext) error { return nil }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
+func (c *unchangedFixCheck) WarmupEligible() bool { return false }
+
+// TestDoctor_BlockingFailedSeverityAccounting exercises the per-severity
+// counters added so dispatch gates can ignore advisory failures.
+func TestDoctor_BlockingFailedSeverityAccounting(t *testing.T) {
+	tests := []struct {
+		name              string
+		checks            []Check
+		wantPassed        int
+		wantFailed        int
+		wantBlockingFails int
+	}{
+		{
+			name:              "pure-ok",
+			checks:            []Check{&mockCheck{name: "a", status: StatusOK, msg: "ok"}},
+			wantPassed:        1,
+			wantFailed:        0,
+			wantBlockingFails: 0,
+		},
+		{
+			name:              "blocking-error",
+			checks:            []Check{&mockCheck{name: "blocker", status: StatusError, severity: SeverityBlocking, msg: "blocked"}},
+			wantPassed:        0,
+			wantFailed:        1,
+			wantBlockingFails: 1,
+		},
+		{
+			name:              "advisory-error",
+			checks:            []Check{&mockCheck{name: "advisor", status: StatusError, severity: SeverityAdvisory, msg: "info"}},
+			wantPassed:        0,
+			wantFailed:        1,
+			wantBlockingFails: 0,
+		},
+		{
+			name: "mixed-blocking-advisory",
+			checks: []Check{
+				&mockCheck{name: "ok", status: StatusOK, msg: "fine"},
+				&mockCheck{name: "blocker", status: StatusError, severity: SeverityBlocking, msg: "blocked"},
+				&mockCheck{name: "advisor", status: StatusError, severity: SeverityAdvisory, msg: "info"},
+			},
+			wantPassed:        1,
+			wantFailed:        2,
+			wantBlockingFails: 1,
+		},
+		{
+			name: "default-severity-is-blocking",
+			checks: []Check{
+				// Severity field omitted; zero value must count as Blocking
+				// so existing checks remain gate-relevant.
+				&mockCheck{name: "legacy", status: StatusError, msg: "bad"},
+			},
+			wantPassed:        0,
+			wantFailed:        1,
+			wantBlockingFails: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Doctor{}
+			for _, c := range tt.checks {
+				d.Register(c)
+			}
+			var buf bytes.Buffer
+			r := d.Run(&CheckContext{CityPath: "/tmp"}, &buf, false)
+
+			if r.Passed != tt.wantPassed {
+				t.Errorf("Passed = %d, want %d", r.Passed, tt.wantPassed)
+			}
+			if r.Failed != tt.wantFailed {
+				t.Errorf("Failed = %d, want %d", r.Failed, tt.wantFailed)
+			}
+			if r.BlockingFailed != tt.wantBlockingFails {
+				t.Errorf("BlockingFailed = %d, want %d", r.BlockingFailed, tt.wantBlockingFails)
+			}
+		})
+	}
+}
+
+// TestDoctor_AdvisoryPerCheckLine verifies the per-check output line includes
+// "(advisory)" when the result has SeverityAdvisory and StatusWarning/Error,
+// and that the suffix is absent for OK results and for blocking failures.
+func TestDoctor_AdvisoryPerCheckLine(t *testing.T) {
+	tests := []struct {
+		name       string
+		check      *mockCheck
+		wantLabel  string
+		wantAbsent string
+	}{
+		{
+			name:      "advisory-warning-has-suffix",
+			check:     &mockCheck{name: "check-a", status: StatusWarning, severity: SeverityAdvisory, msg: "heads up"},
+			wantLabel: "(advisory)",
+		},
+		{
+			name:      "advisory-error-has-suffix",
+			check:     &mockCheck{name: "check-b", status: StatusError, severity: SeverityAdvisory, msg: "note"},
+			wantLabel: "(advisory)",
+		},
+		{
+			name:       "advisory-ok-no-suffix",
+			check:      &mockCheck{name: "check-c", status: StatusOK, severity: SeverityAdvisory, msg: "fine"},
+			wantAbsent: "(advisory)",
+		},
+		{
+			name:       "blocking-warning-no-suffix",
+			check:      &mockCheck{name: "check-d", status: StatusWarning, severity: SeverityBlocking, msg: "bad"},
+			wantAbsent: "(advisory)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Doctor{}
+			d.Register(tt.check)
+			var buf bytes.Buffer
+			d.Run(&CheckContext{CityPath: "/tmp"}, &buf, false)
+			out := buf.String()
+			if tt.wantLabel != "" && !strings.Contains(out, tt.wantLabel) {
+				t.Errorf("output = %q, want %q in line", out, tt.wantLabel)
+			}
+			if tt.wantAbsent != "" && strings.Contains(out, tt.wantAbsent) {
+				t.Errorf("output = %q, must not contain %q", out, tt.wantAbsent)
+			}
+		})
+	}
+}
+
+// TestPrintSummary_AdvisoryRenderedSeparately confirms advisory failures get
+// their own component in the summary line so operators can tell at a glance
+// that a doctor pass had non-blocking findings.
+func TestPrintSummary_AdvisoryRenderedSeparately(t *testing.T) {
+	var buf bytes.Buffer
+	PrintSummary(&buf, &Report{Passed: 1, Failed: 2, BlockingFailed: 1})
+	out := buf.String()
+	if !strings.Contains(out, "2 failed") {
+		t.Errorf("summary = %q, want '2 failed'", out)
+	}
+	if !strings.Contains(out, "1 advisory") {
+		t.Errorf("summary = %q, want '1 advisory'", out)
+	}
+
+	buf.Reset()
+	PrintSummary(&buf, &Report{Passed: 3, Failed: 1, BlockingFailed: 1})
+	if got := buf.String(); strings.Contains(got, "advisory") {
+		t.Errorf("summary = %q, must not include 'advisory' when all failures are blocking", got)
+	}
+}

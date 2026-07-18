@@ -1,0 +1,69 @@
+# gc config — inspect and validate city configuration.
+
+env GC_BEADS=file
+env GC_DOLT=skip
+env GC_SESSION=fake
+
+# Config outside a city fails.
+! exec gc config show
+stderr 'not in a city directory'
+
+# Initialize a healthy city.
+exec gc init $WORK/my-city
+cd $WORK/my-city
+
+# Config show dumps the resolved config as TOML.
+exec gc config show
+stdout 'name = "my-city"'
+stdout '\[workspace\]'
+
+# Config show --validate on a healthy city passes.
+exec gc config show --validate
+stdout 'Config valid.'
+
+# Add an agent and verify it appears in output.
+mkdir -p $WORK/my-city/agents/reviewer
+cp $WORK/agent-reviewer $WORK/my-city/agents/reviewer/agent.toml
+exec gc config show
+stdout 'name = "reviewer"'
+stdout '\[\[agent\]\]'
+
+# Validate passes with valid agent config.
+exec gc config show --validate
+stdout 'Config valid.'
+
+# Broken config fails to parse.
+cp $WORK/bad-toml $WORK/broken-city/city.toml
+cd $WORK/broken-city
+! exec gc config show
+stderr 'gc config show'
+
+# Broken config also fails --validate.
+! exec gc config show --validate
+stderr 'gc config show'
+
+# Invalid legacy inline agents fail --validate.
+cp $WORK/legacy-inline-agent $WORK/my-city/city.toml
+cd $WORK/my-city
+! exec gc config show --validate
+stderr 'unsupported PackV1 \[\[agent\]\]'
+
+# Show mode prints non-fatal migration warnings to stderr but still outputs config.
+cp $WORK/city-warning-name $WORK/my-city/city.toml
+exec gc config show
+stderr 'workspace identity fields are deprecated'
+stdout '\[workspace\]'
+
+-- broken-city/.gc/.keep --
+-- bad-toml --
+{{invalid toml
+-- agent-reviewer --
+start_command = "echo reviewer"
+-- legacy-inline-agent --
+[workspace]
+
+[[agent]]
+name = "mayor"
+-- city-warning-name --
+[workspace]
+name = "my-city"

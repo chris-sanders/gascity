@@ -1,0 +1,231 @@
+package main
+
+import (
+	"fmt"
+	"io"
+
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/spf13/cobra"
+)
+
+// newRestartCmd creates the top-level "gc restart" command.
+func newRestartCmd(stdout, stderr io.Writer) *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "restart [path|name]",
+		Short: "Restart all agent sessions in the city",
+		Long: `Restart the city by stopping it then starting it again.
+
+Equivalent to running "gc stop" followed by "gc start". Under supervisor
+mode this unregisters the city, then re-registers it and triggers an
+immediate reconcile.`,
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeCityNames,
+		RunE: func(_ *cobra.Command, args []string) error {
+			if cmdRestartJSON(args, stdout, stderr, jsonOut) != 0 {
+				return errExit
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL summary")
+	return cmd
+}
+
+func cmdRestartJSON(args []string, stdout, stderr io.Writer, jsonOut bool) int {
+	// Resolve the city reference ONCE up front (accepting a path or a
+	// registered name) and thread the resolved PATH into both the stop and
+	// start legs, so a bare name can never re-resolve to different targets
+	// across legs.
+	cityPath, nameOverride, err := restartTarget(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc restart: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	resolvedArgs := []string{cityPath}
+	restartStdout := stdout
+	if jsonOut {
+		restartStdout = io.Discard
+	}
+	if code := cmdStop(resolvedArgs, restartStdout, stderr, 0, false); code != 0 {
+		return code
+	}
+	code := doStartWithNameOverride(resolvedArgs, false /*controllerMode*/, restartStdout, stderr, nameOverride)
+	if code != 0 || !jsonOut {
+		return code
+	}
+	return writeLifecycleActionJSONOrExit(stdout, stderr, "gc restart", lifecycleActionJSON{
+		Command:  "restart",
+		Action:   "restart",
+		Message:  "City restarted under supervisor.",
+		CityName: nameOverride,
+		CityPath: cityPath,
+	})
+}
+
+// restartTarget resolves the restart argument once to the city path and its
+// registered name (empty when the city is not registered), so both the stop
+// and start legs operate on the same resolved path.
+func restartTarget(args []string) (cityPath, nameOverride string, err error) {
+	dir, err := resolveStartDir(args)
+	if err != nil {
+		return "", "", err
+	}
+	cityPath, err = requireBootstrappedCity(dir)
+	if err != nil {
+		return "", "", err
+	}
+	entry, registered, lookupErr := registeredCityEntry(cityPath)
+	if lookupErr != nil {
+		return "", "", lookupErr
+	}
+	if registered {
+		nameOverride = entry.EffectiveName()
+	}
+	return cityPath, nameOverride, nil
+}
+
+// newRigRestartCmd creates the "gc rig restart <name>" subcommand.
+func newRigRestartCmd(stdout, stderr io.Writer) *cobra.Command {
+	return &cobra.Command{
+		Use:   "restart [name]",
+		Short: "Restart all agents in a rig",
+		Long: `Kill all agent sessions belonging to a rig.
+
+The reconciler will restart the agents on its next tick. This is a
+quick way to force-refresh all agents working on a particular project.`,
+		Args: cobra.ArbitraryArgs,
+		RunE: func(_ *cobra.Command, args []string) error {
+			if cmdRigRestart(args, stdout, stderr) != 0 {
+				return errExit
+			}
+			return nil
+		},
+		ValidArgsFunction: completeRigNames,
+	}
+}
+
+// cmdRigRestart kills all agent sessions in a rig. The reconciler restarts
+// them on its next tick.
+func cmdRigRestart(args []string, stdout, stderr io.Writer) int {
+	ctx, err := resolveContext()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc rig restart: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	rigName := ctx.RigName
+	if len(args) > 0 {
+		rigName = args[0]
+	}
+	if rigName == "" {
+		fmt.Fprintln(stderr, "gc rig restart: missing rig name") //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	cityPath := ctx.CityPath
+	cfg, err := loadCityConfig(cityPath, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc rig restart: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	// Verify rig exists.
+	found := false
+	for _, r := range cfg.Rigs {
+		if r.Name == rigName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		fmt.Fprintln(stderr, rigNotFoundMsg("gc rig restart", rigName, cfg)) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	// Collect agents belonging to this rig.
+	var rigAgents []config.Agent
+	for _, a := range cfg.Agents {
+		if a.Dir == rigName {
+			rigAgents = append(rigAgents, a)
+		}
+	}
+
+	cityName := loadedCityName(cfg, cityPath)
+	sp, err := newSessionProvider()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc rig restart: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	rec := openCityRecorder(stderr)
+	store, _ := openCityStoreAt(cityPath)
+	// Every store consumer in doRigRestart is session-class (session-name
+	// lookups, pool session-ref resolution, runtime running-observation, and the
+	// session-runtime stop/kill in stopTargetsBounded), so route the whole flow
+	// through the session coordination-class store for relocation-safety — the
+	// same whole-store route as gc stop.
+	sessStore := cliSessionStore(store, cfg, cityPath)
+	return doRigRestart(sp, rec, sessStore, cfg, rigAgents, rigName, cityName, cfg.Workspace.SessionTemplate, stdout, stderr)
+}
+
+// doRigRestart kills sessions for all agents in a rig. The reconciler will
+// restart them. Returns 0 even if no agents were running.
+func doRigRestart(
+	sp runtime.Provider,
+	rec events.Recorder,
+	store beads.Store,
+	cfg *config.City,
+	agents []config.Agent,
+	rigName, cityName, sessionTemplate string,
+	stdout, stderr io.Writer,
+) int {
+	var targets []stopTarget
+	for _, a := range agents {
+		sp0 := scaleParamsFor(&a)
+		if !a.SupportsInstanceExpansion() {
+			// Non-expanding template.
+			sn := lookupSessionNameOrLegacy(store, cityName, a.QualifiedName(), sessionTemplate)
+			running, err := workerSessionTargetRunningWithConfig("", store, sp, cfg, sn)
+			if err != nil {
+				fmt.Fprintf(stderr, "gc rig restart: observing %s: %v\n", sn, err) //nolint:errcheck
+				return 1
+			}
+			if running {
+				targets = append(targets, stopTarget{
+					name:      sn,
+					template:  a.QualifiedName(),
+					agentName: a.QualifiedName(),
+					subject:   a.QualifiedName(),
+					order:     len(targets),
+					resolved:  true,
+				})
+			}
+		} else {
+			// Pool agent: resolve live instances from beads first, then legacy discovery.
+			refs, err := selectRunningPoolSessionRefs(store, sp, cfg, resolvePoolSessionRefs(store, cfg, a.Name, a.Dir, sp0, &a, cityName, sessionTemplate, sp, stderr))
+			if err != nil {
+				fmt.Fprintf(stderr, "gc rig restart: observing %s: %v\n", a.QualifiedName(), err) //nolint:errcheck
+				return 1
+			}
+			for _, ref := range refs {
+				targets = append(targets, stopTarget{
+					name:      ref.sessionName,
+					template:  a.QualifiedName(),
+					agentName: ref.qualifiedInstance,
+					subject:   ref.qualifiedInstance,
+					order:     len(targets),
+					resolved:  true,
+				})
+			}
+		}
+	}
+	dependencyCfg := cfg
+	if dependencyCfg == nil {
+		dependencyCfg = &config.City{Agents: agents}
+	}
+	killed := stopTargetsBounded(targets, dependencyCfg, store, sp, rec, eventActor(), io.Discard, stderr)
+
+	fmt.Fprintf(stdout, "Restarted %d agent(s) in rig '%s' (killed sessions; reconciler will restart)\n", killed, rigName) //nolint:errcheck // best-effort stdout
+	return 0
+}

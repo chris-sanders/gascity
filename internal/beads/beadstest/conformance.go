@@ -1,0 +1,1146 @@
+// Package beadstest provides a conformance test suite for beads.Store
+// implementations. Each implementation's test file calls RunStoreTests
+// with its own factory function.
+package beadstest
+
+import (
+	"errors"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
+)
+
+// Options controls optional behavior of the Store conformance suite.
+//
+// Opt-outs are governed by the conformance-skip ledger (conformance_skips.go):
+// a request to skip a subtest is honored ONLY when a matching, unexpired ledger
+// entry exists, naming a tracking bead and an expiry. Without one the subtest
+// hard-fails, so an opt-out can never silently launder a regression.
+type Options struct {
+	// SkipTxApplyConformance requests skipping the
+	// TxRunsCallbackAndAppliesWriteSurface subtest. It is honored only when a
+	// valid, unexpired entry for that subtest exists in the skip ledger;
+	// otherwise the subtest fails loudly.
+	SkipTxApplyConformance bool
+}
+
+// RunStoreTests runs the full conformance suite against a Store implementation.
+// The newStore function must return a fresh, empty store for each call.
+func RunStoreTests(t *testing.T, newStore func() beads.Store) {
+	RunStoreTestsWithOptions(t, newStore, Options{})
+}
+
+// RunStoreTestsWithOptions runs the conformance suite with optional opt-outs
+// for subtests that exercise behavior known to be broken in an underlying
+// dependency rather than in the Store implementation itself.
+func RunStoreTestsWithOptions(t *testing.T, newStore func() beads.Store, opts Options) {
+	t.Helper()
+
+	t.Run("CreateAssignsUniqueNonEmptyID", func(t *testing.T) {
+		s := newStore()
+		b1, err := s.Create(beads.Bead{Title: "first"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b2, err := s.Create(beads.Bead{Title: "second"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b1.ID == "" {
+			t.Error("first bead ID is empty")
+		}
+		if b2.ID == "" {
+			t.Error("second bead ID is empty")
+		}
+		if b1.ID == b2.ID {
+			t.Errorf("bead IDs are not unique: both %q", b1.ID)
+		}
+	})
+
+	t.Run("CreateSetsStatusOpen", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Status != "open" {
+			t.Errorf("Status = %q, want %q", b.Status, "open")
+		}
+	})
+
+	t.Run("CreateDefaultsTypeToTask", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Type != "task" {
+			t.Errorf("Type = %q, want %q", b.Type, "task")
+		}
+	})
+
+	t.Run("CreatePreservesExplicitType", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "test", Type: "bug"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Type != "bug" {
+			t.Errorf("Type = %q, want %q", b.Type, "bug")
+		}
+	})
+
+	t.Run("CreateSetsCreatedAt", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Sanity check: CreatedAt should be recent (within 1 hour).
+		// We use a wide window because external stores have second-precision
+		// timestamps with rounding, and timezone handling can vary.
+		if time.Since(b.CreatedAt).Abs() > time.Hour {
+			t.Errorf("CreatedAt = %v, want within 1 hour of now (%v)", b.CreatedAt, time.Now())
+		}
+	})
+
+	t.Run("CreatePreservesTitle", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "Build a Tower of Hanoi app"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Title != "Build a Tower of Hanoi app" {
+			t.Errorf("Title = %q, want %q", b.Title, "Build a Tower of Hanoi app")
+		}
+	})
+
+	t.Run("CreateAssigneeRoundTrips", func(t *testing.T) {
+		s := newStore()
+		created, err := s.Create(beads.Bead{Title: "test", Assignee: "mayor"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Assignee != "mayor" {
+			t.Errorf("Assignee = %q after Get, want %q from Create", got.Assignee, "mayor")
+		}
+	})
+
+	t.Run("CreateFromRoundTrips", func(t *testing.T) {
+		s := newStore()
+		created, err := s.Create(beads.Bead{Title: "test", From: "priya"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.From != "priya" {
+			t.Errorf("From = %q after Get, want %q from Create", got.From, "priya")
+		}
+	})
+
+	t.Run("CreateEchoMatchesGetOnMetadata", func(t *testing.T) {
+		// The Create return value (the "echo") must carry the same id, status, and
+		// metadata a subsequent Get returns. session.CreateSessionInfo projects the
+		// echo instead of issuing a post-create Get, so any backend whose Create echo
+		// diverges from Get on the projection surface would silently corrupt the typed
+		// create front door. This pins the parity across every backend, not just memstore.
+		s := newStore()
+		meta := map[string]string{
+			"session_name": "polecat-1",
+			"state":        "start_pending",
+			"alias":        "pc-1",
+			"pool_slot":    "3",
+			"agent_name":   "tower/polecat",
+		}
+		created, err := s.Create(beads.Bead{Title: "polecat", Type: "gc:session", Labels: []string{"gc:session"}, Metadata: meta})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != created.ID {
+			t.Errorf("Get ID = %q, create echo ID = %q", got.ID, created.ID)
+		}
+		if got.Status != created.Status {
+			t.Errorf("Get Status = %q, create echo Status = %q", got.Status, created.Status)
+		}
+		for k, v := range meta {
+			if created.Metadata[k] != v {
+				t.Errorf("create echo Metadata[%q] = %q, want %q", k, created.Metadata[k], v)
+			}
+			if got.Metadata[k] != created.Metadata[k] {
+				t.Errorf("Metadata[%q]: Get=%q, create echo=%q — backend must echo created metadata on Create", k, got.Metadata[k], created.Metadata[k])
+			}
+		}
+	})
+
+	t.Run("GetExistingBead", func(t *testing.T) {
+		s := newStore()
+		created, err := s.Create(beads.Bead{Title: "round trip", Type: "bug"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != created.ID {
+			t.Errorf("ID = %q, want %q", got.ID, created.ID)
+		}
+		if got.Title != created.Title {
+			t.Errorf("Title = %q, want %q", got.Title, created.Title)
+		}
+		if got.Status != created.Status {
+			t.Errorf("Status = %q, want %q", got.Status, created.Status)
+		}
+		if got.Type != created.Type {
+			t.Errorf("Type = %q, want %q", got.Type, created.Type)
+		}
+		// Wide tolerance: dolt stores at second precision with rounding,
+		// so create vs show can differ. Just verify it round-trips close.
+		if got.CreatedAt.Sub(created.CreatedAt).Abs() > time.Hour {
+			t.Errorf("CreatedAt = %v, want within 1h of %v", got.CreatedAt, created.CreatedAt)
+		}
+		if got.Assignee != created.Assignee {
+			t.Errorf("Assignee = %q, want %q", got.Assignee, created.Assignee)
+		}
+	})
+
+	t.Run("GetNotFound", func(t *testing.T) {
+		s := newStore()
+		// Create one bead so the store isn't empty, then look up a wrong ID.
+		if _, err := s.Create(beads.Bead{Title: "exists"}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.Get("nonexistent-999")
+		if err == nil {
+			t.Fatal("Get(nonexistent-999) should return error")
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			t.Errorf("error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("GetNotFoundEmptyStore", func(t *testing.T) {
+		s := newStore()
+		_, err := s.Get("nonexistent-999")
+		if err == nil {
+			t.Fatal("Get on empty store should return error")
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			t.Errorf("error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("CloseSuccess", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "closeable"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(b.ID); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != "closed" {
+			t.Errorf("Status = %q, want %q", got.Status, "closed")
+		}
+	})
+
+	t.Run("CloseNotFound", func(t *testing.T) {
+		s := newStore()
+		err := s.Close("nonexistent-999")
+		if err == nil {
+			t.Fatal("Close(nonexistent-999) should return error")
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			t.Errorf("error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("CloseIdempotent", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "close twice"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(b.ID); err != nil {
+			t.Fatal(err)
+		}
+		// Closing again should succeed (no-op).
+		if err := s.Close(b.ID); err != nil {
+			t.Errorf("second Close returned error: %v", err)
+		}
+		got, err := s.Get(b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != "closed" {
+			t.Errorf("Status = %q, want %q", got.Status, "closed")
+		}
+	})
+
+	t.Run("CloseRemovesFromReady", func(t *testing.T) {
+		s := newStore()
+		b1, err := s.Create(beads.Bead{Title: "first"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Create(beads.Bead{Title: "second"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(b1.ID); err != nil {
+			t.Fatal(err)
+		}
+		ready, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ready) != 1 {
+			t.Fatalf("Ready() returned %d beads, want 1", len(ready))
+		}
+		if ready[0].Title != "second" {
+			t.Errorf("ready[0].Title = %q, want %q", ready[0].Title, "second")
+		}
+	})
+
+	t.Run("ListReturnsAllBeads", func(t *testing.T) {
+		s := newStore()
+		_, err := s.Create(beads.Bead{Title: "first"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.Create(beads.Bead{Title: "second"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.ListOpen()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("List() returned %d beads, want 2", len(got))
+		}
+		titles := titlesOf(got)
+		if !hasExactly(titles, "first", "second") {
+			t.Errorf("List() titles = %v, want [first second]", titles)
+		}
+	})
+
+	t.Run("ListEmptyStore", func(t *testing.T) {
+		s := newStore()
+		got, err := s.ListOpen()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("List() on empty store returned %d beads, want 0", len(got))
+		}
+	})
+
+	t.Run("ListCount", func(t *testing.T) {
+		s := newStore()
+		for _, title := range []string{"alpha", "beta", "gamma"} {
+			if _, err := s.Create(beads.Bead{Title: title}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := s.ListOpen()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("List() returned %d beads, want 3", len(got))
+		}
+		titles := titlesOf(got)
+		if !hasExactly(titles, "alpha", "beta", "gamma") {
+			t.Errorf("List() titles = %v, want [alpha beta gamma]", titles)
+		}
+	})
+
+	t.Run("ListRejectsUnboundedQueryWithoutAllowScan", func(t *testing.T) {
+		s := newStore()
+		if _, err := s.Create(beads.Bead{Title: "first"}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.List(beads.ListQuery{})
+		if !errors.Is(err, beads.ErrQueryRequiresScan) {
+			t.Fatalf("List({}) error = %v, want ErrQueryRequiresScan", err)
+		}
+	})
+
+	t.Run("ListAllowsExplicitScan", func(t *testing.T) {
+		s := newStore()
+		if _, err := s.Create(beads.Bead{Title: "first"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Create(beads.Bead{Title: "second"}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.List(beads.ListQuery{AllowScan: true})
+		if err != nil {
+			t.Fatalf("List(AllowScan) error = %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("List(AllowScan) returned %d beads, want 2", len(got))
+		}
+	})
+
+	t.Run("ListFiltersByQueryFields", func(t *testing.T) {
+		s := newStore()
+		parent, err := s.Create(beads.Bead{
+			Title:    "parent",
+			Type:     "epic",
+			Labels:   []string{"root"},
+			Metadata: map[string]string{"scope": "a"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		match, err := s.Create(beads.Bead{
+			Title:    "match",
+			Type:     "task",
+			Labels:   []string{"focus"},
+			ParentID: parent.ID,
+			Metadata: map[string]string{"scope": "a"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Create(beads.Bead{
+			Title:    "wrong-parent",
+			Type:     "task",
+			Labels:   []string{"focus"},
+			Metadata: map[string]string{"scope": "a"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Create(beads.Bead{
+			Title:    "wrong-metadata",
+			Type:     "task",
+			Labels:   []string{"focus"},
+			ParentID: parent.ID,
+			Metadata: map[string]string{"scope": "b"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.List(beads.ListQuery{
+			Type:     "task",
+			Label:    "focus",
+			ParentID: parent.ID,
+			Metadata: map[string]string{"scope": "a"},
+		})
+		if err != nil {
+			t.Fatalf("List(query) error = %v", err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("List(query) returned %d beads, want 1", len(got))
+		}
+		if got[0].ID != match.ID {
+			t.Fatalf("List(query) returned %q, want %q", got[0].ID, match.ID)
+		}
+	})
+
+	t.Run("ReadyReturnsOpenBeads", func(t *testing.T) {
+		s := newStore()
+		_, err := s.Create(beads.Bead{Title: "first"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.Create(beads.Bead{Title: "second"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("Ready() returned %d beads, want 2", len(got))
+		}
+		titles := titlesOf(got)
+		if !hasExactly(titles, "first", "second") {
+			t.Errorf("Ready() titles = %v, want [first second]", titles)
+		}
+	})
+
+	t.Run("UpdateDescription", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "updatable", Description: "original"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		newDesc := "updated description"
+		if err := s.Update(b.ID, beads.UpdateOpts{Description: &newDesc}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Description != "updated description" {
+			t.Errorf("Description = %q, want %q", got.Description, "updated description")
+		}
+	})
+
+	t.Run("UpdateNotFound", func(t *testing.T) {
+		s := newStore()
+		desc := "whatever"
+		err := s.Update("nonexistent-999", beads.UpdateOpts{Description: &desc})
+		if err == nil {
+			t.Fatal("Update(nonexistent) should return error")
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			t.Errorf("error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("UpdateNilField", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "keep desc", Description: "original"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Update with nil Description — should leave field unchanged.
+		if err := s.Update(b.ID, beads.UpdateOpts{}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Description != "original" {
+			t.Errorf("Description = %q, want %q (unchanged)", got.Description, "original")
+		}
+	})
+
+	t.Run("ChildrenEmpty", func(t *testing.T) {
+		s := newStore()
+		children, err := s.Children("nonexistent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(children) != 0 {
+			t.Errorf("Children(nonexistent) returned %d beads, want 0", len(children))
+		}
+	})
+
+	t.Run("ChildrenReturnsMatching", func(t *testing.T) {
+		s := newStore()
+		parent, err := s.Create(beads.Bead{Title: "parent", Type: "molecule"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c1, err := s.Create(beads.Bead{Title: "child-1", ParentID: parent.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c2, err := s.Create(beads.Bead{Title: "child-2", ParentID: parent.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Unrelated bead — should not appear.
+		if _, err := s.Create(beads.Bead{Title: "other"}); err != nil {
+			t.Fatal(err)
+		}
+
+		children, err := s.Children(parent.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(children) != 2 {
+			t.Fatalf("Children returned %d beads, want 2", len(children))
+		}
+		if children[0].ID != c1.ID {
+			t.Errorf("children[0].ID = %q, want %q", children[0].ID, c1.ID)
+		}
+		if children[1].ID != c2.ID {
+			t.Errorf("children[1].ID = %q, want %q", children[1].ID, c2.ID)
+		}
+	})
+
+	t.Run("ChildrenWrongParent", func(t *testing.T) {
+		s := newStore()
+		p1, err := s.Create(beads.Bead{Title: "parent-1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p2, err := s.Create(beads.Bead{Title: "parent-2"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Create(beads.Bead{Title: "child-of-1", ParentID: p1.ID}); err != nil {
+			t.Fatal(err)
+		}
+
+		children, err := s.Children(p2.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(children) != 0 {
+			t.Errorf("Children(p2) returned %d beads, want 0", len(children))
+		}
+	})
+
+	t.Run("ReadyEmptyStore", func(t *testing.T) {
+		s := newStore()
+		got, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("Ready() on empty store returned %d beads, want 0", len(got))
+		}
+	})
+
+	t.Run("ReadyCount", func(t *testing.T) {
+		s := newStore()
+		for _, title := range []string{"alpha", "beta", "gamma"} {
+			if _, err := s.Create(beads.Bead{Title: title}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("Ready() returned %d beads, want 3", len(got))
+		}
+		titles := titlesOf(got)
+		if !hasExactly(titles, "alpha", "beta", "gamma") {
+			t.Errorf("Ready() titles = %v, want [alpha beta gamma]", titles)
+		}
+	})
+
+	t.Run("ReadyExcludesInfraTypes", func(t *testing.T) {
+		s := newStore()
+		// Create a regular task bead — should appear in Ready().
+		if _, err := s.Create(beads.Bead{Title: "task", Type: "task"}); err != nil {
+			t.Fatal(err)
+		}
+		// Create beads with types that bd ready excludes.
+		for _, typ := range []string{"molecule", "step", "convoy", "message", "gate", "merge-request", "session", "agent", "role", "rig"} {
+			if _, err := s.Create(beads.Bead{Title: typ, Type: typ}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("Ready() returned %d beads, want 1 (only the task bead)", len(got))
+		}
+		if got[0].Title != "task" {
+			t.Errorf("Ready()[0].Title = %q, want %q", got[0].Title, "task")
+		}
+	})
+
+	t.Run("ListByLabelMatch", func(t *testing.T) {
+		s := newStore()
+		if _, err := s.Create(beads.Bead{Title: "no-label"}); err != nil {
+			t.Fatal(err)
+		}
+		b2, err := s.Create(beads.Bead{Title: "labeled", Labels: []string{"role:worker"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.ListByLabel("role:worker", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("ListByLabel returned %d beads, want 1", len(got))
+		}
+		if got[0].ID != b2.ID {
+			t.Errorf("got[0].ID = %q, want %q", got[0].ID, b2.ID)
+		}
+	})
+
+	t.Run("ListByLabelNoMatch", func(t *testing.T) {
+		s := newStore()
+		if _, err := s.Create(beads.Bead{Title: "other", Labels: []string{"role:worker"}}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.ListByLabel("role:mayor", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("ListByLabel returned %d beads, want 0", len(got))
+		}
+	})
+
+	t.Run("ListByLabelLimit", func(t *testing.T) {
+		s := newStore()
+		for _, title := range []string{"a", "b", "c"} {
+			if _, err := s.Create(beads.Bead{Title: title, Labels: []string{"batch:1"}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := s.ListByLabel("batch:1", 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("ListByLabel with limit 2 returned %d beads, want 2", len(got))
+		}
+	})
+
+	t.Run("ListByLabelEmpty", func(t *testing.T) {
+		s := newStore()
+		got, err := s.ListByLabel("anything", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("ListByLabel on empty store returned %d beads, want 0", len(got))
+		}
+	})
+
+	t.Run("TxRunsCallbackAndAppliesWriteSurface", func(t *testing.T) {
+		if opts.SkipTxApplyConformance {
+			requireLedgeredSkip(t, "TxRunsCallbackAndAppliesWriteSurface")
+			return
+		}
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "before"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		updatedDescription := "after"
+		called := false
+		err = s.Tx("conformance tx", func(tx beads.Tx) error {
+			called = true
+			if err := tx.Update(b.ID, beads.UpdateOpts{Description: &updatedDescription}); err != nil {
+				return err
+			}
+			if err := tx.SetMetadataBatch(b.ID, map[string]string{"tx": "applied"}); err != nil {
+				return err
+			}
+			if err := tx.SetMetadataBatch(b.ID, map[string]string{"close_reason": "conformance tx closed after preserving fields"}); err != nil {
+				return err
+			}
+			return tx.Close(b.ID)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !called {
+			t.Fatal("Tx callback was not called")
+		}
+
+		got, err := s.Get(b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Description != updatedDescription {
+			t.Errorf("Description after Tx = %q, want %q", got.Description, updatedDescription)
+		}
+		if got.Title != "before" {
+			t.Errorf("Title after Tx = %q, want before", got.Title)
+		}
+		if got.Metadata["tx"] != "applied" {
+			t.Errorf("Metadata[tx] after Tx = %q, want applied", got.Metadata["tx"])
+		}
+		if got.Metadata["close_reason"] != "conformance tx closed after preserving fields" {
+			t.Errorf("Metadata[close_reason] after Tx = %q, want conformance tx closed after preserving fields", got.Metadata["close_reason"])
+		}
+		if got.Status != "closed" {
+			t.Errorf("Status after Tx = %q, want closed", got.Status)
+		}
+	})
+
+	t.Run("TxPropagatesCallbackError", func(t *testing.T) {
+		s := newStore()
+		wantErr := errors.New("stop tx")
+		called := false
+		err := s.Tx("conformance tx error", func(_ beads.Tx) error {
+			called = true
+			return wantErr
+		})
+		if !called {
+			t.Fatal("Tx callback was not called")
+		}
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Tx error = %v, want %v", err, wantErr)
+		}
+	})
+
+	t.Run("TxRejectsNilCallback", func(t *testing.T) {
+		s := newStore()
+		if err := s.Tx("conformance nil tx", nil); err == nil {
+			t.Fatal("Tx(nil) returned nil, want error")
+		}
+	})
+
+	// ListStorageTierContract pins query.go's TierMode row filter (#3045,
+	// #3444): TierIssues keeps history and no-history rows and drops only
+	// ephemeral ones; TierWisps keeps no-history and ephemeral rows; TierBoth
+	// unions all three. Backends must agree on these cardinalities or API list
+	// totals silently shift with backend selection.
+	//
+	// This shared subtest seeds through Store.Create, so it runs only for the
+	// Create-seedable backends wired through RunStoreTests: MemStore,
+	// FileStore, ExecStore, the br exec bridge, and NativeDoltStore. Two
+	// full-Store backends seed differently and pin the same tier contract
+	// through their own tests instead: BdStore via
+	// TestBdStoreListStorageTierConformance, and the DoltLite read store via
+	// TestDoltliteReadStoreTierModesIncludeWisps (its Create routes to the
+	// external bd runner, so it cannot use this Create-based harness and seeds
+	// the snapshot tables directly). Keep those backend-specific tier tests in
+	// sync with this contract.
+	t.Run("ListStorageTierContract", func(t *testing.T) {
+		s := newStore()
+		if _, err := s.Create(beads.Bead{Title: "tier-history", Labels: []string{"tier-contract"}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Create(beads.Bead{Title: "tier-no-history", Labels: []string{"tier-contract"}, NoHistory: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Create(beads.Bead{Title: "tier-ephemeral", Labels: []string{"tier-contract"}, Ephemeral: true}); err != nil {
+			t.Fatal(err)
+		}
+
+		issues, err := s.List(beads.ListQuery{Label: "tier-contract"})
+		if err != nil {
+			t.Fatalf("List issues tier: %v", err)
+		}
+		if got := titlesOf(issues); !hasExactly(got, "tier-history", "tier-no-history") {
+			t.Errorf("issues tier titles = %v, want [tier-history tier-no-history]", got)
+		}
+
+		wisps, err := s.List(beads.ListQuery{Label: "tier-contract", TierMode: beads.TierWisps})
+		if err != nil {
+			t.Fatalf("List wisps tier: %v", err)
+		}
+		if got := titlesOf(wisps); !hasExactly(got, "tier-ephemeral", "tier-no-history") {
+			t.Errorf("wisps tier titles = %v, want [tier-ephemeral tier-no-history]", got)
+		}
+
+		both, err := s.List(beads.ListQuery{Label: "tier-contract", TierMode: beads.TierBoth})
+		if err != nil {
+			t.Fatalf("List both tiers: %v", err)
+		}
+		if got := titlesOf(both); !hasExactly(got, "tier-ephemeral", "tier-history", "tier-no-history") {
+			t.Errorf("both tier titles = %v, want [tier-ephemeral tier-history tier-no-history]", got)
+		}
+	})
+}
+
+// RunMetadataTests runs conformance tests for metadata absent-vs-empty
+// semantics. Call this only for Store implementations that preserve
+// empty-string metadata values (MemStore, BdStore). External script-backed
+// stores (ExecStore) may not preserve this invariant.
+func RunMetadataTests(t *testing.T, newStore func() beads.Store) {
+	t.Helper()
+
+	t.Run("MetadataAbsentVsEmpty", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Set metadata to empty string.
+		if err := s.SetMetadata(b.ID, "key", ""); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Key present with empty value — comma-ok must distinguish from absent.
+		val, ok := got.Metadata["key"]
+		if !ok {
+			t.Fatal("Metadata[\"key\"] absent, want present with empty value")
+		}
+		if val != "" {
+			t.Errorf("Metadata[\"key\"] = %q, want empty string", val)
+		}
+		// Absent key must return !ok.
+		_, ok = got.Metadata["nonexistent"]
+		if ok {
+			t.Error("Metadata[\"nonexistent\"] present, want absent")
+		}
+	})
+}
+
+// RunSequentialIDTests runs tests that assert gc-N sequential IDs. Call this
+// only for Store implementations that use sequential IDs (MemStore, FileStore).
+func RunSequentialIDTests(t *testing.T, newStore func() beads.Store) {
+	t.Helper()
+
+	t.Run("CreateAssignsSequentialID", func(t *testing.T) {
+		s := newStore()
+		b1, err := s.Create(beads.Bead{Title: "first"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b2, err := s.Create(beads.Bead{Title: "second"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b1.ID != "gc-1" {
+			t.Errorf("first bead ID = %q, want %q", b1.ID, "gc-1")
+		}
+		if b2.ID != "gc-2" {
+			t.Errorf("second bead ID = %q, want %q", b2.ID, "gc-2")
+		}
+	})
+}
+
+// RunCreationOrderTests runs tests that assert List/Ready return beads in
+// creation order. Only valid for in-process stores (MemStore, FileStore)
+// where creation order can be tracked with sub-second precision.
+func RunCreationOrderTests(t *testing.T, newStore func() beads.Store) {
+	t.Helper()
+
+	t.Run("ListOrder", func(t *testing.T) {
+		s := newStore()
+		for _, title := range []string{"alpha", "beta", "gamma"} {
+			if _, err := s.Create(beads.Bead{Title: title}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := s.ListOpen()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("List() returned %d beads, want 3", len(got))
+		}
+		want := []string{"alpha", "beta", "gamma"}
+		for i, w := range want {
+			if got[i].Title != w {
+				t.Errorf("got[%d].Title = %q, want %q", i, got[i].Title, w)
+			}
+		}
+	})
+
+	t.Run("ReadyOrder", func(t *testing.T) {
+		s := newStore()
+		for _, title := range []string{"alpha", "beta", "gamma"} {
+			if _, err := s.Create(beads.Bead{Title: title}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("Ready() returned %d beads, want 3", len(got))
+		}
+		want := []string{"alpha", "beta", "gamma"}
+		for i, w := range want {
+			if got[i].Title != w {
+				t.Errorf("got[%d].Title = %q, want %q", i, got[i].Title, w)
+			}
+		}
+	})
+}
+
+// RunDepTests runs conformance tests for dependency operations.
+func RunDepTests(t *testing.T, newStore func() beads.Store) {
+	t.Helper()
+
+	t.Run("DepAddAndListDown", func(t *testing.T) {
+		s := newStore()
+		if err := s.DepAdd("a", "b", "blocks"); err != nil {
+			t.Fatal(err)
+		}
+		deps, err := s.DepList("a", "down")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(deps) != 1 {
+			t.Fatalf("DepList(a, down) = %d deps, want 1", len(deps))
+		}
+		if deps[0].DependsOnID != "b" {
+			t.Errorf("dep.DependsOnID = %q, want %q", deps[0].DependsOnID, "b")
+		}
+	})
+
+	t.Run("DepAddIdempotent", func(t *testing.T) {
+		s := newStore()
+		if err := s.DepAdd("a", "b", "blocks"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DepAdd("a", "b", "blocks"); err != nil {
+			t.Fatal(err)
+		}
+		deps, _ := s.DepList("a", "down")
+		if len(deps) != 1 {
+			t.Errorf("DepList after duplicate DepAdd = %d deps, want 1", len(deps))
+		}
+	})
+
+	t.Run("DepAddUpdatesType", func(t *testing.T) {
+		s := newStore()
+		if err := s.DepAdd("a", "b", "blocks"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DepAdd("a", "b", "tracks"); err != nil {
+			t.Fatal(err)
+		}
+		deps, _ := s.DepList("a", "down")
+		if len(deps) != 1 {
+			t.Fatalf("DepList after type update = %d deps, want 1", len(deps))
+		}
+		if deps[0].Type != "tracks" {
+			t.Errorf("dep.Type = %q, want %q", deps[0].Type, "tracks")
+		}
+	})
+
+	t.Run("DepListUp", func(t *testing.T) {
+		s := newStore()
+		if err := s.DepAdd("a", "b", "blocks"); err != nil {
+			t.Fatal(err)
+		}
+		deps, err := s.DepList("b", "up")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(deps) != 1 {
+			t.Fatalf("DepList(b, up) = %d deps, want 1", len(deps))
+		}
+		if deps[0].IssueID != "a" {
+			t.Errorf("dep.IssueID = %q, want %q", deps[0].IssueID, "a")
+		}
+	})
+
+	t.Run("DepRemove", func(t *testing.T) {
+		s := newStore()
+		_ = s.DepAdd("a", "b", "blocks")
+		_ = s.DepAdd("a", "c", "blocks")
+		if err := s.DepRemove("a", "b"); err != nil {
+			t.Fatal(err)
+		}
+		deps, _ := s.DepList("a", "down")
+		if len(deps) != 1 {
+			t.Fatalf("DepList after remove = %d deps, want 1", len(deps))
+		}
+		if deps[0].DependsOnID != "c" {
+			t.Errorf("remaining dep = %q, want %q", deps[0].DependsOnID, "c")
+		}
+	})
+
+	t.Run("DepRemoveNonexistent", func(t *testing.T) {
+		s := newStore()
+		if err := s.DepRemove("x", "y"); err != nil {
+			t.Errorf("DepRemove nonexistent should not error: %v", err)
+		}
+	})
+
+	t.Run("DepListEmpty", func(t *testing.T) {
+		s := newStore()
+		deps, err := s.DepList("nonexistent", "down")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(deps) != 0 {
+			t.Errorf("DepList on empty store = %d deps, want 0", len(deps))
+		}
+	})
+
+	t.Run("SetMetadataBatch", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "batch-test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		kvs := map[string]string{
+			"key1": "value1",
+			"key2": "value2",
+			"key3": "value3",
+		}
+		if err := s.SetMetadataBatch(b.ID, kvs); err != nil {
+			t.Fatalf("SetMetadataBatch: %v", err)
+		}
+		got, err := s.Get(b.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, want := range kvs {
+			if got.Metadata[k] != want {
+				t.Errorf("Metadata[%q] = %q, want %q", k, got.Metadata[k], want)
+			}
+		}
+	})
+
+	t.Run("SetMetadataBatchNotFound", func(t *testing.T) {
+		s := newStore()
+		err := s.SetMetadataBatch("nonexistent-999", map[string]string{"k": "v"})
+		if err == nil {
+			t.Fatal("SetMetadataBatch on nonexistent bead should return error")
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			t.Errorf("error = %v, want wrapped ErrNotFound", err)
+		}
+	})
+
+	t.Run("SetMetadataBatchEmpty", func(t *testing.T) {
+		s := newStore()
+		b, err := s.Create(beads.Bead{Title: "empty-batch"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Empty batch should succeed without error.
+		if err := s.SetMetadataBatch(b.ID, map[string]string{}); err != nil {
+			t.Fatalf("SetMetadataBatch with empty map: %v", err)
+		}
+	})
+
+	t.Run("Ping", func(t *testing.T) {
+		s := newStore()
+		if err := s.Ping(); err != nil {
+			t.Fatalf("Ping on fresh store should succeed: %v", err)
+		}
+	})
+}
+
+// titlesOf extracts titles from a slice of beads.
+func titlesOf(bs []beads.Bead) []string {
+	titles := make([]string, len(bs))
+	for i, b := range bs {
+		titles[i] = b.Title
+	}
+	sort.Strings(titles)
+	return titles
+}
+
+// hasExactly reports whether sorted holds exactly the want values and no
+// others — set equality (equal length plus an element-wise match after
+// sorting). The tier checks above rely on this to also catch over-inclusion,
+// such as an ephemeral row leaking into TierIssues. It is not a subset check:
+// do not use it where extra elements should be tolerated.
+func hasExactly(sorted []string, want ...string) bool {
+	expected := make([]string, len(want))
+	copy(expected, want)
+	sort.Strings(expected)
+	if len(sorted) != len(expected) {
+		return false
+	}
+	for i := range sorted {
+		if sorted[i] != expected[i] {
+			return false
+		}
+	}
+	return true
+}

@@ -1,0 +1,4654 @@
+package beads_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
+)
+
+// fakeRunner returns a CommandRunner that returns canned output for specific
+// commands, or an error if the command is unrecognized.
+func fakeRunner(responses map[string]struct {
+	out []byte
+	err error
+},
+) beads.CommandRunner {
+	return func(_, name string, args ...string) ([]byte, error) {
+		key := name + " " + strings.Join(args, " ")
+		if resp, ok := responses[key]; ok {
+			return resp.out, resp.err
+		}
+		return nil, fmt.Errorf("unexpected command: %s %s", name, strings.Join(args, " "))
+	}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func doltliteBdStoreTestDir(t *testing.T) string {
+	return doltliteBdStoreMetadataTestDir(t, `{"backend":"doltlite"}`)
+}
+
+func doltliteBdStoreMetadataTestDir(t *testing.T, metadata string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(metadata), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// --- Dir ---
+
+// TestBdStoreDirReturnsConstructionDir proves Dir() reports the exact root
+// a BdStore was constructed with, so callers that need to build an
+// equivalent throwaway store elsewhere (e.g. a ctx-bound clone for a
+// bounded read, gascity ga-cdmx6x) don't need a second, parallel way to
+// track it.
+func TestBdStoreDirReturnsConstructionDir(t *testing.T) {
+	store := beads.NewBdStore("/city/root", fakeRunner(nil))
+	if got := store.Dir(); got != "/city/root" {
+		t.Fatalf("Dir() = %q, want /city/root", got)
+	}
+}
+
+func TestBdStoreDirHandlesNilReceiver(t *testing.T) {
+	var store *beads.BdStore
+	if got := store.Dir(); got != "" {
+		t.Fatalf("Dir() on nil store = %q, want empty string", got)
+	}
+}
+
+// --- Create ---
+
+func TestBdStoreCreate(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd create --json Build a widget -t task`: {
+			out: []byte(`{"id":"bd-abc-123","title":"Build a widget","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","owner":""}`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	b, err := s.Create(beads.Bead{Title: "Build a widget"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ID != "bd-abc-123" {
+		t.Errorf("ID = %q, want %q", b.ID, "bd-abc-123")
+	}
+	if b.Title != "Build a widget" {
+		t.Errorf("Title = %q, want %q", b.Title, "Build a widget")
+	}
+	if b.Status != "open" {
+		t.Errorf("Status = %q, want %q", b.Status, "open")
+	}
+	if b.Type != "task" {
+		t.Errorf("Type = %q, want %q", b.Type, "task")
+	}
+}
+
+func TestBdStoreCreateDefaultsTypeToTask(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Create(beads.Bead{Title: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should pass -t task when Type is empty.
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "-t task") {
+		t.Errorf("args = %q, want to contain '-t task'", args)
+	}
+}
+
+func TestBdStoreCreatePreservesExplicitType(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"bug","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Create(beads.Bead{Title: "test", Type: "bug"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "-t bug") {
+		t.Errorf("args = %q, want to contain '-t bug'", args)
+	}
+}
+
+func TestBdStoreCreatePassesExplicitID(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"mc-session-abc123","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	created, err := s.Create(beads.Bead{ID: "mc-session-abc123", Title: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--id mc-session-abc123") {
+		t.Fatalf("args = %q, want explicit --id", args)
+	}
+	if created.ID != "mc-session-abc123" {
+		t.Fatalf("created.ID = %q, want mc-session-abc123", created.ID)
+	}
+}
+
+func TestBdStoreCreatePassesDeps(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Create(beads.Bead{
+		Title: "test",
+		Needs: []string{"bd-1", "validates:bd-2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--deps bd-1,validates:bd-2") {
+		t.Errorf("args = %q, want combined deps flag", args)
+	}
+}
+
+func TestBdStoreCreatePassesPriority(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","priority":1}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	priority := 1
+	created, err := s.Create(beads.Bead{Title: "test", Priority: &priority})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--priority 1") {
+		t.Fatalf("args = %q, want priority flag", args)
+	}
+	if created.Priority == nil || *created.Priority != 1 {
+		t.Fatalf("created.Priority = %v, want 1", created.Priority)
+	}
+}
+
+func TestBdStoreCreatePassesDeferUntil(t *testing.T) {
+	var gotArgs []string
+	deferUntil := time.Date(2026, 6, 1, 12, 30, 0, 0, time.UTC)
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","defer_until":"` + deferUntil.Format(time.RFC3339) + `"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	created, err := s.Create(beads.Bead{Title: "test", DeferUntil: &deferUntil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--defer "+deferUntil.Format(time.RFC3339)) {
+		t.Fatalf("args = %q, want defer flag", args)
+	}
+	if created.DeferUntil == nil || !created.DeferUntil.Equal(deferUntil) {
+		t.Fatalf("created.DeferUntil = %v, want %s", created.DeferUntil, deferUntil.Format(time.RFC3339))
+	}
+}
+
+func TestBdStoreCreateError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Create(beads.Bead{Title: "test"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "bd create") {
+		t.Errorf("error = %q, want to contain 'bd create'", err)
+	}
+}
+
+func TestBdStoreCreateBadJSON(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte(`{not json`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Create(beads.Bead{Title: "test"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "parsing JSON") {
+		t.Errorf("error = %q, want to contain 'parsing JSON'", err)
+	}
+}
+
+func TestBdStoreCreatePassesAssigneeAndFromMetadata(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-msg-1","title":"Update reminder","status":"open","issue_type":"message","created_at":"2025-01-15T10:30:00Z","assignee":"corp/lawrence","metadata":{"from":"priya"}}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	b, err := s.Create(beads.Bead{
+		Title:       "Update reminder",
+		Type:        "message",
+		Assignee:    "corp/lawrence",
+		From:        "priya",
+		Description: "Friendly nudge",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--assignee corp/lawrence") {
+		t.Fatalf("args = %q, want assignee flag", args)
+	}
+	if !strings.Contains(args, `"from":"priya"`) {
+		t.Fatalf("args = %q, want sender metadata", args)
+	}
+	if b.Assignee != "corp/lawrence" {
+		t.Fatalf("Assignee = %q, want corp/lawrence", b.Assignee)
+	}
+	if b.From != "priya" {
+		t.Fatalf("From = %q, want priya", b.From)
+	}
+}
+
+func TestBdStoreCreateRetriesDoltliteTransientWrite(t *testing.T) {
+	dir := doltliteBdStoreTestDir(t)
+	calls := 0
+	var gotArgs [][]string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = append(gotArgs, append([]string(nil), args...))
+		calls++
+		if calls == 1 {
+			return nil, fmt.Errorf("Error 1213 (40001): serialization failure")
+		}
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore(dir, runner)
+	if _, err := s.Create(beads.Bead{Title: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 transient retry attempts", calls)
+	}
+	for i, args := range gotArgs {
+		if got := strings.Join(args[:3], " "); got != "--dolt-auto-commit off create" {
+			t.Fatalf("call[%d] args = %q, want DoltLite auto-commit guard before create", i, strings.Join(args, " "))
+		}
+	}
+}
+
+func TestBdStoreCreateUsesDoltliteWriteGuardForNativeReadMetadata(t *testing.T) {
+	dir := doltliteBdStoreMetadataTestDir(t, `{"database":"doltlite","dolt_database":"hq"}`)
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = append([]string(nil), args...)
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+
+	s := beads.NewBdStore(dir, runner)
+	if _, err := s.Create(beads.Bead{Title: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(gotArgs[:3], " "); got != "--dolt-auto-commit off create" {
+		t.Fatalf("args = %q, want DoltLite auto-commit guard for database=doltlite metadata", strings.Join(gotArgs, " "))
+	}
+}
+
+func TestBdStoreCreateDoesNotRetryIdlessAmbiguousConnectionLoss(t *testing.T) {
+	dir := doltliteBdStoreTestDir(t)
+	calls := 0
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		calls++
+		return nil, fmt.Errorf("read tcp 127.0.0.1:53001->127.0.0.1:3306: connection reset by peer")
+	}
+
+	s := beads.NewBdStore(dir, runner)
+	if _, err := s.Create(beads.Bead{Title: "post-commit ambiguous"}); err == nil {
+		t.Fatal("Create() error = nil, want ambiguous connection error")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 so an id-less ambiguous create is not replayed", calls)
+	}
+}
+
+// --- Get ---
+
+func TestBdStoreGet(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json bd-abc-123`: {
+			out: []byte(`[{"id":"bd-abc-123","title":"Build a widget","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","assignee":"alice"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	b, err := s.Get("bd-abc-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ID != "bd-abc-123" {
+		t.Errorf("ID = %q, want %q", b.ID, "bd-abc-123")
+	}
+	if b.Assignee != "alice" {
+		t.Errorf("Assignee = %q, want %q", b.Assignee, "alice")
+	}
+}
+
+func TestBdStoreGetFallsBackToEphemeralForWisps(t *testing.T) {
+	// bd show does not query the wisps table, so Get for a wisp ID returns
+	// ErrNotFound from bd show. Get must fall back to bd query with
+	// ephemeral=true so that wisp-tier beads (e.g. auto-handoff mail created
+	// by gc handoff --auto) are retrievable.
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json gc-wisp-abc`: {
+			err: fmt.Errorf("issue gc-wisp-abc not found"),
+		},
+		`bd query --json ephemeral=true AND id=gc-wisp-abc --all --limit 1`: {
+			out: []byte(`[{"id":"gc-wisp-abc","title":"context cycle","status":"open","issue_type":"message","assignee":"claude","ephemeral":true}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	b, err := s.Get("gc-wisp-abc")
+	if err != nil {
+		t.Fatalf("Get wisp: %v", err)
+	}
+	if b.ID != "gc-wisp-abc" {
+		t.Errorf("ID = %q, want %q", b.ID, "gc-wisp-abc")
+	}
+	if !b.Ephemeral {
+		t.Error("Ephemeral = false, want true")
+	}
+}
+
+func TestBdStoreGetEphemeralFallbackReturnsErrNotFoundWhenMissing(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json gc-wisp-missing`: {
+			err: fmt.Errorf("issue gc-wisp-missing not found"),
+		},
+		`bd query --json ephemeral=true AND id=gc-wisp-missing --all --limit 1`: {
+			out: []byte(`[]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Get("gc-wisp-missing")
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBdStoreListUsesDecodedUpdatedAtForUpdatedBefore(t *testing.T) {
+	cutoff := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if name != "bd" {
+			return nil, fmt.Errorf("unexpected command name %q", name)
+		}
+		if strings.Join(args, " ") != "list --json --label=stale --include-infra --include-gates --limit 0" {
+			return nil, fmt.Errorf("unexpected command: bd %s", strings.Join(args, " "))
+		}
+		return []byte(`[
+			{"id":"old","title":"old","status":"open","issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","labels":["stale"]},
+			{"id":"recent","title":"recent","status":"open","issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-04T00:00:00Z","labels":["stale"]}
+		]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{
+		Label:         "stale",
+		UpdatedBefore: cutoff,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "old" {
+		t.Fatalf("List(UpdatedBefore) = %+v, want only old bead", got)
+	}
+	if !got[0].UpdatedAt.Equal(time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("UpdatedAt = %s, want decoded updated_at", got[0].UpdatedAt)
+	}
+}
+
+func TestBdIssueToBeadFallsBackToMetadataFrom(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json bd-msg-1`: {
+			out: []byte(`[{"id":"bd-msg-1","title":"Update reminder","status":"open","issue_type":"message","created_at":"2025-01-15T10:30:00Z","assignee":"corp/lawrence","metadata":{"from":"priya"}}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	b, err := s.Get("bd-msg-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.From != "priya" {
+		t.Fatalf("From = %q, want priya", b.From)
+	}
+}
+
+func TestBdStoreGetNotFound(t *testing.T) {
+	// Real "not found" scenario: bd show returns an empty JSON array.
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Get("nonexistent-999")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBdStoreGetCLIError(t *testing.T) {
+	// CLI error should NOT be wrapped as ErrNotFound.
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Get("nonexistent-999")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("CLI error should not be ErrNotFound, got %v", err)
+	}
+}
+
+func TestBdStoreGetCLINotFound(t *testing.T) {
+	// bd CLI "not found" error should be wrapped as ErrNotFound.
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1: Error fetching x: no issue found matching \"x\"")
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Get("x")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBdStoreGetBadJSON(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte(`not json`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Get("bd-abc-123")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "parsing JSON") {
+		t.Errorf("error = %q, want to contain 'parsing JSON'", err)
+	}
+}
+
+func TestBdStoreGetEmptyArray(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Get("bd-abc-123")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestBdStoreGetExactIDGuard verifies that BdStore.Get returns ErrIDCollision
+// (which wraps ErrNotFound) when bd's fuzzy resolver returns a different bead
+// than requested (gcy-g4o). e.g. requesting "gcy-dv7" must NOT silently accept
+// "gcy-wisp-dv78". Both errors.Is(err, ErrNotFound) and
+// errors.Is(err, ErrIDCollision) must hold so mutation guards can distinguish
+// a genuine collision from a plain absent bead.
+func TestBdStoreGetExactIDGuard(t *testing.T) {
+	// bd returns a bead whose ID is a superset of the requested ID.
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json gcy-dv7`: {
+			out: []byte(`[{"id":"gcy-wisp-dv78","title":"Wrong bead","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Get("gcy-dv7")
+	if err == nil {
+		t.Fatal("Get returned nil error, want ErrIDCollision")
+	}
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("Get error = %v, want errors.Is(err, ErrNotFound) true", err)
+	}
+	if !errors.Is(err, beads.ErrIDCollision) {
+		t.Errorf("Get error = %v, want errors.Is(err, ErrIDCollision) true", err)
+	}
+}
+
+// TestBdStoreMutationsPassThroughOnNotFound verifies that Update/Delete/Close
+// always reach bd directly (internal hot-path callers supply canonical full IDs;
+// the exact-ID collision guard lives at the CLI/API entry points — gcy-g4o).
+func TestBdStoreMutationsPassThroughOnNotFound(t *testing.T) {
+	var updateCalled, deleteCalled, closeCalled bool
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		cmd := strings.Join(append([]string{name}, args...), " ")
+		switch {
+		case strings.HasPrefix(cmd, "bd update "):
+			updateCalled = true
+			return nil, fmt.Errorf("bd: issue not found")
+		case strings.HasPrefix(cmd, "bd delete "):
+			deleteCalled = true
+			return nil, fmt.Errorf("bd: issue not found")
+		case strings.HasPrefix(cmd, "bd close "):
+			closeCalled = true
+			return nil, fmt.Errorf("bd: issue not found")
+		}
+		return nil, fmt.Errorf("unexpected: %s", cmd)
+	}
+	s := beads.NewBdStore("/city", runner)
+	title := "x"
+	_ = s.Update("gcy-dv7", beads.UpdateOpts{Title: &title})
+	_ = s.Delete("gcy-dv7")
+	_ = s.Close("gcy-dv7")
+	if !updateCalled {
+		t.Error("Update did not reach bd when bead was not-found (should pass through)")
+	}
+	if !deleteCalled {
+		t.Error("Delete did not reach bd when bead was not-found (should pass through)")
+	}
+	if !closeCalled {
+		t.Error("Close did not reach bd when bead was not-found (should pass through)")
+	}
+}
+
+// --- Close ---
+
+func TestBdStoreClose(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd close --force --json bd-abc-123`: {
+			out: []byte(`[{"id":"bd-abc-123","title":"test","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Close("bd-abc-123"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBdStoreCloseForwardsStampedCloseReason(t *testing.T) {
+	const reason = "nudge failed: queue terminalization rejected delivery"
+	var closeArgs []string
+	var closed bool
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if name != "bd" {
+			return nil, fmt.Errorf("unexpected command name: %s", name)
+		}
+		switch strings.Join(args, " ") {
+		case "show --json bd-abc-123":
+			status := "open"
+			if closed {
+				status = "closed"
+			}
+			return []byte(`[{"id":"bd-abc-123","title":"test","status":"` + status + `","issue_type":"task","created_at":"2025-01-15T10:30:00Z","metadata":{"close_reason":"` + reason + `"}}]`), nil
+		case "close --force --json --reason " + reason + " bd-abc-123":
+			closeArgs = append([]string(nil), args...)
+			closed = true
+			return []byte(`[{"id":"bd-abc-123","title":"test","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", strings.Join(args, " "))
+		}
+	}
+
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Close("bd-abc-123"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"close", "--force", "--json", "--reason", reason, "bd-abc-123"}
+	if got := fmt.Sprint(closeArgs); got != fmt.Sprint(want) {
+		t.Fatalf("close args = %v, want %v", closeArgs, want)
+	}
+}
+
+func TestBdStoreCloseWithReasonUsesExplicitReasonWithoutShow(t *testing.T) {
+	const reason = "convoy autoclose: all children closed"
+	var closeArgs []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if name != "bd" {
+			return nil, fmt.Errorf("unexpected command name: %s", name)
+		}
+		if len(args) > 0 && args[0] == "show" {
+			return nil, fmt.Errorf("unexpected bd show before explicit-reason close")
+		}
+		switch strings.Join(args, " ") {
+		case "close --force --json --reason " + reason + " bd-x":
+			closeArgs = append([]string(nil), args...)
+			return []byte(`[{"id":"bd-x","title":"t","status":"closed","issue_type":"convoy","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", strings.Join(args, " "))
+		}
+	}
+
+	s := beads.NewBdStore("/city", runner)
+	if err := s.CloseWithReason("bd-x", "  "+reason+"  "); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"close", "--force", "--json", "--reason", reason, "bd-x"}
+	if got := fmt.Sprint(closeArgs); got != fmt.Sprint(want) {
+		t.Fatalf("close args = %v, want %v", closeArgs, want)
+	}
+}
+
+func TestBdStoreReopenUsesReopenCommand(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd reopen --json bd-abc-123`: {
+			out: []byte(`{"id":"bd-abc-123","status":"open"}`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Reopen("bd-abc-123"); err != nil {
+		t.Fatalf("Reopen() error = %v", err)
+	}
+}
+
+func TestBdStoreCloseNotFound(t *testing.T) {
+	// Generic CLI error without "not found" should NOT be ErrNotFound.
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.Close("nonexistent-999")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("generic CLI error should not be ErrNotFound, got %v", err)
+	}
+}
+
+func TestBdStoreCloseCLINotFound(t *testing.T) {
+	// bd CLI "issue not found" should be wrapped as ErrNotFound.
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		// close returns "not found", Get also returns "not found" → truly not found.
+		return nil, fmt.Errorf("exit status 1: Error closing x: issue not found: x")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.Close("x")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestBdStoreCloseForwardsMetadataReason verifies that when a bead has
+// metadata.close_reason set, BdStore.Close() forwards it as the
+// --reason argument to bd close. This is required for cities running
+// with validation.on-close=error, where bd rejects close calls without
+// an explicit reason. Callers (e.g. session_reconcile, convoy
+// autoclose) set metadata.close_reason before invoking Close; this
+// test pins that the value flows through.
+func TestBdStoreCloseForwardsMetadataReason(t *testing.T) {
+	const reason = "convoy autoclose: all children closed"
+	var closeArgs []string
+	var closed bool
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "show":
+			status := "open"
+			if closed {
+				status = "closed"
+			}
+			return []byte(`[{"id":"bd-x","title":"t","status":"` + status + `","issue_type":"convoy","created_at":"2025-01-15T10:30:00Z","metadata":{"close_reason":"convoy autoclose: all children closed"}}]`), nil
+		case "close":
+			closeArgs = append([]string{}, args...)
+			closed = true
+			return []byte(`[{"id":"bd-x","title":"t","status":"closed","issue_type":"convoy","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		}
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Close("bd-x"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"close", "--force", "--json", "--reason", reason, "bd-x"}
+	if !reflect.DeepEqual(closeArgs, want) {
+		t.Errorf("close args = %v, want %v", closeArgs, want)
+	}
+}
+
+// TestBdStoreCloseOmitsReasonWhenMetadataAbsent verifies that when no
+// close_reason metadata is present, BdStore.Close() does not pass
+// --reason and lets bd assign its default. This preserves backward
+// compatibility for callers that don't pre-stamp a reason.
+func TestBdStoreCloseOmitsReasonWhenMetadataAbsent(t *testing.T) {
+	var closeArgs []string
+	var closed bool
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "show":
+			status := "open"
+			if closed {
+				status = "closed"
+			}
+			return []byte(`[{"id":"bd-x","title":"t","status":"` + status + `","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		case "close":
+			closeArgs = append([]string{}, args...)
+			closed = true
+			return []byte(`[{"id":"bd-x","title":"t","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		}
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Close("bd-x"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"close", "--force", "--json", "bd-x"}
+	if !reflect.DeepEqual(closeArgs, want) {
+		t.Errorf("close args = %v, want %v (no --reason when metadata absent)", closeArgs, want)
+	}
+}
+
+// TestBdStoreCloseTrimsMetadataReason verifies that whitespace
+// surrounding metadata.close_reason is stripped before forwarding, so
+// leading/trailing newlines or spaces from metadata persistence don't
+// pass through to bd's validator.
+func TestBdStoreCloseTrimsMetadataReason(t *testing.T) {
+	var closeArgs []string
+	var closed bool
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "show":
+			status := "open"
+			if closed {
+				status = "closed"
+			}
+			return []byte(`[{"id":"bd-x","title":"t","status":"` + status + `","issue_type":"task","created_at":"2025-01-15T10:30:00Z","metadata":{"close_reason":"  convoy autoclose: all children closed  \n"}}]`), nil
+		case "close":
+			closeArgs = append([]string{}, args...)
+			closed = true
+			return []byte(`[{"id":"bd-x","title":"t","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		}
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Close("bd-x"); err != nil {
+		t.Fatal(err)
+	}
+
+	const want = "convoy autoclose: all children closed"
+	for i, arg := range closeArgs {
+		if arg == "--reason" && i+1 < len(closeArgs) {
+			if closeArgs[i+1] != want {
+				t.Errorf("forwarded reason = %q, want %q (trimmed)", closeArgs[i+1], want)
+			}
+			return
+		}
+	}
+	t.Errorf("close args missing --reason: %v", closeArgs)
+}
+
+// TestBdStoreCloseWhitespaceMetadataReason verifies that a
+// whitespace-only metadata.close_reason is treated as absent — no
+// --reason is forwarded. Mirrors the trim-then-empty-check pattern.
+func TestBdStoreCloseWhitespaceMetadataReason(t *testing.T) {
+	var closeArgs []string
+	var closed bool
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "show":
+			status := "open"
+			if closed {
+				status = "closed"
+			}
+			return []byte(`[{"id":"bd-x","title":"t","status":"` + status + `","issue_type":"task","created_at":"2025-01-15T10:30:00Z","metadata":{"close_reason":"   "}}]`), nil
+		case "close":
+			closeArgs = append([]string{}, args...)
+			closed = true
+			return []byte(`[{"id":"bd-x","title":"t","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		}
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Close("bd-x"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, arg := range closeArgs {
+		if arg == "--reason" {
+			t.Errorf("close args contain --reason for whitespace-only metadata: %v", closeArgs)
+			return
+		}
+	}
+}
+
+// TestBdStoreCloseHonestyGuardRejectsUnclosedAfterSuccess pins the honesty
+// guard: when bd close exits 0 but a re-read shows the bead is still open,
+// close must NOT report success. bd's import-revert race
+// (gastownhall/beads#3948) can roll a committed close back to open after the
+// CLI has already returned 0, so the exit code alone is not trustworthy.
+func TestBdStoreCloseHonestyGuardRejectsUnclosedAfterSuccess(t *testing.T) {
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "close":
+			// bd reports success...
+			return []byte(`[{"id":"bd-x","title":"t","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		case "show":
+			// ...but the bead is actually still open (race reverted it).
+			return []byte(`[{"id":"bd-x","title":"t","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		}
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.CloseWithReason("bd-x", "deterministic test reason value")
+	if err == nil {
+		t.Fatal("expected error when bd close exits 0 but status stays open")
+	}
+	if !strings.Contains(err.Error(), "gastownhall/beads#3948") {
+		t.Errorf("error %q must name gastownhall/beads#3948", err)
+	}
+}
+
+// TestBdStoreCloseHonestyGuardAcceptsConfirmedClose verifies the guard does
+// not reject a close that genuinely landed: bd exits 0 and the re-read
+// confirms status closed.
+func TestBdStoreCloseHonestyGuardAcceptsConfirmedClose(t *testing.T) {
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "close", "show":
+			return []byte(`[{"id":"bd-x","title":"t","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		}
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.CloseWithReason("bd-x", "deterministic test reason value"); err != nil {
+		t.Fatalf("confirmed close should succeed, got %v", err)
+	}
+}
+
+// TestBdStoreCloseHonestyGuardToleratesReadFailure verifies the guard does not
+// convert a transient post-close read failure into a close failure: bd
+// reported success, so absent positive evidence of a revert we trust it.
+func TestBdStoreCloseHonestyGuardToleratesReadFailure(t *testing.T) {
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "close":
+			return []byte(`[{"id":"bd-x","title":"t","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		case "show":
+			return nil, fmt.Errorf("exit status 1: transient backend error")
+		}
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.CloseWithReason("bd-x", "deterministic test reason value"); err != nil {
+		t.Fatalf("close should succeed when post-close read fails, got %v", err)
+	}
+}
+
+func TestBdStoreUpdateCLINotFound(t *testing.T) {
+	// bd CLI "not found" from update should be wrapped as ErrNotFound.
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1: Error resolving x: no issue found matching \"x\"")
+	}
+	s := beads.NewBdStore("/city", runner)
+	desc := "whatever"
+	err := s.Update("x", beads.UpdateOpts{Description: &desc})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBdStoreUpdateEmptyOpts(t *testing.T) {
+	// Update with no fields should be a no-op (no bd call).
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		t.Fatal("runner should not be called for empty update")
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Update("bd-abc-123", beads.UpdateOpts{}); err != nil {
+		t.Errorf("empty Update should succeed, got %v", err)
+	}
+}
+
+func TestBdStoreClaimReturnsClaimedBead(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if name != "bd" {
+			t.Fatalf("name = %q, want bd", name)
+		}
+		gotArgs = append([]string(nil), args...)
+		return []byte(`[{"id":"bd-42","title":"Do it","status":"in_progress","assignee":"worker-1","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	claimed, ok, err := s.Claim("bd-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("Claim ok = false, want true")
+	}
+	if claimed.ID != "bd-42" || claimed.Status != "in_progress" || claimed.Assignee != "worker-1" {
+		t.Fatalf("claimed bead = %+v, want claimed bd-42 assigned to worker-1", claimed)
+	}
+	if got := strings.Join(gotArgs, " "); got != "update bd-42 --claim --json" {
+		t.Fatalf("args = %q, want bd claim update args", got)
+	}
+}
+
+func TestBdStoreClaimConflictReturnsFalse(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte(`{"error":"issue is already assigned to worker-2"}`), fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	claimed, ok, err := s.Claim("bd-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatalf("Claim ok = true, want false; claimed=%+v", claimed)
+	}
+}
+
+func TestBdStoreUpdatePassesPriority(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-42","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	priority := 0
+	if err := s.Update("bd-42", beads.UpdateOpts{Priority: &priority}); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--priority 0") {
+		t.Fatalf("args = %q, want priority flag", args)
+	}
+}
+
+func TestBdStoreTxCombinesWritesForSameBead(t *testing.T) {
+	var commands []string
+	closed := false
+	description := "seed"
+	metadata := map[string]string{"existing": "kept"}
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		switch strings.Join(args, " ") {
+		case "show --json bd-42":
+			status := "open"
+			if closed {
+				status = "closed"
+			}
+			payload := fmt.Sprintf(
+				`[{"id":"bd-42","title":"before","status":%q,"issue_type":"task","priority":2,"created_at":"2025-01-15T10:30:00Z","description":%q,"metadata":%s}]`,
+				status,
+				description,
+				mustJSON(t, metadata),
+			)
+			return []byte(payload), nil
+		case "close --force --json --reason completed during transaction bd-42":
+			closed = true
+			description = ""
+			metadata = map[string]string{}
+			return []byte(`[{"id":"bd-42","title":"before","status":"closed","issue_type":"task","priority":2,"created_at":"2025-01-15T10:30:00Z","description":"","metadata":{}}]`), nil
+		case "update --json bd-42 --title before --type task --priority 2 --description after --set-metadata close_reason=completed during transaction --set-metadata existing=kept --set-metadata tx=applied":
+			description = "after"
+			metadata["close_reason"] = "completed during transaction"
+			metadata["existing"] = "kept"
+			metadata["tx"] = "applied"
+			return []byte(`[{"id":"bd-42","title":"before","status":"open","issue_type":"task","priority":2,"created_at":"2025-01-15T10:30:00Z","description":"after","metadata":{"close_reason":"completed during transaction","existing":"kept","tx":"applied"}}]`), nil
+		case "update --json bd-42 --title before --status closed --type task --priority 2 --description after --set-metadata close_reason=completed during transaction --set-metadata existing=kept --set-metadata tx=applied":
+			closed = true
+			description = "after"
+			metadata["close_reason"] = "completed during transaction"
+			metadata["existing"] = "kept"
+			metadata["tx"] = "applied"
+			return []byte(`[{"id":"bd-42","title":"before","status":"closed","issue_type":"task","priority":2,"created_at":"2025-01-15T10:30:00Z","description":"after","metadata":{"close_reason":"completed during transaction","existing":"kept","tx":"applied"}}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", strings.Join(args, " "))
+		}
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	desc := "after"
+	err := s.Tx("combine", func(tx beads.Tx) error {
+		if err := tx.Update("bd-42", beads.UpdateOpts{Description: &desc}); err != nil {
+			return err
+		}
+		if err := tx.SetMetadataBatch("bd-42", map[string]string{"tx": "applied"}); err != nil {
+			return err
+		}
+		if err := tx.SetMetadataBatch("bd-42", map[string]string{"close_reason": "completed during transaction"}); err != nil {
+			return err
+		}
+		return tx.Close("bd-42")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get("bd-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("Status after Tx = %q, want closed", got.Status)
+	}
+	if got.Description != "after" {
+		t.Fatalf("Description after Tx = %q, want after", got.Description)
+	}
+	if got.Metadata["tx"] != "applied" {
+		t.Fatalf("Metadata[tx] after Tx = %q, want applied", got.Metadata["tx"])
+	}
+	if got.Metadata["close_reason"] != "completed during transaction" {
+		t.Fatalf("Metadata[close_reason] after Tx = %q, want completed during transaction", got.Metadata["close_reason"])
+	}
+
+	want := []string{
+		"bd show --json bd-42", // Tx initial Get
+		"bd update --json bd-42 --title before --type task --priority 2 --description after --set-metadata close_reason=completed during transaction --set-metadata existing=kept --set-metadata tx=applied",
+		"bd show --json bd-42", // honesty re-read after update (close's honesty guard)
+		"bd close --force --json --reason completed during transaction bd-42",
+		"bd show --json bd-42", // honesty re-read after close (close's honesty guard)
+		"bd update --json bd-42 --title before --status closed --type task --priority 2 --description after --set-metadata close_reason=completed during transaction --set-metadata existing=kept --set-metadata tx=applied",
+		"bd show --json bd-42", // Tx final Get
+		"bd show --json bd-42", // final Get after Tx
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("commands = %#v, want %#v", commands, want)
+	}
+}
+
+func TestBdStoreTxCloseOnlyUsesCloseCommand(t *testing.T) {
+	var commands []string
+	var closed bool
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		switch strings.Join(args, " ") {
+		case "show --json bd-42":
+			status := "open"
+			if closed {
+				status = "closed"
+			}
+			return []byte(`[{"id":"bd-42","title":"before","status":"` + status + `","issue_type":"task","created_at":"2025-01-15T10:30:00Z","metadata":{"close_reason":"completed during transaction"}}]`), nil
+		case "close --force --json --reason completed during transaction bd-42":
+			closed = true
+			return []byte(`[{"id":"bd-42","title":"before","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", strings.Join(args, " "))
+		}
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	if err := s.Tx("close", func(tx beads.Tx) error {
+		return tx.Close("bd-42")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"bd show --json bd-42", // Tx initial Get
+		"bd close --force --json --reason completed during transaction bd-42",
+		"bd show --json bd-42", // honesty re-read after close
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("commands = %#v, want %#v", commands, want)
+	}
+}
+
+func TestBdStoreTxRetriesTransientUpdateApply(t *testing.T) {
+	updateCalls := 0
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch strings.Join(args, " ") {
+		case "show --json bd-42":
+			return []byte(`[{"id":"bd-42","title":"before","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		case "update --json bd-42 --title before --status open --type task --set-metadata tx=applied":
+			updateCalls++
+			if updateCalls == 1 {
+				return nil, fmt.Errorf("exit status 1: Error updating bd-42: dolt commit: Error 1213 (40001): serialization failure: this transaction conflicts with a committed transaction from another client, try restarting transaction")
+			}
+			return []byte(`[{"id":"bd-42","title":"before","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","metadata":{"tx":"applied"}}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", strings.Join(args, " "))
+		}
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	err := s.Tx("retry", func(tx beads.Tx) error {
+		return tx.SetMetadataBatch("bd-42", map[string]string{"tx": "applied"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updateCalls != 2 {
+		t.Fatalf("updateCalls = %d, want 2", updateCalls)
+	}
+}
+
+func TestBdStoreTxPreservesAddsAndRemovesLabels(t *testing.T) {
+	var commands []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		commands = append(commands, name+" "+strings.Join(args, " "))
+		switch strings.Join(args, " ") {
+		case "show --json bd-42":
+			return []byte(`[{"id":"bd-42","title":"before","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","labels":["a","b"]}]`), nil
+		case "update --json bd-42 --title before --status open --type task --add-label b --add-label c --remove-label a":
+			return []byte(`[{"id":"bd-42","title":"before","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","labels":["b","c"]}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", strings.Join(args, " "))
+		}
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	if err := s.Tx("labels", func(tx beads.Tx) error {
+		return tx.Update("bd-42", beads.UpdateOpts{
+			Labels:       []string{"c"},
+			RemoveLabels: []string{"a"},
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"bd show --json bd-42", // Tx initial Get
+		"bd update --json bd-42 --title before --status open --type task --add-label b --add-label c --remove-label a",
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("commands = %#v, want %#v", commands, want)
+	}
+}
+
+func TestBdStoreUpdateAllBatchesIDsAndRetriesTransientWrite(t *testing.T) {
+	var calls [][]string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if name != "bd" {
+			return nil, fmt.Errorf("unexpected command name %q", name)
+		}
+		calls = append(calls, append([]string(nil), args...))
+		if len(calls) == 1 {
+			return nil, fmt.Errorf("Error 1213 (40001): serialization failure")
+		}
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	status := "closed"
+	updated, err := s.UpdateAll([]string{"bd-1", "bd-2"}, beads.UpdateOpts{
+		Status: &status,
+		Metadata: map[string]string{
+			"phase":      "abort",
+			"gc.outcome": "skipped",
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpdateAll: %v", err)
+	}
+	if updated != 2 {
+		t.Fatalf("updated = %d, want 2", updated)
+	}
+	want := []string{
+		"update", "--json", "bd-1", "bd-2",
+		"--status", "closed",
+		"--set-metadata", "gc.outcome=skipped",
+		"--set-metadata", "phase=abort",
+	}
+	if len(calls) != 2 {
+		t.Fatalf("calls = %d, want 2 transient retry attempts", len(calls))
+	}
+	for i, got := range calls {
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("call[%d] = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestBdStoreWaitForParentProjection(t *testing.T) {
+	var mu sync.Mutex
+	showCalls := 0
+	parentListCalls := 0
+
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		cmd := strings.Join(args, " ")
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch cmd {
+		case "show --json bd-child":
+			showCalls++
+			if showCalls == 1 {
+				return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+			}
+			return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-parent"}]`), nil
+		case "list --json --include-infra --include-gates --limit 0 --parent bd-parent":
+			parentListCalls++
+			if parentListCalls == 1 {
+				return []byte(`[]`), nil
+			}
+			return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-parent"}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", cmd)
+		}
+	}
+
+	s := beads.NewBdStore("/city", runner)
+	if err := s.WaitForParentProjection(context.Background(), "bd-child", "", "bd-parent"); err != nil {
+		t.Fatalf("WaitForParentProjection: %v", err)
+	}
+	if parentListCalls < 2 {
+		t.Fatalf("parentListCalls = %d, want at least 2", parentListCalls)
+	}
+}
+
+func TestBdStoreWaitForParentRemovalProjection(t *testing.T) {
+	var mu sync.Mutex
+	showCalls := 0
+	oldParentListCalls := 0
+
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		cmd := strings.Join(args, " ")
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch cmd {
+		case "show --json bd-child":
+			showCalls++
+			if showCalls == 1 {
+				return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-parent"}]`), nil
+			}
+			return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		case "list --json --include-infra --include-gates --limit 0 --parent bd-parent":
+			oldParentListCalls++
+			if oldParentListCalls == 1 {
+				return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-parent"}]`), nil
+			}
+			return []byte(`[]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", cmd)
+		}
+	}
+
+	s := beads.NewBdStore("/city", runner)
+	if err := s.WaitForParentProjection(context.Background(), "bd-child", "bd-parent", ""); err != nil {
+		t.Fatalf("WaitForParentProjection: %v", err)
+	}
+	if oldParentListCalls < 2 {
+		t.Fatalf("oldParentListCalls = %d, want at least 2", oldParentListCalls)
+	}
+}
+
+func TestBdStoreWaitForParentProjectionDetectsSupersededParent(t *testing.T) {
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		cmd := strings.Join(args, " ")
+		switch cmd {
+		case "list --json --include-infra --include-gates --limit 0 --parent bd-new":
+			return []byte(`[]`), nil
+		case "list --json --include-infra --include-gates --limit 0 --parent bd-old":
+			return []byte(`[]`), nil
+		case "show --json bd-child":
+			return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-other"}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", cmd)
+		}
+	}
+
+	s := beads.NewBdStore("/city", runner)
+	err := s.WaitForParentProjection(context.Background(), "bd-child", "bd-old", "bd-new")
+	if !errors.Is(err, beads.ErrParentProjectionSuperseded) {
+		t.Fatalf("err = %v, want ErrParentProjectionSuperseded", err)
+	}
+}
+
+func TestBdStoreWaitForParentProjectionGetsBeforeListing(t *testing.T) {
+	var mu sync.Mutex
+	showCalls := 0
+	listedBeforeCurrentParentChanged := false
+
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		cmd := strings.Join(args, " ")
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch cmd {
+		case "show --json bd-child":
+			showCalls++
+			if showCalls == 1 {
+				return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-old"}]`), nil
+			}
+			return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-new"}]`), nil
+		case "list --json --include-infra --include-gates --limit 0 --parent bd-old":
+			if showCalls < 2 {
+				listedBeforeCurrentParentChanged = true
+			}
+			return []byte(`[]`), nil
+		case "list --json --include-infra --include-gates --limit 0 --parent bd-new":
+			if showCalls < 2 {
+				listedBeforeCurrentParentChanged = true
+			}
+			return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-new"}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: bd %s", cmd)
+		}
+	}
+
+	s := beads.NewBdStore("/city", runner)
+	if err := s.WaitForParentProjection(context.Background(), "bd-child", "bd-old", "bd-new"); err != nil {
+		t.Fatalf("WaitForParentProjection: %v", err)
+	}
+	if listedBeforeCurrentParentChanged {
+		t.Fatal("WaitForParentProjection listed parent children before Get observed the new parent")
+	}
+}
+
+func TestBdStoreCloseCLIError(t *testing.T) {
+	// CLI error should NOT be wrapped as ErrNotFound.
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("connection refused")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.Close("bd-abc-123")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("CLI error should not be ErrNotFound, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("error should contain original message, got %v", err)
+	}
+}
+
+func TestBdStoreCloseAllReturnsMetadataWriteFailure(t *testing.T) {
+	metadataErr := errors.New("metadata write failed")
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd update --json bd-abc-123 --set-metadata source=wave1`: {
+			err: metadataErr,
+		},
+		`bd close --force --json bd-abc-123`: {
+			out: []byte(`[{"id":"bd-abc-123","title":"test","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+	})
+
+	s := beads.NewBdStore("/city", runner)
+	closed, err := s.CloseAll([]string{"bd-abc-123"}, map[string]string{"source": "wave1"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if closed != 0 {
+		t.Fatalf("closed = %d, want 0", closed)
+	}
+	if !strings.Contains(err.Error(), `setting metadata on "bd-abc-123"`) {
+		t.Fatalf("error = %q, want metadata context", err)
+	}
+	if !errors.Is(err, metadataErr) {
+		t.Fatalf("error = %v, want wrapped metadata error", err)
+	}
+}
+
+func TestBdStoreCloseAllWritesSharedMetadataInSingleBatch(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd update --json bd-1 bd-2 --set-metadata source=wave1`: {
+			out: []byte(`[]`),
+		},
+		`bd close --force --json bd-1 bd-2`: {
+			out: []byte(`[
+				{"id":"bd-1","title":"one","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-2","title":"two","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}
+			]`),
+		},
+	})
+
+	s := beads.NewBdStore("/city", runner)
+	closed, err := s.CloseAll([]string{"bd-1", "bd-2"}, map[string]string{"source": "wave1"})
+	if err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("closed = %d, want 2", closed)
+	}
+}
+
+func TestBdStoreCloseAllReturnsPartialCountAndErrorOnFallbackFailure(t *testing.T) {
+	batchErr := errors.New("batch close failed")
+	individualErr := errors.New("single close failed")
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd close --force --json bd-1 bd-2`: {
+			err: batchErr,
+		},
+		`bd close --force --json bd-1`: {
+			out: []byte(`[{"id":"bd-1","title":"one","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+		`bd close --force --json bd-2`: {
+			err: individualErr,
+		},
+		`bd show --json bd-2`: {
+			out: []byte(`[{"id":"bd-2","title":"two","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+	})
+
+	s := beads.NewBdStore("/city", runner)
+	closed, err := s.CloseAll([]string{"bd-1", "bd-2"}, nil)
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1", closed)
+	}
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, batchErr) {
+		t.Fatalf("error = %v, want wrapped batch error", err)
+	}
+	if !errors.Is(err, individualErr) {
+		t.Fatalf("error = %v, want wrapped individual error", err)
+	}
+	if !strings.Contains(err.Error(), `closing bead "bd-2"`) {
+		t.Fatalf("error = %q, want failing bead context", err)
+	}
+}
+
+func TestBdStoreCloseAllFallbackSuccessReturnsNil(t *testing.T) {
+	batchErr := errors.New("batch close failed")
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd close --force --json bd-1 bd-2`: {
+			err: batchErr,
+		},
+		`bd close --force --json bd-1`: {
+			out: []byte(`[{"id":"bd-1","title":"one","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+		`bd close --force --json bd-2`: {
+			out: []byte(`[{"id":"bd-2","title":"two","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+	})
+
+	s := beads.NewBdStore("/city", runner)
+	closed, err := s.CloseAll([]string{"bd-1", "bd-2"}, nil)
+	if err != nil {
+		t.Fatalf("CloseAll returned error after successful fallback: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("closed = %d, want 2", closed)
+	}
+}
+
+func TestBdStoreCloseAllFallbackForwardsCloseReason(t *testing.T) {
+	const reason = "order-tracking sweep: stale beyond watchdog window"
+	batchErr := errors.New("batch close failed")
+	var closeCalls [][]string
+	closedIDs := map[string]bool{}
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "update":
+			return []byte(`[]`), nil
+		case "close":
+			call := append([]string(nil), args...)
+			closeCalls = append(closeCalls, call)
+			key := strings.Join(args, " ")
+			switch key {
+			case "close --force --json --reason " + reason + " bd-1 bd-2":
+				return nil, batchErr
+			case "close --force --json --reason " + reason + " bd-1":
+				closedIDs["bd-1"] = true
+				return []byte(`[{"id":"bd-1","title":"one","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+			case "close --force --json --reason " + reason + " bd-2":
+				closedIDs["bd-2"] = true
+				return []byte(`[{"id":"bd-2","title":"two","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+			default:
+				return nil, fmt.Errorf("unexpected close args: %v", args)
+			}
+		case "show":
+			id := args[len(args)-1]
+			status := "open"
+			if closedIDs[id] {
+				status = "closed"
+			}
+			return []byte(`[{"id":"` + id + `","title":"open","status":"` + status + `","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: %v", args)
+		}
+	}
+
+	s := beads.NewBdStore("/city", runner)
+	closed, err := s.CloseAll([]string{"bd-1", "bd-2"}, map[string]string{
+		"close_reason": reason,
+	})
+	if err != nil {
+		t.Fatalf("CloseAll returned error after reason-aware fallback: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("closed = %d, want 2", closed)
+	}
+
+	want := [][]string{
+		{"close", "--force", "--json", "--reason", reason, "bd-1", "bd-2"},
+		{"close", "--force", "--json", "--reason", reason, "bd-1"},
+		{"close", "--force", "--json", "--reason", reason, "bd-2"},
+	}
+	if got := fmt.Sprint(closeCalls); got != fmt.Sprint(want) {
+		t.Fatalf("close calls = %v, want %v", closeCalls, want)
+	}
+}
+
+// captureCloseAllRunner returns a CommandRunner that records the args
+// of any `close` invocation into the provided slice and returns canned
+// closed-status JSON for every bead in the batch. update calls (from
+// SetMetadataBatch) succeed with empty output. Used by the
+// CloseAll-close-reason-forwarding tests below to assert the exact
+// shape of the bd close argv.
+func captureCloseAllRunner(closeArgs *[]string, ids ...string) beads.CommandRunner {
+	closedJSON := []byte(`[`)
+	for i, id := range ids {
+		if i > 0 {
+			closedJSON = append(closedJSON, ',')
+		}
+		closedJSON = append(closedJSON, []byte(`{"id":"`+id+`","title":"t","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`)...)
+	}
+	closedJSON = append(closedJSON, ']')
+	return func(_, _ string, args ...string) ([]byte, error) {
+		if len(args) == 0 {
+			return nil, fmt.Errorf("empty args")
+		}
+		switch args[0] {
+		case "update":
+			return []byte(`[]`), nil
+		case "close":
+			*closeArgs = append([]string{}, args...)
+			return closedJSON, nil
+		}
+		return nil, fmt.Errorf("unexpected command: %v", args)
+	}
+}
+
+// TestBdStoreCloseAllForwardsCloseReason verifies that when the metadata
+// map passed to CloseAll contains a close_reason value, BdStore forwards
+// it as the --reason argument to bd close. This is required for cities
+// running with validation.on-close=error, where bd rejects close calls
+// without an explicit reason of >=20 characters. Mirrors the per-bead
+// BdStore.Close pattern for the batch path: CloseAll uses the shared
+// metadata map's close_reason because callers stamp the same metadata
+// on every bead in the batch.
+func TestBdStoreCloseAllForwardsCloseReason(t *testing.T) {
+	const reason = "order-tracking sweep: stale beyond watchdog window"
+	var closeArgs []string
+	runner := captureCloseAllRunner(&closeArgs, "bd-1", "bd-2")
+
+	s := beads.NewBdStore("/city", runner)
+	n, err := s.CloseAll([]string{"bd-1", "bd-2"}, map[string]string{
+		"close_reason": reason,
+	})
+	if err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("closed = %d, want 2", n)
+	}
+
+	// Expected argv: close --force --json --reason "<phrase>" bd-1 bd-2
+	want := []string{"close", "--force", "--json", "--reason", reason, "bd-1", "bd-2"}
+	if len(closeArgs) != len(want) {
+		t.Fatalf("close args length = %d, want %d\ngot:  %v\nwant: %v", len(closeArgs), len(want), closeArgs, want)
+	}
+	for i := range want {
+		if closeArgs[i] != want[i] {
+			t.Errorf("close args[%d] = %q, want %q\nfull args: %v", i, closeArgs[i], want[i], closeArgs)
+		}
+	}
+}
+
+func TestBdStoreCloseAllWithReasonSkipsMetadataWrites(t *testing.T) {
+	const reason = "mail archive: bounded advisory cleanup"
+	commands := make([]string, 0, 1)
+	runner := func(_ string, name string, args ...string) ([]byte, error) {
+		cmd := name + " " + strings.Join(args, " ")
+		commands = append(commands, cmd)
+		if strings.HasPrefix(cmd, "bd update ") {
+			t.Fatalf("CloseAllWithReason must not pre-write metadata: %s", cmd)
+		}
+		if cmd != "bd close --force --json --reason "+reason+" bd-1 bd-2" {
+			return nil, fmt.Errorf("unexpected command: %s", cmd)
+		}
+		return []byte(`[
+			{"id":"bd-1","title":"one","status":"closed","issue_type":"message","created_at":"2025-01-15T10:30:00Z"},
+			{"id":"bd-2","title":"two","status":"closed","issue_type":"message","created_at":"2025-01-15T10:30:00Z"}
+		]`), nil
+	}
+
+	s := beads.NewBdStore("/city", runner)
+	closed, err := s.CloseAllWithReason([]string{"bd-1", "bd-2"}, reason)
+	if err != nil {
+		t.Fatalf("CloseAllWithReason: %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("closed = %d, want 2", closed)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("commands = %v, want exactly one close command", commands)
+	}
+}
+
+// TestBdStoreCloseAllOmitsReasonWhenAbsent verifies that when no
+// close_reason is present in the metadata map, CloseAll does not pass
+// --reason and lets bd assign its default. Preserves backward
+// compatibility for callers that don't pre-stamp a reason.
+func TestBdStoreCloseAllOmitsReasonWhenAbsent(t *testing.T) {
+	var closeArgs []string
+	runner := captureCloseAllRunner(&closeArgs, "bd-1")
+
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.CloseAll([]string{"bd-1"}, map[string]string{
+		"source": "wave1",
+	}); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+
+	for _, arg := range closeArgs {
+		if arg == "--reason" {
+			t.Errorf("close args contain --reason for metadata without close_reason: %v", closeArgs)
+			return
+		}
+	}
+}
+
+// TestBdStoreCloseAllOmitsReasonWhenNilMetadata verifies that when nil
+// metadata is passed, CloseAll does not pass --reason. Same shape as
+// the absent-key case but exercises the empty-map branch (nil maps
+// read as empty in Go).
+func TestBdStoreCloseAllOmitsReasonWhenNilMetadata(t *testing.T) {
+	var closeArgs []string
+	runner := captureCloseAllRunner(&closeArgs, "bd-1")
+
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.CloseAll([]string{"bd-1"}, nil); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+
+	for _, arg := range closeArgs {
+		if arg == "--reason" {
+			t.Errorf("close args contain --reason for nil metadata: %v", closeArgs)
+			return
+		}
+	}
+}
+
+// TestBdStoreCloseAllTrimsCloseReason verifies that whitespace
+// surrounding metadata.close_reason is stripped before forwarding, so
+// leading/trailing newlines or spaces from metadata persistence don't
+// pass through to bd's validator.
+func TestBdStoreCloseAllTrimsCloseReason(t *testing.T) {
+	var closeArgs []string
+	runner := captureCloseAllRunner(&closeArgs, "bd-1")
+
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.CloseAll([]string{"bd-1"}, map[string]string{
+		"close_reason": "  order-tracking sweep: stale beyond watchdog window  \n",
+	}); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+
+	const want = "order-tracking sweep: stale beyond watchdog window"
+	for i, arg := range closeArgs {
+		if arg == "--reason" && i+1 < len(closeArgs) {
+			if closeArgs[i+1] != want {
+				t.Errorf("forwarded reason = %q, want %q (trimmed)", closeArgs[i+1], want)
+			}
+			return
+		}
+	}
+	t.Errorf("close args missing --reason: %v", closeArgs)
+}
+
+// TestBdStoreCloseAllWhitespaceCloseReason verifies that a
+// whitespace-only close_reason is treated as absent — no --reason is
+// forwarded. Mirrors the trim-then-empty-check pattern.
+func TestBdStoreCloseAllWhitespaceCloseReason(t *testing.T) {
+	var closeArgs []string
+	runner := captureCloseAllRunner(&closeArgs, "bd-1")
+
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.CloseAll([]string{"bd-1"}, map[string]string{
+		"close_reason": "   \n",
+	}); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+
+	for _, arg := range closeArgs {
+		if arg == "--reason" {
+			t.Errorf("close args contain --reason for whitespace-only close_reason: %v", closeArgs)
+			return
+		}
+	}
+}
+
+func TestBdStoreDoltliteLifecycleMutationsRetryTransientWrites(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*beads.BdStore) error
+	}{
+		{
+			name: "CloseWithReason",
+			run:  func(s *beads.BdStore) error { return s.CloseWithReason("bd-1", "done") },
+		},
+		{
+			name: "CloseAll",
+			run: func(s *beads.BdStore) error {
+				_, err := s.CloseAll([]string{"bd-1"}, nil)
+				return err
+			},
+		},
+		{
+			name: "CloseAllWithReason",
+			run: func(s *beads.BdStore) error {
+				_, err := s.CloseAllWithReason([]string{"bd-1"}, "done")
+				return err
+			},
+		},
+		{
+			name: "Reopen",
+			run:  func(s *beads.BdStore) error { return s.Reopen("bd-1") },
+		},
+		{
+			name: "Delete",
+			run:  func(s *beads.BdStore) error { return s.Delete("bd-1") },
+		},
+		{
+			name: "DepRemove",
+			run:  func(s *beads.BdStore) error { return s.DepRemove("bd-1", "bd-2") },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := doltliteBdStoreTestDir(t)
+			closed := false
+			var writes [][]string
+			runner := func(_, name string, args ...string) ([]byte, error) {
+				if name != "bd" {
+					return nil, fmt.Errorf("unexpected command name %q", name)
+				}
+				unwrapped := stripDoltliteAutoCommitArgs(args)
+				switch unwrapped[0] {
+				case "show":
+					status := "open"
+					if closed {
+						status = "closed"
+					}
+					return []byte(`[{"id":"bd-1","title":"one","status":"` + status + `","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+				case "close", "reopen", "delete", "dep":
+					writes = append(writes, append([]string(nil), args...))
+					if len(writes) == 1 {
+						return nil, fmt.Errorf("Error 1213 (40001): serialization failure")
+					}
+					if unwrapped[0] == "close" {
+						closed = true
+					}
+					return []byte(`[{"id":"bd-1","title":"one","status":"closed","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`), nil
+				default:
+					return nil, fmt.Errorf("unexpected command: bd %s", strings.Join(args, " "))
+				}
+			}
+			s := beads.NewBdStore(dir, runner)
+			if err := tt.run(s); err != nil {
+				t.Fatalf("%s: %v", tt.name, err)
+			}
+			if len(writes) != 2 {
+				t.Fatalf("write calls = %d, want 2 transient retry attempts: %v", len(writes), writes)
+			}
+			for i, args := range writes {
+				if got := strings.Join(args[:2], " "); got != "--dolt-auto-commit off" {
+					t.Fatalf("write[%d] args = %q, want DoltLite auto-commit guard", i, strings.Join(args, " "))
+				}
+			}
+		})
+	}
+}
+
+func stripDoltliteAutoCommitArgs(args []string) []string {
+	if len(args) >= 2 && args[0] == "--dolt-auto-commit" && args[1] == "off" {
+		return args[2:]
+	}
+	return args
+}
+
+// --- List ---
+
+func TestBdStoreList(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --include-infra --include-gates --limit 0`: {
+			out: []byte(`[{"id":"bd-aaa","title":"first","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},{"id":"bd-bbb","title":"second","status":"closed","issue_type":"bug","created_at":"2025-01-15T10:31:00Z"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.ListOpen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListOpen() returned %d beads, want 1", len(got))
+	}
+	if got[0].ID != "bd-aaa" {
+		t.Errorf("got[0].ID = %q, want %q", got[0].ID, "bd-aaa")
+	}
+	if got[0].Status != "open" {
+		t.Errorf("got[0].Status = %q, want %q", got[0].Status, "open")
+	}
+}
+
+func TestBdStoreListDecodesIsBlockedProjection(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --include-infra --include-gates --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-blocked","title":"blocked","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","is_blocked":1},
+				{"id":"bd-ready","title":"ready","status":"open","issue_type":"task","created_at":"2025-01-15T10:31:00Z","is_blocked":false}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.ListOpen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListOpen() returned %d beads, want 2", len(got))
+	}
+	if got[0].IsBlocked == nil || !*got[0].IsBlocked {
+		t.Fatalf("got[0].IsBlocked = %v, want true", got[0].IsBlocked)
+	}
+	if got[1].IsBlocked == nil || *got[1].IsBlocked {
+		t.Fatalf("got[1].IsBlocked = %v, want false", got[1].IsBlocked)
+	}
+}
+
+func TestBdStoreListEmpty(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --include-infra --include-gates --limit 0`: {out: []byte(`[]`)},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.ListOpen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("List() returned %d beads, want 0", len(got))
+	}
+}
+
+func TestBdStoreListEmptyOutputMeansNoBeads(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --include-infra --include-gates --limit 0`: {out: []byte(" \n\t")},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.ListOpen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("List() returned %d beads, want 0", len(got))
+	}
+}
+
+func TestBdStoreListSkipLabelsEmitsFlagWhenOptedIn(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "version" {
+			t.Fatal("bd list --skip-labels support must come from explicit store config, not a bd version probe")
+		}
+		gotCmd = name + " " + strings.Join(args, " ")
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner, beads.WithBdStoreListSkipLabels(true))
+	if _, err := s.List(beads.ListQuery{AllowScan: true, SkipLabels: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotCmd, "--skip-labels") {
+		t.Fatalf("bd list command = %q, want --skip-labels flag", gotCmd)
+	}
+}
+
+// TestBdStoreListSkipLabelsOmittedByDefault is the regression test for the
+// unconditional --skip-labels emit introduced in 994d544fc: bd 1.0.4 (the
+// supported floor) rejects the flag, so the default store must fall back to
+// normal label hydration unless the caller opts into bd 1.0.5 semantics.
+func TestBdStoreListSkipLabelsOmittedByDefault(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "version" {
+			t.Fatal("bd list --skip-labels support must come from explicit store config, not a bd version probe")
+		}
+		gotCmd = name + " " + strings.Join(args, " ")
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.List(beads.ListQuery{AllowScan: true, SkipLabels: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(gotCmd, "--skip-labels") {
+		t.Fatalf("bd list command = %q, bd 1.0.4 does not support --skip-labels", gotCmd)
+	}
+}
+
+func TestBdStoreListSkipLabelsOmittedWhenOptedOut(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "version" {
+			t.Fatal("bd list --skip-labels support must come from explicit store config, not a bd version probe")
+		}
+		gotCmd = name + " " + strings.Join(args, " ")
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner, beads.WithBdStoreListSkipLabels(false))
+	if _, err := s.List(beads.ListQuery{AllowScan: true, SkipLabels: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(gotCmd, "--skip-labels") {
+		t.Fatalf("bd list command = %q, want --skip-labels omitted when opted out", gotCmd)
+	}
+}
+
+func TestBdStoreListAcceptsBdListEnvelope(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "version" {
+			t.Fatal("bd list --skip-labels support must come from explicit store config, not a bd version probe")
+		}
+		gotCmd = name + " " + strings.Join(args, " ")
+		return []byte(`{
+			"issues": [
+				{"id":"bd-envelope","title":"from envelope","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}
+			],
+			"meta": {"count": 1, "skip_labels": true},
+			"schema_version": 1
+		}`), nil
+	}
+	s := beads.NewBdStore("/city", runner, beads.WithBdStoreListSkipLabels(true))
+	got, err := s.List(beads.ListQuery{AllowScan: true, SkipLabels: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotCmd, "--skip-labels") {
+		t.Fatalf("bd list command = %q, want --skip-labels flag", gotCmd)
+	}
+	if len(got) != 1 || got[0].ID != "bd-envelope" {
+		t.Fatalf("List() = %+v, want bd-envelope from envelope", got)
+	}
+}
+
+func TestBdStoreListSkipLabelsOmittedForLabelFilter(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd = name + " " + strings.Join(args, " ")
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.List(beads.ListQuery{Label: "order-tracking", SkipLabels: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(gotCmd, "--skip-labels") {
+		t.Fatalf("bd list command = %q, --skip-labels cannot combine with label filters", gotCmd)
+	}
+}
+
+func TestBdStoreListError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.ListOpen()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "bd list") {
+		t.Errorf("error = %q, want to contain 'bd list'", err)
+	}
+}
+
+func TestBdStoreListReturnsPartialResultsOnCorruptEntries(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --include-infra --include-gates --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-good","title":"good","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-bad","title":"bad","status":"open","issue_type":"task","created_at":"not-a-time"}
+			]`),
+		},
+	})
+
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.ListOpen()
+	if len(got) != 1 || got[0].ID != "bd-good" {
+		t.Fatalf("ListOpen() = %v, want only bd-good", got)
+	}
+	var partial *beads.PartialResultError
+	if !errors.As(err, &partial) {
+		t.Fatalf("ListOpen() error = %v, want *beads.PartialResultError so callers can distinguish complete from partial results", err)
+	}
+	if partial.Op != "bd list" {
+		t.Errorf("PartialResultError.Op = %q, want %q", partial.Op, "bd list")
+	}
+	if partial.Err == nil {
+		t.Errorf("PartialResultError.Err is nil; want wrapped parse error")
+	}
+}
+
+func TestBdStoreListReturnsHardErrorWithoutUsableSurvivors(t *testing.T) {
+	tests := []struct {
+		name string
+		out  []byte
+	}{
+		{
+			name: "malformed top-level json",
+			out:  []byte(`{not-json`),
+		},
+		{
+			name: "all entries corrupt",
+			out: []byte(`[
+				{"id":"bd-bad","title":"bad","status":"open","issue_type":"task","created_at":"not-a-time"}
+			]`),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := fakeRunner(map[string]struct {
+				out []byte
+				err error
+			}{
+				`bd list --json --include-infra --include-gates --limit 0`: {out: tc.out},
+			})
+
+			s := beads.NewBdStore("/city", runner)
+			got, err := s.ListOpen()
+			if err == nil {
+				t.Fatal("ListOpen() error = nil, want hard parse error")
+			}
+			if len(got) != 0 {
+				t.Fatalf("ListOpen() returned %v, want no usable survivors", got)
+			}
+			var partial *beads.PartialResultError
+			if errors.As(err, &partial) {
+				t.Fatalf("ListOpen() error = %v, want hard parse error not *PartialResultError", err)
+			}
+			if !strings.Contains(err.Error(), "bd list") {
+				t.Fatalf("ListOpen() error = %q, want bd list context", err)
+			}
+		})
+	}
+}
+
+// TestBdStoreListErrorIncludesRawBdOutput is a regression net for the
+// gascity #1726 / #2040 failure mode: when `bd list --json` returns non-JSON
+// output, the resulting error must include the raw bd stdout so the failure
+// surface is diagnosable rather than the opaque json.Unmarshal message
+// (e.g. "invalid character 'N' looking for beginning of value" with no clue
+// what 'N' was). Historical example: bd shipped with Gas City v1.0.0
+// returned the literal string "None\n" instead of a JSON array.
+func TestBdStoreListErrorIncludesRawBdOutput(t *testing.T) {
+	tests := []struct {
+		name        string
+		out         []byte
+		wantInError string
+	}{
+		{
+			name:        "literal None (historical #1726 shape)",
+			out:         []byte("None\n"),
+			wantInError: "None",
+		},
+		{
+			name:        "plain text error accidentally on stdout",
+			out:         []byte("error: connection refused\n"),
+			wantInError: "connection refused",
+		},
+		{
+			name:        "truncated JSON",
+			out:         []byte(`[{"id":"bd-aaa","title":"first"`),
+			wantInError: `bd-aaa`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := fakeRunner(map[string]struct {
+				out []byte
+				err error
+			}{
+				`bd list --json --include-infra --include-gates --limit 0`: {out: tc.out},
+			})
+
+			s := beads.NewBdStore("/city", runner)
+			got, err := s.ListOpen()
+			if err == nil {
+				t.Fatalf("ListOpen() error = nil, want diagnostic parse error")
+			}
+			if len(got) != 0 {
+				t.Fatalf("ListOpen() returned %v, want no usable survivors", got)
+			}
+			if !strings.Contains(err.Error(), tc.wantInError) {
+				t.Errorf("ListOpen() error = %q; want substring %q so callers can see the raw bd output",
+					err.Error(), tc.wantInError)
+			}
+			if !strings.Contains(err.Error(), "bd list") {
+				t.Errorf("ListOpen() error = %q; want 'bd list' context prefix", err.Error())
+			}
+		})
+	}
+}
+
+func TestBdStoreReadyReturnsPartialResultErrorOnCorruptEntries(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-good","title":"good","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-bad","title":"bad","status":"open","issue_type":"task","created_at":"not-a-time"}
+			]`),
+		},
+	})
+
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready()
+	if len(got) != 1 || got[0].ID != "bd-good" {
+		t.Fatalf("Ready() = %v, want only bd-good", got)
+	}
+	var partial *beads.PartialResultError
+	if !errors.As(err, &partial) {
+		t.Fatalf("Ready() error = %v, want *beads.PartialResultError", err)
+	}
+	if partial.Op != "bd ready" {
+		t.Errorf("PartialResultError.Op = %q, want %q", partial.Op, "bd ready")
+	}
+}
+
+func TestBdStoreReadyReturnsHardErrorWithoutUsableSurvivors(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-bad","title":"bad","status":"open","issue_type":"task","created_at":"not-a-time"}
+			]`),
+		},
+	})
+
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready()
+	if err == nil {
+		t.Fatal("Ready() error = nil, want hard parse error")
+	}
+	if len(got) != 0 {
+		t.Fatalf("Ready() returned %v, want no usable survivors", got)
+	}
+	var partial *beads.PartialResultError
+	if errors.As(err, &partial) {
+		t.Fatalf("Ready() error = %v, want hard parse error not *PartialResultError", err)
+	}
+	if !strings.Contains(err.Error(), "bd ready") {
+		t.Fatalf("Ready() error = %q, want bd ready context", err)
+	}
+}
+
+func TestBdStoreListIncludesInfra(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.ListOpen(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(gotArgs, " "), "--include-infra") {
+		t.Fatalf("args = %q, want --include-infra", strings.Join(gotArgs, " "))
+	}
+}
+
+func TestBdStoreListRetriesOnInvalidConnection(t *testing.T) {
+	calls := 0
+	goodJSON := []byte(`[{"id":"bd-x","title":"t","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`)
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, fmt.Errorf("begin read tx: invalid connection")
+		}
+		return goodJSON, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.ListOpen()
+	if err != nil {
+		t.Fatalf("ListOpen() error = %v, want nil after retry recovered", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListOpen() returned %d beads, want 1", len(got))
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (1 transient + 1 success)", calls)
+	}
+}
+
+func TestBdStoreListRetryBoundedReturnsErrorAfterExhaustion(t *testing.T) {
+	calls := 0
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		calls++
+		return nil, fmt.Errorf("begin read tx: invalid connection")
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.ListOpen()
+	if err == nil {
+		t.Fatal("ListOpen() error = nil, want error after retries exhausted")
+	}
+	if calls < 2 {
+		t.Fatalf("calls = %d, want >= 2 (retry must be attempted)", calls)
+	}
+}
+
+// --- Ready ---
+
+func TestBdStoreReady(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {
+			out: []byte(`[{"id":"bd-aaa","title":"ready one","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Ready() returned %d beads, want 1", len(got))
+	}
+	if got[0].Title != "ready one" {
+		t.Errorf("got[0].Title = %q, want %q", got[0].Title, "ready one")
+	}
+}
+
+func TestBdStoreReadyWithAssigneeAndLimit(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --assignee worker-1 --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-worker","title":"ready one","status":"open","issue_type":"task","assignee":"worker-1","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-other","title":"wrong assignee","status":"open","issue_type":"task","assignee":"worker-2","created_at":"2025-01-15T10:31:00Z"}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready(beads.ReadyQuery{Assignee: "worker-1", Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Ready(assignee) returned %d beads, want 1", len(got))
+	}
+	if got[0].ID != "bd-worker" {
+		t.Fatalf("Ready(assignee)[0].ID = %q, want bd-worker", got[0].ID)
+	}
+}
+
+func TestBdStoreReadyWithTierBothAssigneeAppliesLimitAfterClientFilter(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --include-ephemeral --assignee worker-1 --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-session","title":"session marker","status":"open","issue_type":"task","assignee":"worker-1","created_at":"2025-01-15T10:29:00Z","labels":["gc:session"]},
+				{"id":"bd-worker","title":"ready one","status":"open","issue_type":"task","assignee":"worker-1","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-wisp","title":"ready wisp","status":"open","issue_type":"task","assignee":"worker-1","created_at":"2025-01-15T10:31:00Z","ephemeral":true}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready(beads.ReadyQuery{Assignee: "worker-1", Limit: 2, TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Ready(TierBoth, assignee) returned %d beads, want 2", len(got))
+	}
+	if got[1].ID != "bd-wisp" {
+		t.Fatalf("Ready(TierBoth, assignee)[1].ID = %q, want bd-wisp", got[1].ID)
+	}
+}
+
+func TestBdStoreReadyWispsAppliesLimitAfterTierFilter(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd = name + " " + strings.Join(args, " ")
+		return []byte(`[
+			{"id":"bd-issue","title":"normal ready work","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
+			{"id":"bd-wisp","title":"ready wisp","status":"open","issue_type":"task","created_at":"2025-01-15T10:31:00Z","ephemeral":true},
+			{"id":"bd-wisp-2","title":"second ready wisp","status":"open","issue_type":"task","created_at":"2025-01-15T10:32:00Z","ephemeral":true}
+		]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready(beads.ReadyQuery{TierMode: beads.TierWisps, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotCmd, "--include-ephemeral") {
+		t.Fatalf("bd ready command = %q, want --include-ephemeral", gotCmd)
+	}
+	if strings.Contains(gotCmd, "--limit 1") {
+		t.Fatalf("bd ready command = %q, must not pre-limit before wisp filtering", gotCmd)
+	}
+	if !strings.Contains(gotCmd, "--limit 0") {
+		t.Fatalf("bd ready command = %q, want unbounded pre-filter read", gotCmd)
+	}
+	if len(got) != 1 || got[0].ID != "bd-wisp" {
+		t.Fatalf("Ready(TierWisps, Limit:1) = %+v, want first wisp after tier filtering", got)
+	}
+}
+
+func TestBdStoreReadyDoesNotSpecialCaseSyntheticMetadata(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-synthetic","title":"synthetic unit","status":"open","issue_type":"task","created_at":"2025-01-15T10:29:00Z","metadata":{"gc.synthetic":"true"}},
+				{"id":"bd-task","title":"ready one","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-extra","title":"ready two","status":"open","issue_type":"task","created_at":"2025-01-15T10:31:00Z"}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready(beads.ReadyQuery{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Ready(limit) returned %d beads, want 1", len(got))
+	}
+	if got[0].ID != "bd-synthetic" {
+		t.Fatalf("Ready(limit)[0].ID = %q, want bd-synthetic", got[0].ID)
+	}
+}
+
+func TestBdStoreReadyFiltersExcludedLabelsBeforeLimit(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-order","title":"order bookkeeping","status":"open","issue_type":"task","labels":["order-tracking"],"created_at":"2025-01-15T10:29:00Z"},
+				{"id":"bd-task","title":"ready one","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-extra","title":"ready two","status":"open","issue_type":"task","created_at":"2025-01-15T10:31:00Z"}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready(beads.ReadyQuery{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Ready(limit) returned %d beads, want 1", len(got))
+	}
+	if got[0].ID != "bd-task" {
+		t.Fatalf("Ready(limit)[0].ID = %q, want bd-task after excluded label filtering", got[0].ID)
+	}
+}
+
+func TestBdStoreReadyFiltersInfraTypes(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-task","title":"ready one","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-session","title":"infra session","status":"open","issue_type":"session","created_at":"2025-01-15T10:31:00Z"},
+				{"id":"bd-convoy","title":"sling convoy","status":"open","issue_type":"convoy","created_at":"2025-01-15T10:32:00Z"}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Ready() returned %d beads, want 1", len(got))
+	}
+	if got[0].ID != "bd-task" {
+		t.Fatalf("Ready()[0].ID = %q, want %q", got[0].ID, "bd-task")
+	}
+}
+
+func TestBdStoreReadyFiltersFutureDeferredRows(t *testing.T) {
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-task","title":"ready one","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
+				{"id":"bd-deferred","title":"not yet","status":"open","issue_type":"task","created_at":"2025-01-15T10:31:00Z","defer_until":"` + future + `"}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Ready() returned %d beads, want 1", len(got))
+	}
+	if got[0].ID != "bd-task" {
+		t.Fatalf("Ready()[0].ID = %q, want bd-task", got[0].ID)
+	}
+}
+
+func TestBdStoreReadyEmpty(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {out: []byte(`[]`)},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("Ready() returned %d beads, want 0", len(got))
+	}
+}
+
+func TestBdStoreReadyError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Ready()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "bd ready") {
+		t.Errorf("error = %q, want to contain 'bd ready'", err)
+	}
+}
+
+func TestBdStoreReadyReturnsParseErrorOnMalformedJSON(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd ready --json --limit 0`: {
+			out: []byte(`{not json`),
+		},
+	})
+
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Ready()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "parsing JSON") {
+		t.Fatalf("error = %q, want parsing JSON context", err)
+	}
+}
+
+// --- Status mapping ---
+
+func TestBdStoreStatusMapping(t *testing.T) {
+	tests := []struct {
+		bdStatus   string
+		wantStatus string
+	}{
+		{"open", "open"},
+		{"in_progress", "in_progress"},
+		{"blocked", "open"},
+		{"review", "open"},
+		{"testing", "open"},
+		{"closed", "closed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.bdStatus, func(t *testing.T) {
+			runner := fakeRunner(map[string]struct {
+				out []byte
+				err error
+			}{
+				`bd show --json bd-x`: {
+					out: []byte(fmt.Sprintf(`[{"id":"bd-x","title":"test","status":%q,"issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`, tt.bdStatus)),
+				},
+			})
+			s := beads.NewBdStore("/city", runner)
+			b, err := s.Get("bd-x")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if b.Status != tt.wantStatus {
+				t.Errorf("status %q → %q, want %q", tt.bdStatus, b.Status, tt.wantStatus)
+			}
+		})
+	}
+}
+
+// --- Init ---
+
+func TestBdStoreInit(t *testing.T) {
+	var gotDir, gotName string
+	var gotArgs []string
+	runner := func(dir, name string, args ...string) ([]byte, error) {
+		gotDir = dir
+		gotName = name
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore("/my/city", runner)
+	if err := s.Init("bright-lights", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if gotDir != "/my/city" {
+		t.Errorf("dir = %q, want %q", gotDir, "/my/city")
+	}
+	if gotName != "bd" {
+		t.Errorf("name = %q, want %q", gotName, "bd")
+	}
+	wantArgs := "init --server -p bright-lights --skip-hooks"
+	if strings.Join(gotArgs, " ") != wantArgs {
+		t.Errorf("args = %q, want %q", strings.Join(gotArgs, " "), wantArgs)
+	}
+}
+
+func TestBdStoreInitWithServerHost(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore("/my/city", runner)
+	if err := s.Init("gc", "dolt.gc.svc.cluster.local", "3307"); err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := "init --server -p gc --skip-hooks --server-host dolt.gc.svc.cluster.local --server-port 3307"
+	if strings.Join(gotArgs, " ") != wantArgs {
+		t.Errorf("args = %q, want %q", strings.Join(gotArgs, " "), wantArgs)
+	}
+}
+
+func TestBdStoreInitError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte("init failed"), fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.Init("test", "", "")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "bd init") {
+		t.Errorf("error = %q, want to contain 'bd init'", err)
+	}
+}
+
+// --- ConfigSet ---
+
+func TestBdStoreConfigSet(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.ConfigSet("issue_prefix", "bl"); err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := "config set issue_prefix bl"
+	if strings.Join(gotArgs, " ") != wantArgs {
+		t.Errorf("args = %q, want %q", strings.Join(gotArgs, " "), wantArgs)
+	}
+}
+
+func TestBdStoreConfigSetError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte("config failed"), fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.ConfigSet("issue_prefix", "bl")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "bd config set") {
+		t.Errorf("error = %q, want to contain 'bd config set'", err)
+	}
+}
+
+// --- Purge ---
+
+func TestBdStorePurge(t *testing.T) {
+	var gotArgs []string
+	var gotDir string
+	var gotEnv []string
+	s := beads.NewBdStore("/city", nil)
+	s.SetPurgeRunner(func(dir string, env []string, args ...string) ([]byte, error) {
+		gotDir = dir
+		gotArgs = args
+		gotEnv = env
+		return []byte(`{"purged_count": 5}`), nil
+	})
+	result, err := s.Purge("/city/rigs/fe/.beads", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Purged != 5 {
+		t.Errorf("Purged = %d, want 5", result.Purged)
+	}
+	// Verify args include purge --json (no --allow-stale: bd purge
+	// does not support that flag).
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "purge") || !strings.Contains(args, "--json") {
+		t.Errorf("args = %q, want purge --json", args)
+	}
+	// Should NOT contain --dry-run.
+	if strings.Contains(args, "--dry-run") {
+		t.Errorf("args = %q, should not contain --dry-run", args)
+	}
+	// Dir should be parent of beads dir.
+	if gotDir != "/city/rigs/fe" {
+		t.Errorf("dir = %q, want %q", gotDir, "/city/rigs/fe")
+	}
+	// Env should contain BEADS_DIR.
+	foundBeadsDir := false
+	for _, e := range gotEnv {
+		if e == "BEADS_DIR=/city/rigs/fe/.beads" {
+			foundBeadsDir = true
+		}
+	}
+	if !foundBeadsDir {
+		t.Errorf("env missing BEADS_DIR; got %v", gotEnv)
+	}
+}
+
+func TestBdStorePurgeDryRun(t *testing.T) {
+	var gotArgs []string
+	s := beads.NewBdStore("/city", nil)
+	s.SetPurgeRunner(func(_ string, _ []string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"purged_count": 0}`), nil
+	})
+	_, err := s.Purge("/city/.beads", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--dry-run") {
+		t.Errorf("args = %q, want --dry-run", args)
+	}
+}
+
+func TestBdStorePurgeError(t *testing.T) {
+	s := beads.NewBdStore("/city", nil)
+	s.SetPurgeRunner(func(_ string, _ []string, _ ...string) ([]byte, error) {
+		return []byte("purge failed"), fmt.Errorf("exit status 1")
+	})
+	_, err := s.Purge("/city/.beads", false)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "bd purge") {
+		t.Errorf("error = %q, want to contain 'bd purge'", err)
+	}
+}
+
+func TestBdStorePurgeBadJSON(t *testing.T) {
+	s := beads.NewBdStore("/city", nil)
+	s.SetPurgeRunner(func(_ string, _ []string, _ ...string) ([]byte, error) {
+		return []byte("not json"), nil
+	})
+	_, err := s.Purge("/city/.beads", false)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "unexpected output") {
+		t.Errorf("error = %q, want to contain 'unexpected output'", err)
+	}
+}
+
+func TestBdStorePurgeMissingCount(t *testing.T) {
+	s := beads.NewBdStore("/city", nil)
+	s.SetPurgeRunner(func(_ string, _ []string, _ ...string) ([]byte, error) {
+		return []byte(`{"other_field": true}`), nil
+	})
+	result, err := s.Purge("/city/.beads", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Missing purged_count should return 0 (not an error).
+	if result.Purged != 0 {
+		t.Errorf("Purged = %d, want 0 (missing field)", result.Purged)
+	}
+}
+
+// --- Create with labels and parent ---
+
+func TestBdStoreCreateWithLabels(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"convoy","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	created, err := s.Create(beads.Bead{Title: "test", Type: "convoy", Labels: []string{"owned"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--labels owned") {
+		t.Errorf("args = %q, want to contain '--labels owned'", args)
+	}
+	if len(created.Labels) != 0 {
+		t.Errorf("created.Labels = %#v, want empty until backend confirms labels", created.Labels)
+	}
+}
+
+func TestBdStoreCreateWithMultipleLabelsUsesSingleFlag(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"convoy","created_at":"2025-01-15T10:30:00Z","labels":["owned","session:gc-x"]}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Create(beads.Bead{Title: "test", Type: "convoy", Labels: []string{"owned", "session:gc-x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--labels owned,session:gc-x") {
+		t.Errorf("args = %q, want to contain '--labels owned,session:gc-x'", args)
+	}
+	if strings.Count(args, "--labels") != 1 {
+		t.Errorf("args = %q, want a single --labels flag", args)
+	}
+}
+
+func TestBdStoreCreateWithParentID(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	created, err := s.Create(beads.Bead{Title: "test", ParentID: "bd-parent-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--parent bd-parent-1") {
+		t.Errorf("args = %q, want to contain '--parent bd-parent-1'", args)
+	}
+	if created.ParentID != "" {
+		t.Errorf("created.ParentID = %q, want empty until backend confirms parent", created.ParentID)
+	}
+}
+
+func TestBdStoreCreateDoesNotBackfillUnconfirmedFields(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","metadata":{"accepted":"true"}}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	created, err := s.Create(beads.Bead{
+		Title:       "test",
+		Description: "local description",
+		ParentID:    "bd-parent-1",
+		Labels:      []string{"owned"},
+		Needs:       []string{"bd-2"},
+		Metadata: map[string]string{
+			"local": "value",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Description != "" {
+		t.Fatalf("created.Description = %q, want empty until backend confirms it", created.Description)
+	}
+	if created.ParentID != "" {
+		t.Fatalf("created.ParentID = %q, want empty until backend confirms it", created.ParentID)
+	}
+	if len(created.Labels) != 0 {
+		t.Fatalf("created.Labels = %#v, want empty until backend confirms them", created.Labels)
+	}
+	if len(created.Needs) != 0 {
+		t.Fatalf("created.Needs = %#v, want empty until backend confirms them", created.Needs)
+	}
+	if len(created.Metadata) != 1 || created.Metadata["accepted"] != "true" {
+		t.Fatalf("created.Metadata = %#v, want backend metadata only", created.Metadata)
+	}
+}
+
+func TestBdStoreDepAddParentChildAlreadyParentedIsNoop(t *testing.T) {
+	calls := make([]string, 0, 1)
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		call := name + " " + strings.Join(args, " ")
+		calls = append(calls, call)
+		switch call {
+		case "bd show --json bd-child":
+			return []byte(`[{"id":"bd-child","title":"child","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","parent":"bd-parent"}]`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command: %s", call)
+		}
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	if err := s.DepAdd("bd-child", "bd-parent", "parent-child"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls = %v, want only bd show", calls)
+	}
+}
+
+func TestBdStoreGetNormalizesShowStyleDependencies(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json bd-child`: {
+			out: []byte(`[
+				{
+					"id":"bd-child",
+					"title":"child",
+					"status":"open",
+					"issue_type":"task",
+					"created_at":"2025-01-15T10:30:00Z",
+					"dependencies":[
+						{
+							"id":"bd-parent",
+							"title":"parent",
+							"status":"open",
+							"issue_type":"task",
+							"dependency_type":"parent-child"
+						},
+						{
+							"issue_id":"",
+							"depends_on_id":"",
+							"type":""
+						}
+					],
+					"parent":"bd-parent"
+				}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+
+	got, err := s.Get("bd-child")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(got.Dependencies) != 1 {
+		t.Fatalf("Dependencies = %#v, want one normalized dependency", got.Dependencies)
+	}
+	dep := got.Dependencies[0]
+	if dep.IssueID != "bd-child" || dep.DependsOnID != "bd-parent" || dep.Type != "parent-child" {
+		t.Fatalf("dependency = %+v, want child -> parent parent-child", dep)
+	}
+}
+
+func TestBdStoreListInfersParentFromParentChildDependency(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --label=real-world-app-contract --include-infra --include-gates --limit 0`: {
+			out: []byte(`[
+				{
+					"id":"bd-child",
+					"title":"child",
+					"status":"open",
+					"issue_type":"task",
+					"created_at":"2025-01-15T10:30:00Z",
+					"labels":["real-world-app-contract"],
+					"dependencies":[
+						{
+							"issue_id":"bd-child",
+							"depends_on_id":"bd-parent",
+							"type":"parent-child"
+						}
+					]
+				}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+
+	got, err := s.List(beads.ListQuery{Label: "real-world-app-contract", Limit: 50})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("List returned %d beads, want 1", len(got))
+	}
+	if got[0].ParentID != "bd-parent" {
+		t.Fatalf("ParentID = %q, want bd-parent", got[0].ParentID)
+	}
+}
+
+func TestBdStoreListMapsUpdatedAt(t *testing.T) {
+	created := time.Date(2026, 5, 30, 6, 52, 8, 0, time.UTC)
+	updated := time.Date(2026, 5, 30, 23, 52, 11, 0, time.UTC)
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --all --include-infra --include-gates --limit 0`: {
+			out: []byte(`[
+				{
+					"id":"ga-updated",
+					"title":"updated bead",
+					"status":"closed",
+					"issue_type":"task",
+					"created_at":"` + created.Format(time.RFC3339) + `",
+					"updated_at":"` + updated.Format(time.RFC3339) + `"
+				}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+
+	got, err := s.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("List returned %d beads, want 1", len(got))
+	}
+	if !got[0].UpdatedAt.Equal(updated) {
+		t.Fatalf("UpdatedAt = %s, want %s", got[0].UpdatedAt, updated)
+	}
+}
+
+func TestBdStoreCreateNoLabelsNoParent(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Create(beads.Bead{Title: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if strings.Contains(args, "--labels") {
+		t.Errorf("args = %q, should not contain --labels when Labels is nil", args)
+	}
+	if strings.Contains(args, "--parent") {
+		t.Errorf("args = %q, should not contain --parent when ParentID is empty", args)
+	}
+}
+
+// --- Update with labels ---
+
+func TestBdStoreUpdateWithLabels(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.Update("bd-42", beads.UpdateOpts{Labels: []string{"pool:hw/polecat", "urgent"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--add-label pool:hw/polecat") {
+		t.Errorf("args = %q, want --add-label pool:hw/polecat", args)
+	}
+	if !strings.Contains(args, "--add-label urgent") {
+		t.Errorf("args = %q, want --add-label urgent", args)
+	}
+}
+
+func TestBdStoreUpdateNoLabels(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	desc := "updated"
+	err := s.Update("bd-42", beads.UpdateOpts{Description: &desc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if strings.Contains(args, "--add-label") {
+		t.Errorf("args = %q, should not contain --add-label when Labels is nil", args)
+	}
+}
+
+// --- SetMetadata ---
+
+func TestBdStoreSetMetadata(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.SetMetadata("bd-42", "merge_strategy", "mr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := "update --json bd-42 --set-metadata merge_strategy=mr"
+	if strings.Join(gotArgs, " ") != wantArgs {
+		t.Errorf("args = %q, want %q", strings.Join(gotArgs, " "), wantArgs)
+	}
+}
+
+func TestBdStoreSetMetadataDisablesAutoCommitForDoltlite(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"backend":"doltlite"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore(dir, runner)
+	if err := s.SetMetadata("bd-42", "merge_strategy", "mr"); err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := "--dolt-auto-commit off update --json bd-42 --set-metadata merge_strategy=mr"
+	if strings.Join(gotArgs, " ") != wantArgs {
+		t.Errorf("args = %q, want %q", strings.Join(gotArgs, " "), wantArgs)
+	}
+}
+
+func TestBdStoreSetMetadataError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.SetMetadata("bd-42", "key", "value")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "setting metadata") {
+		t.Errorf("error = %q, want to contain 'setting metadata'", err)
+	}
+}
+
+func TestBdStoreSetMetadataBatchRetriesDoltSerializationFailure(t *testing.T) {
+	calls := 0
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, fmt.Errorf("exit status 1: Error updating bd-42: dolt commit: Error 1213 (40001): serialization failure: this transaction conflicts with a committed transaction from another client, try restarting transaction")
+		}
+		return []byte(`{"id":"bd-42"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.SetMetadataBatch("bd-42", map[string]string{"state": "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+}
+
+func TestBdStoreSetMetadataCLINotFound(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1: Error updating x: issue not found: bd-42")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.SetMetadata("bd-42", "key", "value")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBdStoreSetMetadataBatchCLINotFound(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1: Error updating x: no issue found matching \"bd-42\"")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.SetMetadataBatch("bd-42", map[string]string{"key": "value"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBdStoreReadPathsSurfaceSilentFallbackMarkerPair(t *testing.T) {
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+echo "auto-importing 220929 bytes from .beads/issues.jsonl into empty database..." >&2
+case "$1" in
+  show)
+    printf '[{"id":"bd-42","title":"fallback read","status":"open","issue_type":"task","created_at":"2026-06-07T00:00:00Z"}]'
+    ;;
+  list)
+    printf '[]'
+    ;;
+  *)
+    echo "unexpected bd command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := beads.ExecCommandRunnerWithEnv(nil)
+	s := beads.NewBdStore(t.TempDir(), runner)
+
+	if _, err := s.Get("bd-42"); !errors.Is(err, beads.ErrBDSilentFallback) {
+		t.Fatalf("Get error = %v, want ErrBDSilentFallback", err)
+	}
+	if _, err := s.List(beads.ListQuery{AllowScan: true}); !errors.Is(err, beads.ErrBDSilentFallback) {
+		t.Fatalf("List error = %v, want ErrBDSilentFallback", err)
+	}
+}
+
+func TestBdStoreReadPathsRequireCompleteSilentFallbackMarkerPair(t *testing.T) {
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+echo "auto-importing schema into initialized local store" >&2
+case "$1" in
+  show)
+    printf '[{"id":"bd-42","title":"normal read","status":"open","issue_type":"task","created_at":"2026-06-07T00:00:00Z"}]'
+    ;;
+  list)
+    printf '[{"id":"bd-42","title":"normal read","status":"open","issue_type":"task","created_at":"2026-06-07T00:00:00Z"}]'
+    ;;
+  *)
+    echo "unexpected bd command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := beads.ExecCommandRunnerWithEnv(nil)
+	s := beads.NewBdStore(t.TempDir(), runner)
+
+	got, err := s.Get("bd-42")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.ID != "bd-42" {
+		t.Fatalf("Get ID = %q, want bd-42", got.ID)
+	}
+	list, err := s.List(beads.ListQuery{AllowScan: true})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 || list[0].ID != "bd-42" {
+		t.Fatalf("List = %+v, want bd-42", list)
+	}
+}
+
+func TestBdStoreReleaseIfCurrentUsesGuardedSQL(t *testing.T) {
+	var gotName string
+	var gotArgs []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return []byte(`{"rows_affected":1,"schema_version":1}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	released, err := s.ReleaseIfCurrent("bd-42", "worker-'1")
+	if err != nil {
+		t.Fatalf("ReleaseIfCurrent: %v", err)
+	}
+	if !released {
+		t.Fatal("ReleaseIfCurrent released = false, want true")
+	}
+	if gotName != "bd" {
+		t.Fatalf("runner name = %q, want bd", gotName)
+	}
+	if len(gotArgs) != 3 || gotArgs[0] != "sql" || gotArgs[1] != "--json" {
+		t.Fatalf("args = %q, want bd sql --json <query>", gotArgs)
+	}
+	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-''1'"
+	if gotArgs[2] != wantQuery {
+		t.Fatalf("SQL query = %q, want %q", gotArgs[2], wantQuery)
+	}
+}
+
+func TestBdStoreReleaseIfCurrentSQLLiteralEscapesBackslash(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = append([]string(nil), args...)
+		return []byte(`{"rows_affected":1,"schema_version":1}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	if _, err := s.ReleaseIfCurrent("bd-\\42", "worker-\\1"); err != nil {
+		t.Fatalf("ReleaseIfCurrent: %v", err)
+	}
+	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP WHERE id = 'bd-\\\\42' AND status = 'in_progress' AND assignee = 'worker-\\\\1'"
+	if gotArgs[2] != wantQuery {
+		t.Fatalf("SQL query = %q, want %q", gotArgs[2], wantQuery)
+	}
+}
+
+func TestBdStoreReleaseIfCurrentFallsBackWhenEmbeddedBdSQLUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"demo"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile metadata: %v", err)
+	}
+	var calls []string
+	runner := func(callDir, name string, args ...string) ([]byte, error) {
+		call := callDir + ": " + name + " " + strings.Join(args, " ")
+		calls = append(calls, call)
+		switch {
+		case name == "bd" && len(args) >= 1 && args[0] == "sql":
+			return nil, fmt.Errorf("exit status 1: Error: 'bd sql' is not yet supported in embedded mode")
+		case name == "dolt" && len(args) == 5 && args[0] == "sql" && args[1] == "-r" && args[2] == "json" && args[3] == "-q":
+			return []byte(`{"rows":[{"rows_affected":1}]}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected call %s", call)
+		}
+	}
+	s := beads.NewBdStore(dir, runner)
+
+	released, err := s.ReleaseIfCurrent("bd-42", "worker-1")
+	if err != nil {
+		t.Fatalf("ReleaseIfCurrent: %v", err)
+	}
+	if !released {
+		t.Fatal("ReleaseIfCurrent released = false, want true")
+	}
+	wantCalls := []string{
+		dir + ": bd sql --json UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'",
+		filepath.Join(dir, ".beads", "embeddeddolt", "demo") + ": dolt sql -r json -q UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'; SELECT ROW_COUNT() AS rows_affected",
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestBdStoreReleaseIfCurrentEmbeddedFallbackParsesDoltRowsAffectedShapes(t *testing.T) {
+	realOutput, err := os.ReadFile(filepath.Join("testdata", "dolt_release_if_current_rows_affected.json"))
+	if err != nil {
+		t.Fatalf("ReadFile fixture: %v", err)
+	}
+	tests := []struct {
+		name string
+		out  []byte
+	}{
+		{
+			name: "real dolt sql rows affected fixture",
+			out:  realOutput,
+		},
+		{
+			name: "multi result stream",
+			out: []byte(`{"rows":[]}
+{"rows":[{"rows_affected":1}]}
+`),
+		},
+		{
+			name: "array wrapped result sets",
+			out:  []byte(`[{"rows":[]},{"rows":[{"rows_affected":1}]}]`),
+		},
+		{
+			name: "trailing non json output",
+			out:  append(append([]byte("warning: using local dolt\n"), realOutput...), []byte("\nQuery OK, 1 row affected\n")...),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := embeddedDoltReleaseIfCurrentStore(t, tt.out)
+
+			released, err := s.ReleaseIfCurrent("bd-42", "worker-1")
+			if err != nil {
+				t.Fatalf("ReleaseIfCurrent: %v", err)
+			}
+			if !released {
+				t.Fatal("ReleaseIfCurrent released = false, want true")
+			}
+		})
+	}
+}
+
+func TestBdStoreReleaseIfCurrentEmbeddedFallbackSkipsWrongAssignee(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"demo"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile metadata: %v", err)
+	}
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		switch {
+		case name == "bd" && len(args) >= 1 && args[0] == "sql":
+			return nil, fmt.Errorf("exit status 1: Error: 'bd sql' is not yet supported in embedded mode")
+		case name == "dolt" && len(args) == 5 && args[0] == "sql" && args[1] == "-r" && args[2] == "json" && args[3] == "-q":
+			return []byte(`{"rows":[{"rows_affected":0}]}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected command %s %q", name, args)
+		}
+	}
+	s := beads.NewBdStore(dir, runner)
+
+	released, err := s.ReleaseIfCurrent("bd-42", "worker-1")
+	if err != nil {
+		t.Fatalf("ReleaseIfCurrent: %v", err)
+	}
+	if released {
+		t.Fatal("ReleaseIfCurrent released = true, want false")
+	}
+}
+
+func embeddedDoltReleaseIfCurrentStore(t *testing.T, doltOut []byte) *beads.BdStore {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"demo"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile metadata: %v", err)
+	}
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		switch {
+		case name == "bd" && len(args) >= 1 && args[0] == "sql":
+			return nil, fmt.Errorf("exit status 1: Error: 'bd sql' is not yet supported in embedded mode")
+		case name == "dolt" && len(args) == 5 && args[0] == "sql" && args[1] == "-r" && args[2] == "json" && args[3] == "-q":
+			return doltOut, nil
+		default:
+			return nil, fmt.Errorf("unexpected command %s %q", name, args)
+		}
+	}
+	return beads.NewBdStore(dir, runner)
+}
+
+func TestBdStoreReleaseIfCurrentSkipsWhenRowsAffectedIsZero(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd sql --json UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'`: {
+			out: []byte(`{"rows_affected":0,"schema_version":1}`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+
+	released, err := s.ReleaseIfCurrent("bd-42", "worker-1")
+	if err != nil {
+		t.Fatalf("ReleaseIfCurrent: %v", err)
+	}
+	if released {
+		t.Fatal("ReleaseIfCurrent released = true, want false")
+	}
+}
+
+// --- ListByLabel ---
+
+func TestBdStoreListByLabel(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --label=order-run:digest --include-infra --include-gates --limit 0`: {
+			out: []byte(`[{"id":"bd-aaa","title":"digest wisp","status":"open","issue_type":"task","created_at":"2026-02-27T10:00:00Z","labels":["order-run:digest"]}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.ListByLabel("order-run:digest", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListByLabel returned %d beads, want 1", len(got))
+	}
+	if got[0].ID != "bd-aaa" {
+		t.Errorf("got[0].ID = %q, want %q", got[0].ID, "bd-aaa")
+	}
+	if len(got[0].Labels) != 1 || got[0].Labels[0] != "order-run:digest" {
+		t.Errorf("got[0].Labels = %v, want [order-run:digest]", got[0].Labels)
+	}
+}
+
+func TestBdStoreListCreatedBeforeForwardsFilter(t *testing.T) {
+	before := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
+	wantCmd := `bd list --json --label=order-run:digest --all --created-before ` +
+		before.Format(time.RFC3339Nano) + ` --include-infra --include-gates --limit 0`
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		wantCmd: {
+			out: []byte(`[{"id":"bd-old","title":"digest wisp","status":"closed","issue_type":"task","created_at":"2026-04-20T11:59:00Z","labels":["order-run:digest"]}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{
+		Label:         "order-run:digest",
+		CreatedBefore: before,
+		Limit:         1,
+		IncludeClosed: true,
+		Sort:          beads.SortCreatedDesc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "bd-old" {
+		t.Fatalf("List returned %+v, want bd-old", got)
+	}
+}
+
+func TestBdStoreListByLabelEmpty(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --label=order-run:none --include-infra --include-gates --limit 0`: {out: []byte(`[]`)},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.ListByLabel("order-run:none", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListByLabel returned %d beads, want 0", len(got))
+	}
+}
+
+func TestBdStoreListByLabelError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.ListByLabel("order-run:digest", 1)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "bd list") {
+		t.Errorf("error = %q, want to contain 'bd list'", err)
+	}
+}
+
+func TestBdStoreListByLabelZeroLimit(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.ListByLabel("order-run:digest", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--limit 0") {
+		t.Errorf("args = %q, want --limit 0 for unlimited", args)
+	}
+	if !strings.Contains(args, "--include-infra") {
+		t.Errorf("args = %q, want --include-infra", args)
+	}
+	if !strings.Contains(args, "--include-gates") {
+		t.Errorf("args = %q, want --include-gates", args)
+	}
+	if strings.Contains(args, "--all") {
+		t.Errorf("args = %q, did not want --all by default", args)
+	}
+}
+
+func TestBdStoreListByLabelIncludeClosedAddsAll(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.ListByLabel("order-run:digest", 1, beads.IncludeClosed); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--all") {
+		t.Fatalf("args = %q, want --all when IncludeClosed is set", args)
+	}
+}
+
+func TestBdStoreListByAssigneeIncludesInfra(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.ListByAssignee("mayor", "open", 0); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--assignee=mayor") {
+		t.Fatalf("args = %q, want --assignee=mayor", args)
+	}
+	if !strings.Contains(args, "--status=open") {
+		t.Fatalf("args = %q, want --status=open", args)
+	}
+	if !strings.Contains(args, "--include-infra") {
+		t.Fatalf("args = %q, want --include-infra", args)
+	}
+}
+
+func TestBdStoreListByMetadataIncludesInfra(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.ListByMetadata(map[string]string{"alias": "mayor"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--metadata-field alias=mayor") {
+		t.Fatalf("args = %q, want metadata filter", args)
+	}
+	if !strings.Contains(args, "--include-infra") {
+		t.Fatalf("args = %q, want --include-infra", args)
+	}
+	if strings.Contains(args, "--all") {
+		t.Fatalf("args = %q, did not want --all by default", args)
+	}
+}
+
+func TestBdStoreListByMetadataIncludeClosedAddsAll(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.ListByMetadata(map[string]string{"alias": "mayor"}, 0, beads.IncludeClosed); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--all") {
+		t.Fatalf("args = %q, want --all when IncludeClosed is set", args)
+	}
+}
+
+// --- Verify working directory is passed ---
+
+func TestBdStorePassesDir(t *testing.T) {
+	var gotDir string
+	runner := func(dir, _ string, _ ...string) ([]byte, error) {
+		gotDir = dir
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/my/city", runner)
+	_, _ = s.ListOpen()
+	if gotDir != "/my/city" {
+		t.Errorf("dir = %q, want %q", gotDir, "/my/city")
+	}
+}
+
+// --- DepAdd ---
+
+func TestBdStoreDepAdd(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.DepAdd("bd-42", "bd-41", "blocks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := "dep add bd-42 bd-41 --type blocks"
+	if strings.Join(gotArgs, " ") != wantArgs {
+		t.Errorf("args = %q, want %q", strings.Join(gotArgs, " "), wantArgs)
+	}
+}
+
+func TestBdStoreDepAddRetriesTransientDoltConnectionError(t *testing.T) {
+	calls := 0
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, fmt.Errorf("exit status 1: [mysql] read tcp 127.0.0.1:54108->127.0.0.1:4306: i/o timeout: failed to check for dependency cycle: invalid connection")
+		}
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.DepAdd("bd-42", "bd-41", "blocks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+}
+
+// TestBdStoreDepAddRetriesSqliteBusyError proves a sqlite-backed bd write
+// that loses a lock race ("database is locked (5) (SQLITE_BUSY)") goes
+// through the same transient-write retry loop as Dolt serialization
+// failures instead of failing permanently on first contention.
+func TestBdStoreDepAddRetriesSqliteBusyError(t *testing.T) {
+	calls := 0
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, fmt.Errorf("exit status 1: adding dependency: database is locked (5) (SQLITE_BUSY)")
+		}
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.DepAdd("bd-42", "bd-41", "blocks"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (1 sqlite busy + 1 retry success)", calls)
+	}
+}
+
+func TestBdStoreDepAddError(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return nil, fmt.Errorf("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.DepAdd("bd-42", "bd-41", "blocks")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "adding dep") {
+		t.Errorf("error = %q, want 'adding dep'", err)
+	}
+}
+
+// --- DepRemove ---
+
+func TestBdStoreDepRemove(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return nil, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.DepRemove("bd-42", "bd-41")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := "dep remove bd-42 bd-41"
+	if strings.Join(gotArgs, " ") != wantArgs {
+		t.Errorf("args = %q, want %q", strings.Join(gotArgs, " "), wantArgs)
+	}
+}
+
+// --- DepList ---
+
+func TestBdStoreDepListDown(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd dep list bd-42 --json`: {
+			out: []byte(`[{"id":"bd-41","title":"blocker","status":"open","issue_type":"task","created_at":"2026-03-06T10:00:00Z","dependency_type":"blocks"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	deps, err := s.DepList("bd-42", "down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("DepList = %d deps, want 1", len(deps))
+	}
+	if deps[0].IssueID != "bd-42" {
+		t.Errorf("IssueID = %q, want %q", deps[0].IssueID, "bd-42")
+	}
+	if deps[0].DependsOnID != "bd-41" {
+		t.Errorf("DependsOnID = %q, want %q", deps[0].DependsOnID, "bd-41")
+	}
+	if deps[0].Type != "blocks" {
+		t.Errorf("Type = %q, want %q", deps[0].Type, "blocks")
+	}
+}
+
+func TestBdStoreDepListUp(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd dep list bd-41 --json --direction=up`: {
+			out: []byte(`[{"id":"bd-42","title":"dependent","status":"open","issue_type":"task","created_at":"2026-03-06T10:00:00Z","dependency_type":"blocks"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	deps, err := s.DepList("bd-41", "up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("DepList = %d deps, want 1", len(deps))
+	}
+	// "up" on bd-41: bd-42 depends on bd-41.
+	if deps[0].IssueID != "bd-42" {
+		t.Errorf("IssueID = %q, want %q", deps[0].IssueID, "bd-42")
+	}
+	if deps[0].DependsOnID != "bd-41" {
+		t.Errorf("DependsOnID = %q, want %q", deps[0].DependsOnID, "bd-41")
+	}
+}
+
+func TestBdStoreDepListEmpty(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd dep list bd-42 --json`: {out: []byte(`[]`)},
+	})
+	s := beads.NewBdStore("/city", runner)
+	deps, err := s.DepList("bd-42", "down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 0 {
+		t.Errorf("DepList = %d deps, want 0", len(deps))
+	}
+}
+
+func TestExecCommandRunnerWithEnvOverridesInheritedValues(t *testing.T) {
+	t.Setenv("GC_CITY_PATH", "/wrong")
+	t.Setenv("GC_DOLT_PORT", "9999")
+
+	dir := t.TempDir()
+	runner := beads.ExecCommandRunnerWithEnv(map[string]string{
+		"GC_CITY_PATH": "/city",
+		"GC_DOLT_PORT": "31364",
+	})
+
+	out, err := runner(dir, "sh", "-c", `printf '%s\n%s\n' "$GC_CITY_PATH" "$GC_DOLT_PORT"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %q, want 2 lines", string(out))
+	}
+	if lines[0] != "/city" {
+		t.Fatalf("GC_CITY_PATH = %q, want %q", lines[0], "/city")
+	}
+	if lines[1] != "31364" {
+		t.Fatalf("GC_DOLT_PORT = %q, want %q", lines[1], "31364")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("runner should preserve working dir usability: %v", err)
+	}
+}
+
+func TestExecCommandRunnerWithEnvSurfacesBdJSONErrorFromStdout(t *testing.T) {
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+printf '%s\n' 'bd warning before json'
+printf '%s\n' '{"error":"resolving dependency: no issue found bd-missing","schema_version":1}'
+exit 1
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	runner := beads.ExecCommandRunnerWithEnv(map[string]string{
+		"GC_CITY_PATH": "/city",
+	})
+
+	out, err := runner(t.TempDir(), "bd", "dep", "list", "bd-missing", "--json")
+	if err == nil {
+		t.Fatal("runner error = nil, want bd exit error")
+	}
+	if !strings.Contains(err.Error(), "resolving dependency: no issue found bd-missing") {
+		t.Fatalf("runner error = %q, want stdout JSON error detail", err.Error())
+	}
+	if !strings.Contains(string(out), `"schema_version":1`) {
+		t.Fatalf("runner stdout = %q, want original bd stdout preserved", string(out))
+	}
+}
+
+func TestBdStoreApplyGraphPlan(t *testing.T) {
+	dir := t.TempDir()
+	var capturedPlan beads.GraphApplyPlan
+	runner := func(cmdDir, name string, args ...string) ([]byte, error) {
+		if cmdDir != dir {
+			t.Fatalf("runner dir = %q, want %q", cmdDir, dir)
+		}
+		if name != "bd" {
+			t.Fatalf("runner name = %q, want bd", name)
+		}
+		if len(args) != 4 || args[0] != "create" || args[1] != "--graph" || args[3] != "--json" {
+			t.Fatalf("args = %q", args)
+		}
+		data, err := os.ReadFile(args[2])
+		if err != nil {
+			t.Fatalf("reading plan file: %v", err)
+		}
+		if err := json.Unmarshal(data, &capturedPlan); err != nil {
+			t.Fatalf("unmarshal plan file: %v", err)
+		}
+		return []byte(`{"ids":{"mol.root":"bd-1","mol.step":"bd-2"}}`), nil
+	}
+
+	s := beads.NewBdStore(dir, runner)
+	result, err := s.ApplyGraphPlan(t.Context(), &beads.GraphApplyPlan{
+		CommitMessage: "gc: instantiate mol",
+		Nodes: []beads.GraphApplyNode{
+			{Key: "mol.root", Title: "Root"},
+			{Key: "mol.step", Title: "Step"},
+		},
+		Edges: []beads.GraphApplyEdge{
+			{FromKey: "mol.step", ToKey: "mol.root", Type: "parent-child"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyGraphPlan: %v", err)
+	}
+	if got := result.IDs["mol.step"]; got != "bd-2" {
+		t.Fatalf("result ID = %q, want bd-2", got)
+	}
+	if got := capturedPlan.CommitMessage; got != "gc: instantiate mol" {
+		t.Fatalf("captured commit message = %q", got)
+	}
+	if len(capturedPlan.Nodes) != 2 || len(capturedPlan.Edges) != 1 {
+		t.Fatalf("captured plan = %+v", capturedPlan)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, ".gc", "tmp", "graph-apply-*.json")); len(matches) != 0 {
+		t.Fatalf("temp graph apply files were not cleaned up: %v", matches)
+	}
+}
+
+func TestBdStoreApplyGraphPlanWithStorageNoHistory(t *testing.T) {
+	dir := t.TempDir()
+	var capturedPlan beads.GraphApplyPlan
+	var gotArgs []string
+	runner := func(cmdDir, name string, args ...string) ([]byte, error) {
+		if cmdDir != dir {
+			t.Fatalf("runner dir = %q, want %q", cmdDir, dir)
+		}
+		if name != "bd" {
+			t.Fatalf("runner name = %q, want bd", name)
+		}
+		gotArgs = append([]string(nil), args...)
+		graphPath := args[2]
+		data, err := os.ReadFile(graphPath)
+		if err != nil {
+			t.Fatalf("reading plan file: %v", err)
+		}
+		if err := json.Unmarshal(data, &capturedPlan); err != nil {
+			t.Fatalf("unmarshal plan file: %v", err)
+		}
+		return []byte(`{"ids":{"root":"bd-1"}}`), nil
+	}
+
+	s := beads.NewBdStore(dir, runner)
+	result, err := s.ApplyGraphPlanWithStorage(t.Context(), &beads.GraphApplyPlan{
+		Nodes: []beads.GraphApplyNode{{Key: "root", Title: "Root"}},
+	}, beads.StorageNoHistory)
+	if err != nil {
+		t.Fatalf("ApplyGraphPlan: %v", err)
+	}
+	if got := result.IDs["root"]; got != "bd-1" {
+		t.Fatalf("result ID = %q, want bd-1", got)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--no-history") {
+		t.Fatalf("args = %q, want --no-history graph flag", args)
+	}
+	if data := mustJSON(t, capturedPlan); strings.Contains(data, "no_history") || strings.Contains(data, "ephemeral") {
+		t.Fatalf("captured graph JSON = %s, storage must travel as CLI flags only", data)
+	}
+}
+
+func TestBdStoreSupportsEphemeralGraphApply(t *testing.T) {
+	store := beads.NewBdStore(t.TempDir(), nil)
+	if !store.SupportsEphemeralGraphApply() {
+		t.Fatal("SupportsEphemeralGraphApply() = false, want true")
+	}
+}
+
+func TestBdStoreApplyGraphPlanRejectsMissingIDs(t *testing.T) {
+	dir := t.TempDir()
+	runner := func(string, string, ...string) ([]byte, error) {
+		return []byte(`{"ids":{"mol.root":"bd-1"}}`), nil
+	}
+
+	s := beads.NewBdStore(dir, runner)
+	_, err := s.ApplyGraphPlan(t.Context(), &beads.GraphApplyPlan{
+		Nodes: []beads.GraphApplyNode{
+			{Key: "mol.root", Title: "Root"},
+			{Key: "mol.step", Title: "Step"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "missing IDs for keys: mol.step") {
+		t.Fatalf("error = %q, want missing key detail", err)
+	}
+}
+
+// --- Ephemeral / wisps tier ---
+
+func TestBdStoreCreatePassesEphemeralFlag(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-w","title":"wisp","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","ephemeral":true}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	created, err := s.Create(beads.Bead{Title: "wisp", Ephemeral: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--ephemeral") {
+		t.Fatalf("args = %q, want --ephemeral flag", args)
+	}
+	if !created.Ephemeral {
+		t.Fatalf("created.Ephemeral = false, want true")
+	}
+}
+
+func TestBdStoreCreateWithStoragePassesNoHistoryFlag(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"test","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z","no_history":true}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	created, err := s.CreateWithStorage(beads.Bead{Title: "test"}, beads.StorageNoHistory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(gotArgs, " ")
+	if !strings.Contains(args, "--no-history") {
+		t.Fatalf("args = %q, want --no-history flag", args)
+	}
+	if created.Ephemeral || !created.NoHistory {
+		t.Fatalf("created storage = ephemeral:%v no_history:%v, want no-history", created.Ephemeral, created.NoHistory)
+	}
+}
+
+func TestBdStoreCreateOmitsEphemeralFlagByDefault(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"id":"bd-x","title":"plain","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.Create(beads.Bead{Title: "plain"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(gotArgs, " "), "--ephemeral") {
+		t.Fatalf("args = %q, must not contain --ephemeral", gotArgs)
+	}
+}
+
+func TestBdStoreListWispsUsesBdListWithClientTierFilter(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd := name + " " + strings.Join(args, " ")
+		calls = append(calls, gotCmd)
+		if strings.HasPrefix(gotCmd, "bd query ") {
+			return []byte(`[
+				{"id":"bd-w","title":"wisp","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:02Z","ephemeral":true,"labels":["order-tracking"]}
+			]`), nil
+		}
+		return []byte(`[
+			{"id":"bd-i","title":"issue","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","labels":["order-tracking"]},
+			{"id":"bd-nh","title":"no-history","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:01Z","no_history":true,"labels":["order-tracking"]}
+		]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Label: "order-tracking", TierMode: beads.TierWisps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCmd := firstCommandWithPrefix(calls, "bd list ")
+	if !strings.HasPrefix(gotCmd, "bd list --json ") {
+		t.Fatalf("cmd = %q, want bd list prefix", gotCmd)
+	}
+	if strings.Contains(gotCmd, "--include-ephemeral") {
+		t.Fatalf("cmd = %q, bd list does not support --include-ephemeral", gotCmd)
+	}
+	if !strings.Contains(gotCmd, "--include-templates") {
+		t.Fatalf("cmd = %q, want --include-templates for wisp-aware list", gotCmd)
+	}
+	if !strings.Contains(gotCmd, "--label=order-tracking") {
+		t.Fatalf("cmd = %q, want label flag", gotCmd)
+	}
+	if queryCmd := firstCommandWithPrefix(calls, "bd query "); !strings.Contains(queryCmd, "ephemeral=true AND label=order-tracking") {
+		t.Fatalf("calls = %#v, want matching bd query ephemeral read", calls)
+	}
+	if len(got) != 2 || got[0].ID != "bd-nh" || got[1].ID != "bd-w" || !got[0].NoHistory || !got[1].Ephemeral {
+		t.Fatalf("got = %+v, want no-history and ephemeral rows only", got)
+	}
+}
+
+func TestBdStoreListWispsRequestsUnlimitedResultsByDefault(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd := name + " " + strings.Join(args, " ")
+		calls = append(calls, gotCmd)
+		var b strings.Builder
+		b.WriteByte('[')
+		for i := 0; i < 55; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"id":"bd-w-%02d","title":"wisp","status":"open","issue_type":"task","created_at":"2026-05-01T00:%02d:00Z","ephemeral":true,"labels":["order-tracking"]}`, i, i)
+		}
+		b.WriteByte(']')
+		return []byte(b.String()), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Label: "order-tracking", TierMode: beads.TierWisps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCmd := firstCommandWithPrefix(calls, "bd list ")
+	if !strings.Contains(gotCmd, "--limit 0") {
+		t.Fatalf("cmd = %q, want explicit --limit 0 so bd list does not apply its default page size", gotCmd)
+	}
+	if len(got) != 55 {
+		t.Fatalf("got %d wisps, want all 55 rows", len(got))
+	}
+}
+
+func TestBdStoreListWispsAppliesMetadataBeforeClientLimit(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd := name + " " + strings.Join(args, " ")
+		calls = append(calls, gotCmd)
+		if !strings.Contains(gotCmd, "--limit 0") {
+			return []byte(`[{"id":"bd-new","title":"wrong first page","status":"closed","issue_type":"task","created_at":"2026-05-03T00:00:00Z","ephemeral":true,"labels":["order-run:o"],"metadata":{"phase":"skip"}}]`), nil
+		}
+		return []byte(`[
+			{"id":"bd-new","title":"wrong metadata","status":"closed","issue_type":"task","created_at":"2026-05-03T00:00:00Z","ephemeral":true,"labels":["order-run:o"],"metadata":{"phase":"skip"}},
+			{"id":"bd-old","title":"matching metadata","status":"closed","issue_type":"task","created_at":"2026-05-01T00:00:00Z","ephemeral":true,"labels":["order-run:o"],"metadata":{"phase":"keep"}}
+		]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{
+		Label:         "order-run:o",
+		Metadata:      map[string]string{"phase": "keep"},
+		Limit:         1,
+		IncludeClosed: true,
+		TierMode:      beads.TierWisps,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCmd := firstCommandWithPrefix(calls, "bd list ")
+	if !strings.Contains(gotCmd, "--limit 0") {
+		t.Fatalf("wisps query = %q, want --limit 0 before client-side metadata filtering", gotCmd)
+	}
+	if len(got) != 1 || got[0].ID != "bd-old" {
+		t.Fatalf("got = %+v, want metadata-matching wisp after client filter then Limit", got)
+	}
+}
+
+func TestBdStoreListWispsReturnsPartialRowsWithErrorOnCorruptEntries(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --include-infra --include-gates --include-templates --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-good","title":"good","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
+				{"id":"bd-bad","title":"bad","status":"open","issue_type":"task","created_at":"not-a-time","ephemeral":true}
+			]`),
+		},
+		`bd query --json ephemeral=true --limit 0`: {out: []byte(`[]`)},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{AllowScan: true, TierMode: beads.TierWisps})
+	if len(got) != 1 || got[0].ID != "bd-good" {
+		t.Fatalf("List(wisps) = %v, want surviving row bd-good", got)
+	}
+	var partial *beads.PartialResultError
+	if !errors.As(err, &partial) {
+		t.Fatalf("List(wisps) error = %v, want *beads.PartialResultError", err)
+	}
+	if partial.Op != "bd list wisps tier" {
+		t.Errorf("PartialResultError.Op = %q, want %q", partial.Op, "bd list wisps tier")
+	}
+}
+
+func TestBdStoreListBothTiersUnionsBdListAndEphemeralQuery(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		calls = append(calls, full)
+		if strings.Contains(full, "--include-ephemeral") {
+			t.Fatalf("bd list command = %q, --include-ephemeral is only valid for bd ready", full)
+		}
+		if strings.HasPrefix(full, "bd query ") {
+			return []byte(`[
+				{"id":"bd-w","title":"wisp","status":"open","issue_type":"task","created_at":"2026-05-02T00:00:00Z","ephemeral":true,"labels":["order-run:o"]}
+			]`), nil
+		}
+		if !strings.HasPrefix(full, "bd list ") {
+			return nil, fmt.Errorf("unexpected: %s", full)
+		}
+		return []byte(`[
+			{"id":"bd-i","title":"issue","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","labels":["order-run:o"]}
+		]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Label: "order-run:o", TierMode: beads.TierBoth, Sort: beads.SortCreatedDesc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("got %d runner calls, want 2: %v", len(calls), calls)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d beads, want 2: %+v", len(got), got)
+	}
+	if got[0].ID != "bd-w" || got[1].ID != "bd-i" {
+		t.Fatalf("merge order = [%s,%s], want [bd-w, bd-i] (desc by CreatedAt)", got[0].ID, got[1].ID)
+	}
+}
+
+func TestBdStoreListBothTiersAppliesCreatedBeforeBeforeMergedLimit(t *testing.T) {
+	before := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		calls = append(calls, full)
+		if strings.Contains(full, "--include-ephemeral") {
+			t.Fatalf("bd list command = %q, --include-ephemeral is only valid for bd ready", full)
+		}
+		if strings.HasPrefix(full, "bd query ") {
+			return []byte(`[]`), nil
+		}
+		if !strings.HasPrefix(full, "bd list ") {
+			return nil, fmt.Errorf("unexpected: %s", full)
+		}
+		if !strings.Contains(full, "--limit 0") {
+			return []byte(`[{"id":"bd-new","title":"newer","status":"closed","issue_type":"task","created_at":"2026-05-03T00:00:00Z","ephemeral":true,"labels":["order-run:o"]}]`), nil
+		}
+		return []byte(`[
+			{"id":"bd-new","title":"newer","status":"closed","issue_type":"task","created_at":"2026-05-03T00:00:00Z","ephemeral":true,"labels":["order-run:o"]},
+			{"id":"bd-old","title":"older","status":"closed","issue_type":"task","created_at":"2026-05-01T00:00:00Z","ephemeral":true,"labels":["order-run:o"]}
+		]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{
+		Label:         "order-run:o",
+		CreatedBefore: before,
+		Limit:         1,
+		IncludeClosed: true,
+		Sort:          beads.SortCreatedDesc,
+		TierMode:      beads.TierBoth,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryCmd := firstCommandWithPrefix(calls, "bd list ")
+	if !strings.Contains(queryCmd, "--limit 0") {
+		t.Fatalf("bd list query = %q, want unlimited --limit 0 before CreatedBefore client filtering", queryCmd)
+	}
+	if len(got) != 1 || got[0].ID != "bd-old" {
+		t.Fatalf("got = %+v, want only older wisp after CreatedBefore then Limit", got)
+	}
+}
+
+func TestBdStoreListBothTiersMessageUnionsEphemeralQueryWithoutTierFiltering(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		calls = append(calls, full)
+		if strings.HasPrefix(full, "bd query ") {
+			return []byte(`[]`), nil
+		}
+		if strings.HasPrefix(full, "bd list ") {
+			return []byte(`[{"id":"bd-msg","title":"message","status":"open","issue_type":"message","assignee":"mayor","created_at":"2026-05-01T00:00:00Z","ephemeral":true}]`), nil
+		}
+		return nil, fmt.Errorf("unexpected: %s", full)
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("got %d runner calls, want 2: %v", len(calls), calls)
+	}
+	if strings.Contains(calls[0], "--include-templates") {
+		t.Fatalf("bd list command = %q, message TierBoth fast path must not include template rows", calls[0])
+	}
+	if len(got) != 1 || got[0].ID != "bd-msg" || !got[0].Ephemeral {
+		t.Fatalf("got = %+v, want TierBoth bd message row bd-msg with Ephemeral=true", got)
+	}
+}
+
+func TestBdStoreListAssigneesSingleUsesAssigneeFlag(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd = name + " " + strings.Join(args, " ")
+		return []byte(`[{"id":"bd-route-a","title":"message","status":"open","issue_type":"message","assignee":"route-a","created_at":"2026-05-01T00:00:00Z"}]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Assignees: []string{"route-a"}, Type: "message", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotCmd, "--assignee=route-a") {
+		t.Fatalf("cmd = %q, want single Assignees value mapped to --assignee", gotCmd)
+	}
+	if len(got) != 1 || got[0].ID != "bd-route-a" {
+		t.Fatalf("got = %+v, want bd-route-a", got)
+	}
+}
+
+func TestBdStoreListAssigneesMultipleFallsBackToClientFilter(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd = name + " " + strings.Join(args, " ")
+		if strings.Contains(gotCmd, "--assignee=") {
+			t.Fatalf("cmd = %q, multi-route Assignees must not emit a single --assignee", gotCmd)
+		}
+		if strings.Contains(gotCmd, "--limit 1") {
+			return []byte(`[{"id":"bd-route-c","title":"message","status":"open","issue_type":"message","assignee":"route-c","created_at":"2026-05-01T00:00:00Z"}]`), nil
+		}
+		return []byte(`[
+			{"id":"bd-route-c","title":"message","status":"open","issue_type":"message","assignee":"route-c","created_at":"2026-05-01T00:00:00Z"},
+			{"id":"bd-route-b","title":"message","status":"open","issue_type":"message","assignee":"route-b","created_at":"2026-05-01T00:00:01Z"},
+			{"id":"bd-route-a","title":"message","status":"open","issue_type":"message","assignee":"route-a","created_at":"2026-05-01T00:00:02Z"}
+		]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{
+		Assignees: []string{"route-a", "route-b"},
+		Type:      "message",
+		Status:    "open",
+		Limit:     1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotCmd, "--limit 0") {
+		t.Fatalf("cmd = %q, want unlimited server query before multi-Assignees client filtering", gotCmd)
+	}
+	if len(got) != 1 || got[0].ID != "bd-route-b" {
+		t.Fatalf("got = %+v, want first matching route after client filter", got)
+	}
+}
+
+func TestBdStoreListWispsAssigneesSingleUsesAssigneeClause(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd := name + " " + strings.Join(args, " ")
+		calls = append(calls, gotCmd)
+		return []byte(`[{"id":"bd-wisp-a","title":"message","status":"open","issue_type":"message","assignee":"route-a","created_at":"2026-05-01T00:00:00Z","ephemeral":true}]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Assignees: []string{"route-a"}, Type: "message", Status: "open", TierMode: beads.TierWisps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCmd := firstCommandWithPrefix(calls, "bd query ")
+	if !strings.Contains(gotCmd, "assignee=route-a") {
+		t.Fatalf("cmd = %q, want single Assignees value mapped to query assignee clause", gotCmd)
+	}
+	if len(got) != 1 || got[0].ID != "bd-wisp-a" {
+		t.Fatalf("got = %+v, want bd-wisp-a", got)
+	}
+}
+
+func TestBdStoreListWispsAssigneesMultipleFallsBackToClientFilter(t *testing.T) {
+	var gotCmd string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		gotCmd = name + " " + strings.Join(args, " ")
+		if strings.Contains(gotCmd, "--assignee=") {
+			t.Fatalf("cmd = %q, multi-route Assignees must not emit one --assignee", gotCmd)
+		}
+		if strings.Contains(gotCmd, "--limit 1") {
+			return []byte(`[{"id":"bd-wisp-c","title":"message","status":"open","issue_type":"message","assignee":"route-c","created_at":"2026-05-01T00:00:00Z","ephemeral":true}]`), nil
+		}
+		return []byte(`[
+			{"id":"bd-wisp-c","title":"message","status":"open","issue_type":"message","assignee":"route-c","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
+			{"id":"bd-wisp-b","title":"message","status":"open","issue_type":"message","assignee":"route-b","created_at":"2026-05-01T00:00:01Z","ephemeral":true},
+			{"id":"bd-wisp-a","title":"message","status":"open","issue_type":"message","assignee":"route-a","created_at":"2026-05-01T00:00:02Z","ephemeral":true}
+		]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{
+		Assignees: []string{"route-a", "route-b"},
+		Type:      "message",
+		Status:    "open",
+		Limit:     1,
+		TierMode:  beads.TierWisps,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotCmd, "--limit 0") {
+		t.Fatalf("cmd = %q, want unlimited server query before multi-Assignees client filtering", gotCmd)
+	}
+	if len(got) != 1 || got[0].ID != "bd-wisp-b" {
+		t.Fatalf("got = %+v, want first matching wisp after client filter", got)
+	}
+}
+
+func TestBdStoreListIssuesTierDoesNotIssueQuery(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		calls = append(calls, full)
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.List(beads.ListQuery{Label: "order-tracking"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range calls {
+		if strings.HasPrefix(c, "bd query ") {
+			t.Fatalf("default tier issued bd query: %v", calls)
+		}
+	}
+}
+
+func firstCommandWithPrefix(calls []string, prefix string) string {
+	for _, call := range calls {
+		if strings.HasPrefix(call, prefix) {
+			return call
+		}
+	}
+	return ""
+}
+
+func TestBdStoreListBothTiersReturnsWholeReadError(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		calls = append(calls, full)
+		if strings.Contains(full, "--include-ephemeral") {
+			t.Fatalf("bd list command = %q, --include-ephemeral is only valid for bd ready", full)
+		}
+		return nil, fmt.Errorf("simulated bd list outage")
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Label: "order-run:o", TierMode: beads.TierBoth})
+	if err == nil {
+		t.Fatalf("err = nil, want bd list error")
+	}
+	if beads.IsPartialResult(err) {
+		t.Fatalf("err = %v, want whole-read failure, not PartialResultError", err)
+	}
+	if !strings.Contains(err.Error(), "bd list") {
+		t.Fatalf("err = %v, want bd list context", err)
+	}
+	if got != nil {
+		t.Fatalf("got = %+v, want nil rows on whole-read failure", got)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("calls = %#v, want bd list and bd query calls", calls)
+	}
+}
+
+func TestBdStoreListWispAwareTiersTolerateAdaptersWithoutBdQuery(t *testing.T) {
+	cases := []struct {
+		name string
+		tier beads.TierMode
+		want string
+	}{
+		{name: "wisps", tier: beads.TierWisps, want: "bd-no-history"},
+		{name: "both", tier: beads.TierBoth, want: "bd-history"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			runner := func(_, name string, args ...string) ([]byte, error) {
+				full := name + " " + strings.Join(args, " ")
+				calls = append(calls, full)
+				if strings.HasPrefix(full, "bd query ") {
+					return nil, fmt.Errorf("bd: unknown subcommand \"query\"")
+				}
+				return []byte(`[
+					{"id":"bd-history","title":"history","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z"},
+					{"id":"bd-no-history","title":"no-history","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:01Z","no_history":true}
+				]`), nil
+			}
+			s := beads.NewBdStore("/city", runner)
+			got, err := s.List(beads.ListQuery{Status: "open", TierMode: tc.tier})
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if firstCommandWithPrefix(calls, "bd query ") == "" {
+				t.Fatalf("calls = %#v, want bd query attempt for wisp-aware tier", calls)
+			}
+			if len(got) == 0 || got[0].ID != tc.want {
+				t.Fatalf("got = %+v, want first row %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBdStoreListWispsFallsBackToClientFilteringForUnsafeQueryValues pins the
+// bd list storage-tier contract: bd list has no ephemeral-only flag, so wisp
+// reads use normal list flags and then filter the storage tier client-side.
+func TestBdStoreListWispsFallsBackToClientFilteringForUnsafeQueryValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		query beads.ListQuery
+		want  string
+	}{
+		{
+			name:  "slash assignee",
+			query: beads.ListQuery{Assignee: "gascity/workflows.codex-max", Type: "message", Status: "open", TierMode: beads.TierWisps},
+			want:  "bd-match-assignee",
+		},
+		{
+			name:  "label with space",
+			query: beads.ListQuery{Label: "order tracking", TierMode: beads.TierWisps},
+			want:  "bd-match-label",
+		},
+		{
+			name:  "type reserved token",
+			query: beads.ListQuery{Type: "or", TierMode: beads.TierWisps},
+			want:  "bd-match-type",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []string
+			runner := func(_, name string, args ...string) ([]byte, error) {
+				gotCmd := name + " " + strings.Join(args, " ")
+				calls = append(calls, gotCmd)
+				return []byte(`[
+					{"id":"bd-match-assignee","title":"message","status":"open","issue_type":"message","assignee":"gascity/workflows.codex-max","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
+					{"id":"bd-match-label","title":"label","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","ephemeral":true,"labels":["order tracking"]},
+					{"id":"bd-match-type","title":"reserved","status":"open","issue_type":"or","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
+					{"id":"bd-other","title":"other","status":"open","issue_type":"task","assignee":"someone-else","created_at":"2026-05-01T00:00:00Z","ephemeral":true}
+				]`), nil
+			}
+			s := beads.NewBdStore("/city", runner)
+			got, err := s.List(tc.query)
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			gotCmd := firstCommandWithPrefix(calls, "bd list ")
+			if !strings.Contains(gotCmd, "bd list --json") {
+				t.Fatalf("cmd = %q, want wisps bd list", gotCmd)
+			}
+			if strings.Contains(gotCmd, "--include-ephemeral") {
+				t.Fatalf("cmd = %q, bd list does not support --include-ephemeral", gotCmd)
+			}
+			if !strings.Contains(gotCmd, "--include-templates") {
+				t.Fatalf("cmd = %q, want --include-templates for wisp-aware list", gotCmd)
+			}
+			queryCmd := firstCommandWithPrefix(calls, "bd query ")
+			switch tc.name {
+			case "slash assignee":
+				if strings.Contains(queryCmd, "gascity/workflows.codex-max") {
+					t.Fatalf("query cmd = %q, unsafe slash assignee must be client-filtered", queryCmd)
+				}
+			case "label with space":
+				if strings.Contains(queryCmd, "order tracking") {
+					t.Fatalf("query cmd = %q, unsafe label must be client-filtered", queryCmd)
+				}
+			case "type reserved token":
+				if strings.Contains(queryCmd, "type=or") {
+					t.Fatalf("query cmd = %q, reserved type token must be client-filtered", queryCmd)
+				}
+			}
+			if len(got) != 1 || got[0].ID != tc.want {
+				t.Fatalf("List() = %+v, want only %s after client filtering", got, tc.want)
+			}
+		})
+	}
+}
+
+// --- Read retry ---
+
+func TestBdStoreReadyRetriesOnInvalidConnection(t *testing.T) {
+	calls := 0
+	goodJSON := []byte(`[{"id":"bd-x","title":"t","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`)
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, fmt.Errorf("begin read tx: invalid connection")
+		}
+		return goodJSON, nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.Ready()
+	if err != nil {
+		t.Fatalf("Ready() error = %v, want nil after retry recovered", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Ready() returned %d beads, want 1", len(got))
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (1 transient + 1 success)", calls)
+	}
+}
+
+func TestBdStoreReadyRetryBoundedReturnsErrorAfterExhaustion(t *testing.T) {
+	calls := 0
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		calls++
+		return nil, fmt.Errorf("begin read tx: invalid connection")
+	}
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Ready()
+	if err == nil {
+		t.Fatal("Ready() error = nil, want error after retries exhausted")
+	}
+	if calls < 2 {
+		t.Fatalf("calls = %d, want >= 2 (retry must be attempted)", calls)
+	}
+}

@@ -1,0 +1,84 @@
+# Events — verify local event recording and API-backed gc events behavior
+#
+# Tests that bead create/close and mail send/read emit events,
+# and that gc events no longer reads the local file-backed log directly.
+
+env GC_BEADS=file
+env GC_DOLT=skip
+env GC_SESSION=fake
+
+# Initialize city
+exec gc init $WORK/bright-lights
+cd $WORK/bright-lights
+
+# --- Create a bead → should emit bead.created ---
+
+exec bd create 'Build Tower of Hanoi'
+stdout 'Created bead: gc-1'
+
+# --- Close a bead → should emit bead.closed ---
+
+exec bd close gc-1
+stdout 'Closed bead: gc-1'
+
+# --- Send mail → should emit mail.sent ---
+
+exec gc mail send mayor 'hey there'
+stdout 'Sent message gc-2 to mayor'
+
+# --- Read mail → should emit mail.read ---
+
+exec gc mail read gc-2
+stdout 'Body:     hey there'
+
+# --- Event-producing commands append to the local city log ---
+
+exec grep 'bead.created' .gc/events.jsonl
+exec grep 'bead.closed' .gc/events.jsonl
+exec grep 'mail.sent' .gc/events.jsonl
+exec grep 'mail.read' .gc/events.jsonl
+exec grep 'gc-1' .gc/events.jsonl
+
+# --- gc events is a supervisor API reflection, not a local log reader ---
+
+! exec gc events
+stderr 'could not auto-discover the supervisor API'
+
+! exec gc events --type bead.created
+stderr 'could not auto-discover the supervisor API'
+
+# --- gc event emit (external event recording) ---
+
+exec gc event emit bead.updated --subject gc-1 --message 'Updated title'
+exec grep 'bead.updated' .gc/events.jsonl
+exec grep 'gc-1' .gc/events.jsonl
+
+# --- gc event emit with --actor ---
+
+exec gc event emit agent.started --subject mayor --actor gc --message 'started session'
+exec grep 'agent.started' .gc/events.jsonl
+exec grep 'gc' .gc/events.jsonl
+
+# --- gc event emit (missing type arg → exit 1) ---
+
+! exec gc event emit
+
+# --- gc event (missing subcommand) ---
+
+! exec gc event
+stderr 'missing subcommand'
+
+# --- Invalid --since ---
+
+! exec gc events --since notaduration
+stderr 'invalid --since'
+
+# --- Watch mode still requires the supervisor API ---
+
+! exec gc events --watch --type=agent.crashed --timeout=100ms
+stderr 'could not auto-discover the supervisor API'
+
+# --- Watch mode: invalid --timeout ---
+
+! exec gc events --watch --timeout=notaduration
+stderr 'invalid --timeout'

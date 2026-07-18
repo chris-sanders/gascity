@@ -1,0 +1,848 @@
+// Package docsync verifies that tutorial prose and testscript txtar files
+// cover the same set of gc commands. Every `$ gc <verb>` in a tutorial
+// markdown must have a corresponding `exec gc <verb>` in the txtar.
+package docsync
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/gastownhall/gascity/internal/docgen"
+)
+
+func repoRoot() string {
+	_, filename, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(filename), "..", "..")
+}
+
+var (
+	markdownLinkRE    = regexp.MustCompile(`\[[^][]+\]\(([^)]+)\)`)
+	schemaHrefRE      = regexp.MustCompile(`href="[^"]*?/schema/([^"#?]+)"`)
+	schemaGitHubRawRE = regexp.MustCompile(`href="https://raw\.githubusercontent\.com/gastownhall/gascity/main/docs/reference/schema/([^"#?]+)"`)
+)
+
+// docTreeDirs lists the top-level directories that are documentation trees
+// and should be link-checked. Update this list when adding or removing doc
+// directories. TestDocDirCoverage will fail if a new directory with markdown
+// appears that is not accounted for here or in docTreeIgnored.
+var docTreeDirs = []string{"contrib", "docs", "engdocs", "release-gates", "specs"}
+
+// docTreeIgnored lists directories that contain markdown but are not
+// documentation trees (e.g., embedded prompt templates, test fixtures,
+// gitignored scratch space for local work).
+var docTreeIgnored = []string{"cmd", "examples", "internal", "plans", "scripts", "test", "tmp", "worktrees"}
+
+// isNestedWorktreeRoot reports whether path is the root of a linked git
+// worktree checked out inside this tree. Linked worktrees have a .git FILE
+// (a "gitdir: ..." pointer) rather than a .git directory, so this catches
+// worktrees regardless of naming convention — unlike docTreeIgnored's
+// "worktrees" entry above, which only catches that exact name.
+func isNestedWorktreeRoot(path string) bool {
+	info, err := os.Lstat(filepath.Join(path, ".git"))
+	return err == nil && !info.IsDir()
+}
+
+// knownBrokenLinks lists links to docs that do not exist yet. These are
+// excluded from TestLocalMarkdownLinks failures but still logged. Remove
+// entries as the missing docs are created.
+// See: https://github.com/gastownhall/gascity/issues (file upstream)
+var knownBrokenLinks = map[string]bool{
+	"contrib/events-scripts/README.md -> ../../docs/k8s-guide.md":  true,
+	"contrib/session-scripts/README.md -> ../../docs/k8s-guide.md": true,
+}
+
+func TestSchemaDownloadLinksUseGitHubRaw(t *testing.T) {
+	root := repoRoot()
+	docs := []string{
+		"docs/reference/api.md",
+		"docs/reference/events.md",
+		"docs/reference/schema/index.md",
+	}
+
+	for _, rel := range docs {
+		path := filepath.Join(root, rel)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		for _, match := range schemaHrefRE.FindAllStringSubmatch(string(data), -1) {
+			target := match[1]
+			if filepath.Ext(target) != ".json" {
+				t.Errorf("%s links /schema/%s; schema downloads must use .json", rel, target)
+				continue
+			}
+			ghMatch := schemaGitHubRawRE.FindStringSubmatch(match[0])
+			if ghMatch == nil {
+				t.Errorf("%s links /schema/%s via relative path; use GitHub raw URL so downloads work in both local preview and production", rel, target)
+				continue
+			}
+			artifact := filepath.Join(root, "docs", "reference", "schema", filepath.FromSlash(target))
+			if _, err := os.Stat(artifact); err != nil {
+				t.Errorf("%s links /schema/%s but %s is not committed: %v", rel, target, artifact, err)
+			}
+		}
+	}
+}
+
+func allDocsMarkdownFiles(root string) ([]string, error) {
+	var files []string
+
+	// Root-level markdown files.
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(e.Name())
+		if ext == ".md" || ext == ".mdx" {
+			files = append(files, filepath.Join(root, e.Name()))
+		}
+	}
+
+	// Walk every doc tree directory.
+	for _, dir := range docTreeDirs {
+		dirRoot := filepath.Join(root, dir)
+		err := filepath.WalkDir(dirRoot, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				name := d.Name()
+				if path != dirRoot && (strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			ext := filepath.Ext(path)
+			if ext == ".md" || ext == ".mdx" {
+				files = append(files, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	sort.Strings(files)
+	return files, nil
+}
+
+func publicSurfaceMarkdownFiles(root string) ([]string, error) {
+	all, err := allDocsMarkdownFiles(root)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, path := range all {
+		// Skip archive subdirectories in any doc tree.
+		rel, _ := filepath.Rel(root, path)
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		isArchive := false
+		for _, p := range parts {
+			if p == "archive" {
+				isArchive = true
+				break
+			}
+		}
+		if !isArchive {
+			out = append(out, path)
+		}
+	}
+	return out, nil
+}
+
+func extractMarkdownLinks(content string) []string {
+	matches := markdownLinkRE.FindAllStringSubmatchIndex(content, -1)
+	var links []string
+	for _, m := range matches {
+		start := m[0]
+		if start > 0 && content[start-1] == '!' {
+			continue
+		}
+		target := content[m[2]:m[3]]
+		target = strings.TrimSpace(target)
+		target = strings.Trim(target, "<>")
+		if target == "" {
+			continue
+		}
+		if idx := strings.Index(target, ` "`); idx >= 0 {
+			target = target[:idx]
+		}
+		links = append(links, target)
+	}
+	return links
+}
+
+func isExternalLink(target string) bool {
+	switch {
+	case strings.HasPrefix(target, "http://"),
+		strings.HasPrefix(target, "https://"),
+		strings.HasPrefix(target, "mailto:"),
+		strings.HasPrefix(target, "tel:"),
+		strings.HasPrefix(target, "app://"),
+		strings.HasPrefix(target, "plugin://"),
+		strings.HasPrefix(target, "#"):
+		return true
+	default:
+		return false
+	}
+}
+
+// sourceTreeRoot returns the top-level doc directory that contains sourcePath,
+// or "" if sourcePath is a root-level file. For example, if sourcePath is
+// /repo/engdocs/architecture/foo.md and root is /repo, this returns "engdocs".
+func sourceTreeRoot(root, sourcePath string) string {
+	rel, err := filepath.Rel(root, sourcePath)
+	if err != nil {
+		return ""
+	}
+	parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
+	if len(parts) < 2 {
+		return "" // root-level file
+	}
+	dir := filepath.Join(root, parts[0])
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+	return parts[0]
+}
+
+func resolveLocalLink(root, sourcePath, target string) string {
+	if idx := strings.Index(target, "#"); idx >= 0 {
+		target = target[:idx]
+	}
+	if target == "" {
+		return ""
+	}
+	if strings.HasPrefix(target, "/") {
+		// Absolute links resolve against docs/, the document root. This
+		// matches the standard convention and Mintlify's behavior.
+		// Absolute paths work from any tree, but from engdocs/ or
+		// contrib/ they can be confusing since /foo resolves to
+		// docs/foo, not a sibling in the same tree.
+		target = strings.TrimPrefix(target, "/")
+		target = filepath.FromSlash(target)
+		return filepath.Clean(filepath.Join(root, "docs", target))
+	}
+	target = filepath.FromSlash(target)
+	return filepath.Clean(filepath.Join(filepath.Dir(sourcePath), target))
+}
+
+func localLinkExists(path string) bool {
+	if _, err := os.Stat(path); err == nil {
+		return true
+	}
+	switch ext := filepath.Ext(path); ext {
+	case "":
+		// Try .md then .mdx (Mintlify format), then index files.
+		for _, try := range []string{
+			path + ".md",
+			path + ".mdx",
+			filepath.Join(path, "index.md"),
+			filepath.Join(path, "index.mdx"),
+		} {
+			if _, err := os.Stat(try); err == nil {
+				return true
+			}
+		}
+	case ".md":
+		// Try .mdx variant.
+		mdxPath := strings.TrimSuffix(path, ".md") + ".mdx"
+		if _, err := os.Stat(mdxPath); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func collectMintPages(v any, out *[]string) {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, child := range x {
+			if k == "pages" {
+				if arr, ok := child.([]any); ok {
+					for _, item := range arr {
+						if s, ok := item.(string); ok {
+							*out = append(*out, s)
+						}
+					}
+				}
+			}
+			collectMintPages(child, out)
+		}
+	case []any:
+		for _, child := range x {
+			collectMintPages(child, out)
+		}
+	}
+}
+
+// gcVerbsFromMarkdown extracts unique gc subcommands from code blocks.
+// Only matches unindented `$ gc ...` lines to skip agent conversations.
+func gcVerbsFromMarkdown(path string) (map[string]bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	verbs := make(map[string]bool)
+	inCodeBlock := false
+	scanner := bufio.NewScanner(f)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "```") {
+			inCodeBlock = !inCodeBlock
+			continue
+		}
+		if !inCodeBlock {
+			continue
+		}
+		if strings.HasPrefix(line, "$ gc ") {
+			verb := extractVerb(line[len("$ gc "):])
+			if verb != "" {
+				verbs[verb] = true
+			}
+		}
+	}
+	return verbs, scanner.Err()
+}
+
+// gcVerbsFromTxtar extracts unique gc subcommands from exec lines.
+// Recognizes both active ("exec gc ...") and commented-out ("# exec gc ...")
+// lines so that planned-but-unimplemented commands count as covered.
+func gcVerbsFromTxtar(path string) (map[string]bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	verbs := make(map[string]bool)
+	scanner := bufio.NewScanner(f)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		after, ok := strings.CutPrefix(line, "exec gc ")
+		if !ok {
+			after, ok = strings.CutPrefix(line, "# exec gc ")
+			if !ok {
+				continue
+			}
+		}
+		verb := extractVerb(after)
+		if verb != "" {
+			verbs[verb] = true
+		}
+	}
+	return verbs, scanner.Err()
+}
+
+// extractVerb pulls the subcommand (up to 2 lowercase words) from args.
+// "rig add ~/foo" → "rig add", "bead show gc-1" → "bead show",
+// "start $WORK/x" → "start".
+func extractVerb(args string) string {
+	words := strings.Fields(args)
+	var parts []string
+	for i, w := range words {
+		if i >= 2 {
+			break
+		}
+		if !isLowerAlpha(w) {
+			break
+		}
+		parts = append(parts, w)
+	}
+	return strings.Join(parts, " ")
+}
+
+func isLowerAlpha(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < 'a' || c > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+func TestTutorial01CommandSync(t *testing.T) {
+	root := repoRoot()
+	tutorial := filepath.Join(root, "docs", "tutorials", "01-cities-and-rigs.md")
+	txtar := filepath.Join(root, "cmd", "gc", "testdata", "01-hello-gas-city.txtar")
+
+	mdVerbs, err := gcVerbsFromMarkdown(tutorial)
+	if err != nil {
+		t.Fatalf("parsing tutorial: %v", err)
+	}
+
+	txtarVerbs, err := gcVerbsFromTxtar(txtar)
+	if err != nil {
+		t.Fatalf("parsing txtar: %v", err)
+	}
+
+	// Every tutorial command must have txtar coverage.
+	var missing []string
+	for verb := range mdVerbs {
+		if !txtarVerbs[verb] {
+			missing = append(missing, verb)
+		}
+	}
+
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Errorf("gc commands in tutorial but not in txtar:")
+		for _, v := range missing {
+			t.Errorf("  gc %s", v)
+		}
+	}
+
+	// Log txtar commands not in tutorial (info only — txtar may test more
+	// than what's documented, which is fine).
+	var extra []string
+	for verb := range txtarVerbs {
+		if !mdVerbs[verb] {
+			extra = append(extra, verb)
+		}
+	}
+
+	if len(extra) > 0 {
+		sort.Strings(extra)
+		t.Logf("gc commands in txtar but not in tutorial (ok — extra test coverage):")
+		for _, v := range extra {
+			t.Logf("  gc %s", v)
+		}
+	}
+}
+
+func TestSchemaFreshness(t *testing.T) {
+	root := repoRoot()
+
+	// Generate schemas in memory and compare against committed files.
+	tests := []struct {
+		name     string
+		generate func() ([]byte, error)
+		path     string
+	}{
+		{
+			name: "city-schema.json",
+			generate: func() ([]byte, error) {
+				s, err := docgen.GenerateCitySchema()
+				if err != nil {
+					return nil, err
+				}
+				data, err := json.MarshalIndent(s, "", "  ")
+				if err != nil {
+					return nil, err
+				}
+				return append(data, '\n'), nil
+			},
+			path: filepath.Join(root, "docs", "reference", "schema", "city-schema.json"),
+		},
+		{
+			name: "config.md",
+			generate: func() ([]byte, error) {
+				s, err := docgen.GenerateCitySchema()
+				if err != nil {
+					return nil, err
+				}
+				var buf bytes.Buffer
+				if err := docgen.RenderMarkdown(&buf, s); err != nil {
+					return nil, err
+				}
+				return buf.Bytes(), nil
+			},
+			path: filepath.Join(root, "docs", "reference", "config.md"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			generated, err := tt.generate()
+			if err != nil {
+				t.Fatalf("generating %s: %v", tt.name, err)
+			}
+
+			committed, err := os.ReadFile(tt.path)
+			if err != nil {
+				t.Fatalf("reading %s: %v\nRun: go run ./cmd/genschema", tt.path, err)
+			}
+
+			if !bytes.Equal(generated, committed) {
+				t.Errorf("%s is stale. Run: go run ./cmd/genschema", tt.name)
+			}
+		})
+	}
+}
+
+// hasMdSuffix reports whether the path portion of a link target (before any
+// anchor or query) has a .md or .mdx extension. Used to catch "GitHub-friendly"
+// edits that add .md suffixes to Mintlify page links — the deployed site serves
+// extensionless routes, so the suffix breaks navigation even though the file
+// exists on disk.
+func hasMdSuffix(target string) bool {
+	path := target
+	if idx := strings.Index(path, "#"); idx >= 0 {
+		path = path[:idx]
+	}
+	if idx := strings.Index(path, "?"); idx >= 0 {
+		path = path[:idx]
+	}
+	ext := filepath.Ext(path)
+	return ext == ".md" || ext == ".mdx"
+}
+
+// isMintlifySource returns true if path belongs to a doc tree that has a
+// Mintlify config (docs.json). In Mintlify trees, extensionless root-relative
+// links like /tutorials/01-beads are the expected convention. Other trees are
+// GitHub-only and must use explicit .md extensions.
+func isMintlifySource(root, path string) bool {
+	tree := sourceTreeRoot(root, path)
+	if tree == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(root, tree, "docs.json"))
+	return err == nil
+}
+
+func TestLocalMarkdownLinks(t *testing.T) {
+	root := repoRoot()
+	files, err := allDocsMarkdownFiles(root)
+	if err != nil {
+		t.Fatalf("collecting markdown files: %v", err)
+	}
+
+	var broken []string
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		mintlify := isMintlifySource(root, path)
+		docsRoot := filepath.Join(root, "docs")
+		relToDocsRoot, _ := filepath.Rel(docsRoot, path)
+		relToDocsRoot = filepath.ToSlash(relToDocsRoot)
+		publishedMintlifyPage := mintlify && !docsPublishExemptions[relToDocsRoot]
+		for _, target := range extractMarkdownLinks(string(data)) {
+			if isExternalLink(target) {
+				continue
+			}
+			resolved := resolveLocalLink(root, path, target)
+			if resolved == "" {
+				continue
+			}
+			if mintlify {
+				// Mintlify docs: extensionless links are the correct convention
+				// (deployed site uses route-based URLs without extensions).
+				// A .md/.mdx suffix on an internal page link breaks Mintlify
+				// navigation even though the file exists on disk.
+				// Only enforce for published pages — workspace meta files
+				// (docsPublishExemptions) may legitimately reference raw filenames.
+				if publishedMintlifyPage && hasMdSuffix(target) {
+					relPath, _ := filepath.Rel(root, path)
+					broken = append(broken, relPath+" -> "+target)
+				} else if !localLinkExists(resolved) {
+					relPath, _ := filepath.Rel(root, path)
+					broken = append(broken, relPath+" -> "+target)
+				}
+			} else {
+				// engdocs and root files: GitHub-only, require exact
+				// file paths. No extensionless fallback.
+				if _, err := os.Stat(resolved); err != nil {
+					relPath, _ := filepath.Rel(root, path)
+					broken = append(broken, relPath+" -> "+target)
+				}
+			}
+		}
+	}
+
+	sort.Strings(broken)
+	var unexpected []string
+	for _, item := range broken {
+		if !knownBrokenLinks[item] {
+			unexpected = append(unexpected, item)
+		}
+	}
+	if len(unexpected) > 0 {
+		t.Errorf(`broken local markdown links (%d):
+
+docs/ is authored for the Mintlify site (https://docs.gascityhall.com), NOT for
+direct GitHub viewing. Internal page links in docs/ are extensionless by
+convention — use /tutorials/01-beads, not /tutorials/01-beads.md. A .md/.mdx
+suffix breaks Mintlify navigation even though the file exists on disk, so please
+don't reformat docs/ links to be "GitHub-friendly". (engdocs/ and root .md files
+ARE GitHub-only and DO require explicit .md paths.) See CONTRIBUTING.md ->
+"Docs link conventions". If a link is genuinely broken on the live site, say so
+in the PR and we'll fix it Mintlify-side rather than changing the path here.
+
+Offending links:`, len(unexpected))
+		for _, item := range unexpected {
+			t.Errorf("  %s", item)
+		}
+	}
+	if len(broken) > 0 && len(unexpected) == 0 {
+		t.Logf("%d known-broken links (see knownBrokenLinks allowlist)", len(broken))
+	}
+}
+
+func TestMintNavigationPagesExist(t *testing.T) {
+	root := repoRoot()
+	configPath := filepath.Join(root, "docs", "docs.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("reading docs.json: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("parsing docs.json: %v", err)
+	}
+
+	var pages []string
+	collectMintPages(decoded, &pages)
+	sort.Strings(pages)
+
+	var missing []string
+	for _, page := range pages {
+		path := filepath.Join(root, "docs", filepath.FromSlash(page))
+		if filepath.Ext(path) == "" {
+			path += ".md"
+		}
+		if _, err := os.Stat(path); err != nil {
+			// Also try .mdx (Mintlify format).
+			mdxPath := strings.TrimSuffix(path, ".md") + ".mdx"
+			if _, err2 := os.Stat(mdxPath); err2 != nil {
+				missing = append(missing, page)
+			}
+		}
+	}
+
+	if len(missing) > 0 {
+		t.Errorf("docs.json references missing pages:")
+		for _, page := range missing {
+			t.Errorf("  %s", page)
+		}
+	}
+}
+
+// docsPublishExemptions lists markdown files under docs/ that are allowed to
+// exist without a docs.json navigation entry. The docs/ tree publishes to
+// docs.gascityhall.com via Mintlify, so every other .md/.mdx must appear in
+// the navigation. Keep this list tiny: a file belongs here only if it is
+// docs-workspace meta (not a published page and not an engineering doc).
+// Engineering docs (plans, design notes, internal runbooks) do NOT belong in
+// docs/ at all — move them under engdocs/ instead of adding an exemption.
+var docsPublishExemptions = map[string]bool{
+	"README.md": true, // contributor README for the docs workspace itself
+}
+
+// collectDocsMarkdownFiles returns every .md/.mdx file under docs/, as paths
+// relative to docs/ with forward slashes (e.g. "guides/index.md").
+func collectDocsMarkdownFiles(docsRoot string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(docsRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if ext := filepath.Ext(path); ext != ".md" && ext != ".mdx" {
+			return nil
+		}
+		rel, err := filepath.Rel(docsRoot, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+// TestEveryDocsPageIsPublished enforces that docs/ holds only published docs:
+// every markdown file under docs/ must be referenced by docs.json navigation
+// (the source of truth for what ships to docs.gascityhall.com), except for the
+// small docsPublishExemptions allowlist. This is the reverse of
+// TestMintNavigationPagesExist (which checks nav entries point at real files);
+// together they keep docs/ and the published nav in exact correspondence and
+// keep engineering docs (plans, design notes) out of the published tree.
+func TestEveryDocsPageIsPublished(t *testing.T) {
+	root := repoRoot()
+	docsRoot := filepath.Join(root, "docs")
+
+	data, err := os.ReadFile(filepath.Join(docsRoot, "docs.json"))
+	if err != nil {
+		t.Fatalf("reading docs.json: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("parsing docs.json: %v", err)
+	}
+
+	// Build the set of page-form references (no extension, slash-separated)
+	// that docs.json navigation declares, e.g. "guides/index".
+	var pages []string
+	collectMintPages(decoded, &pages)
+	navPages := make(map[string]bool, len(pages))
+	for _, p := range pages {
+		navPages[strings.TrimSuffix(filepath.ToSlash(p), filepath.Ext(p))] = true
+	}
+
+	files, err := collectDocsMarkdownFiles(docsRoot)
+	if err != nil {
+		t.Fatalf("collecting docs markdown: %v", err)
+	}
+
+	var orphans []string
+	for _, rel := range files {
+		if docsPublishExemptions[rel] {
+			continue
+		}
+		pageForm := strings.TrimSuffix(rel, filepath.Ext(rel))
+		if !navPages[pageForm] {
+			orphans = append(orphans, rel)
+		}
+	}
+
+	if len(orphans) > 0 {
+		sort.Strings(orphans)
+		t.Errorf("docs/ markdown files not referenced in docs.json navigation.\n" +
+			"docs/ publishes to docs.gascityhall.com, so every page must be in the nav.\n" +
+			"Fix each file by either adding it to docs/docs.json navigation (if it is a\n" +
+			"published page) or moving it under engdocs/ (if it is an engineering doc):")
+		for _, o := range orphans {
+			t.Errorf("  docs/%s", o)
+		}
+	}
+}
+
+func TestNoKnownStaleDocReferences(t *testing.T) {
+	root := repoRoot()
+	files, err := publicSurfaceMarkdownFiles(root)
+	if err != nil {
+		t.Fatalf("collecting public markdown files: %v", err)
+	}
+
+	banned := []string{
+		"internal/session/session.go",
+		"internal/session/fingerprint.go",
+		"docs/primitive-test.md",
+		"02-named-crew.md",
+		"04-agent-team.md",
+		"progression.md",
+		"mail-roadmap.md",
+		"agent.NewFake",
+		"session.Fake",
+		"agent.Fake",
+		"internal/dolt/",
+	}
+
+	var hits []string
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		text := string(data)
+		relPath, _ := filepath.Rel(root, path)
+		for _, pattern := range banned {
+			if strings.Contains(text, pattern) {
+				hits = append(hits, relPath+" -> "+pattern)
+			}
+		}
+	}
+
+	if len(hits) > 0 {
+		sort.Strings(hits)
+		t.Errorf("found stale doc references:")
+		for _, hit := range hits {
+			t.Errorf("  %s", hit)
+		}
+	}
+}
+
+// TestDocDirCoverage fails if a new top-level directory containing markdown
+// files exists that is not listed in docTreeDirs or docTreeIgnored. This
+// prevents silent gaps when new doc directories are added.
+func TestDocDirCoverage(t *testing.T) {
+	root := repoRoot()
+	known := make(map[string]bool)
+	for _, d := range docTreeDirs {
+		known[d] = true
+	}
+	for _, d := range docTreeIgnored {
+		known[d] = true
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("reading repo root: %v", err)
+	}
+
+	var uncovered []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules" {
+			continue
+		}
+		if known[name] {
+			continue
+		}
+		dirPath := filepath.Join(root, name)
+		if isNestedWorktreeRoot(dirPath) {
+			continue
+		}
+		// Check if this directory contains any markdown.
+		hasMarkdown := false
+		_ = filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || hasMarkdown {
+				return filepath.SkipDir
+			}
+			if !d.IsDir() {
+				ext := filepath.Ext(path)
+				if ext == ".md" || ext == ".mdx" {
+					hasMarkdown = true
+					return filepath.SkipAll
+				}
+			}
+			return nil
+		})
+		if hasMarkdown {
+			uncovered = append(uncovered, name)
+		}
+	}
+
+	if len(uncovered) > 0 {
+		sort.Strings(uncovered)
+		t.Errorf("directories with markdown not in docTreeDirs or docTreeIgnored " +
+			"(add to the appropriate list in docsync_test.go):")
+		for _, d := range uncovered {
+			t.Errorf("  %s", d)
+		}
+	}
+}
