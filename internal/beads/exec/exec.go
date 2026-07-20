@@ -33,6 +33,13 @@ func (s *Store) SetEnv(env map[string]string) {
 	s.env = env
 }
 
+// IDPrefix returns the issue-id prefix for this exec-backed store, read from
+// the GC_BEADS_PREFIX entry of the store's env. NewCachingStore uses it to key
+// the cache by scope prefix; without it exec stores cache as "(no-prefix)".
+func (s *Store) IDPrefix() string {
+	return strings.TrimSpace(s.env["GC_BEADS_PREFIX"])
+}
+
 // NewStore returns a Store that delegates to the given script.
 // The script path may be absolute, relative, or a bare name resolved via
 // exec.LookPath.
