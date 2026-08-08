@@ -1,0 +1,57 @@
+diff --git a/cmd/gc/session_reconciler.go b/cmd/gc/session_reconciler.go
+index 871a72b71..65a58b78b 100644
+--- a/cmd/gc/session_reconciler.go
++++ b/cmd/gc/session_reconciler.go
+@@ -2109,7 +2109,51 @@ func reconcileSessionBeadsTracedWithNamedDemand(
+ 		// infoPostZombie stays byte-identical throughout. Guarded by
+ 		// TestReconcileSessionBeads_ZombieTerminalErrorReflectedOnSnapshot.
+ 		infoPostZombie := infoByID[id]
+-		if alive && shouldRollbackPendingCreateInfo(infoPostZombie) && !runningSessionMatchesPendingCreateInfo(infoPostZombie, name, sp) {
++		var pendingCreateStartupTimeout time.Duration
++		if cfg != nil {
++			pendingCreateStartupTimeout = cfg.Session.StartupTimeoutDuration()
++		}
++		// Draft 16 (Patch C): the "belongs to another session" rollback must not
++		// fire while THIS session's own async start is still in flight. On k8s a
++		// pool worker's Start is async (start_enqueued → ~17s pod-create →
++		// success); a reconcile tick during that window reads not-yet-committed
++		// runtime metadata (GetMeta GC_SESSION_ID empty/transient), so the strict
++		// runningSessionMatchesPendingCreateInfo check reports "foreign runtime"
++		// and rolls back the pending-create mid-start — then the start commits
++		// success against a bead the reconciler already closed, so the pool
++		// re-mints next tick → perpetual churn. pendingCreateStartInFlightInfo is
++		// the existing start-lease window (last_woke_at + startup_timeout +
++		// staleKeyDetectDelay + 5s); defer rollback while it holds. A truly wedged
++		// start still rolls back once the lease expires (branch at ~2164 below).
++		if alive && shouldRollbackPendingCreateInfo(infoPostZombie) &&
++			!pendingCreateStartInFlightInfo(infoPostZombie, clk, pendingCreateStartupTimeout) &&
++			!runningSessionMatchesPendingCreateInfo(infoPostZombie, name, sp) {
++			// Draft 16 (Patch A): a pool with poolDesired=N mints a fresh
++			// pending-create session bead each reconcile tick that does not yet
++			// count the already-live worker toward demand. The live pod is
++			// labeled with the FIRST session id, so this new pending-create sees
++			// its runtime "belongs to another session". Before Draft 15's
++			// Stop(name) below, distinguish the two cases:
++			//   (a) a true ORPHAN — the live runtime's owning session is gone or
++			//       is a different pool slot → stop it (Draft 15 behavior), or
++			//   (b) a DUPLICATE mint for a slot whose legitimate live worker is
++			//       still open in this tick → roll back only the duplicate bead
++			//       and LEAVE THE LIVE RUNTIME running (else Draft 15 kills the
++			//       good worker → perpetual churn, worker never claims work).
++			// Match by the stable pool identity (Template + PoolSlot) on the
++			// live runtime's owning session, not by the freshly-minted id.
++			// Drop with Patch B (pool demand counts in-flight sessions) upstream.
++			if liveID, err := sp.GetMeta(name, "GC_SESSION_ID"); err == nil {
++				liveID = strings.TrimSpace(liveID)
++				if liveOwner, ok := infoByID[liveID]; ok && liveID != id &&
++					!liveOwner.Closed && liveOwner.PoolManaged &&
++					liveOwner.Template == infoPostZombie.Template &&
++					liveOwner.PoolSlot == infoPostZombie.PoolSlot {
++					fmt.Fprintf(stderr, "session reconciler: rolling back duplicate pending-create %s for pool slot already served by live session %s (leaving runtime %s running)\n", id, liveID, name) //nolint:errcheck
++					tick.apply(id, attemptRollbackPendingCreate(infoByID[id], tp.TemplateName, name, "pending_create_rollback", "duplicate pending-create; live runtime already serves pool slot", false))
++					continue
++				}
++			}
+ 			// Stop the abandoned runtime too, else a k8s pool worker's
+ 			// sleep-infinity pod outlives the rolled-back create as an orphan
+ 			// that never reaps. Safe: pool-instance session names are unique, so
