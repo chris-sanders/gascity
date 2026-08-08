@@ -1,0 +1,9 @@
+issue_prefix: ci
+issue-prefix: ci
+gc.endpoint_origin: city_canonical
+gc.endpoint_status: unverified
+dolt.host: dolt.gc.svc.cluster.local
+dolt.port: 3307
+dolt.user: root
+dolt.mode: server
+dolt.auto-start: false
