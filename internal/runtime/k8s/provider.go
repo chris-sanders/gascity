@@ -49,6 +49,7 @@ type Provider struct {
 	tolerations        []corev1.Toleration // GC_K8S_TOLERATIONS (JSON)
 	affinity           *corev1.Affinity    // GC_K8S_AFFINITY (JSON)
 	priorityClassName  string              // GC_K8S_PRIORITY_CLASS_NAME
+	codexAuthSecret    string              // GC_K8S_CODEX_AUTH_SECRET: read-only auth.json seed
 	postStartSettle    time.Duration       // settle time before post-start liveness check
 	stderr             io.Writer           // warning output (default os.Stderr)
 }
@@ -68,6 +69,9 @@ type schedulingFields struct {
 //   - GC_K8S_SERVICE_ACCOUNT — pod service account name (default: namespace default)
 //   - GC_K8S_CPU_REQUEST, GC_K8S_MEM_REQUEST — resource requests
 //   - GC_K8S_CPU_LIMIT, GC_K8S_MEM_LIMIT — resource limits
+//   - GC_K8S_CODEX_AUTH_SECRET — optional Secret containing a minimal Codex
+//     auth.json seed.  It is mounted read-only and copied into a fresh writable
+//     CODEX_HOME for each worker; it is never injected as an API-key variable.
 //
 // The in-cluster Dolt service alias defaults to the provider defaults
 // (dolt.gc.svc.cluster.local:3307). Pods receive projected GC_DOLT_* env;
@@ -124,6 +128,7 @@ func NewProvider() (*Provider, error) {
 		tolerations:        scheduling.tolerations,
 		affinity:           scheduling.affinity,
 		priorityClassName:  scheduling.priorityClassName,
+		codexAuthSecret:    strings.TrimSpace(os.Getenv("GC_K8S_CODEX_AUTH_SECRET")),
 	}, nil
 }
 

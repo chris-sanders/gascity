@@ -102,6 +102,49 @@ func TestBuildPod_NoSchedulingFields_NoBehaviorChange(t *testing.T) {
 	}
 }
 
+func TestBuildPod_CodexAuthUsesReadOnlySeedAndFreshWritableHome(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	p.codexAuthSecret = "codex-credentials"
+	pod, err := buildPod("test-session", runtime.Config{Command: "codex exec hello"}, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	var seed, home *corev1.VolumeMount
+	for i := range pod.Spec.Containers[0].VolumeMounts {
+		m := &pod.Spec.Containers[0].VolumeMounts[i]
+		if m.Name == "codex-auth-seed" {
+			seed = m
+		}
+		if m.Name == "codex-home" {
+			home = m
+		}
+	}
+	if seed == nil || !seed.ReadOnly || seed.MountPath != "/var/run/gascity/codex-seed" {
+		t.Fatalf("missing read-only Codex seed mount: %#v", seed)
+	}
+	if home == nil || home.MountPath != "/home/gcagent/.codex" {
+		t.Fatalf("missing writable Codex home mount: %#v", home)
+	}
+	if !strings.Contains(strings.Join(pod.Spec.Containers[0].Args, " "), "chmod 0600 \"$CODEX_HOME/auth.json\"") {
+		t.Fatal("entrypoint does not restrict copied auth.json")
+	}
+	var codexHome bool
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == "CODEX_HOME" && e.Value == "/home/gcagent/.codex" {
+			codexHome = true
+		}
+		if e.Name == "OPENAI_API_KEY" || e.Name == "CODEX_API_KEY" {
+			t.Fatalf("API-key fallback present: %s", e.Name)
+		}
+	}
+	if !codexHome {
+		t.Fatal("CODEX_HOME is not set")
+	}
+	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
+		t.Fatal("Codex worker pod is not explicitly non-root")
+	}
+}
+
 func TestBuildPod_ClonesSchedulingFields(t *testing.T) {
 	seconds := int64(30)
 	p := newProviderWithOps(newFakeK8sOps())

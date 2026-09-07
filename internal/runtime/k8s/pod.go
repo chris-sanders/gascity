@@ -254,7 +254,13 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			linuxUsername,
 		)
 	}
-	credCopy := `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; git config --global --add safe.directory '*' 2>/dev/null; `
+	credCopy := `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; `
+	if p.codexAuthSecret != "" {
+		// The Secret volume remains read-only.  Codex refreshes auth state, so
+		// every worker gets a new EmptyDir-backed home seeded from auth.json.
+		credCopy += `mkdir -p "$CODEX_HOME" && cp -L /var/run/gascity/codex-seed/auth.json "$CODEX_HOME/auth.json" && chmod 0700 "$CODEX_HOME" && chmod 0600 "$CODEX_HOME/auth.json"; `
+	}
+	credCopy += `git config --global --add safe.directory '*' 2>/dev/null; `
 	wsWait := ""
 	if !p.prebaked {
 		wsWait = `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
@@ -321,6 +327,16 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			},
 		},
 	})
+	if p.codexAuthSecret != "" {
+		mainVolMounts = append(mainVolMounts,
+			corev1.VolumeMount{Name: "codex-auth-seed", MountPath: "/var/run/gascity/codex-seed", ReadOnly: true},
+			corev1.VolumeMount{Name: "codex-home", MountPath: "/home/gcagent/.codex"},
+		)
+		volumes = append(volumes,
+			corev1.Volume{Name: "codex-auth-seed", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: p.codexAuthSecret}}},
+			corev1.Volume{Name: "codex-home", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		)
+	}
 
 	// If GC_CITY differs from work_dir, add a city volume (not needed when prebaked).
 	if !p.prebaked && ctrlCity != "" && ctrlCity != cfg.WorkDir {
@@ -378,6 +394,18 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			}},
 			Volumes: volumes,
 		},
+	}
+	if p.codexAuthSecret != "" {
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "CODEX_HOME", Value: "/home/gcagent/.codex"})
+		uid := int64(1000)
+		pod.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsNonRoot: boolPtr(true), FSGroup: &uid}
+		pod.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{
+			RunAsNonRoot:             boolPtr(true),
+			RunAsUser:                &uid,
+			RunAsGroup:               &uid,
+			AllowPrivilegeEscalation: boolPtr(false),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		}
 	}
 
 	// Apply optional scheduling fields.
