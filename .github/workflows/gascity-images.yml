@@ -66,7 +66,10 @@ jobs:
           test -x gc && test -x br
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
-        with: {registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }}}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and publish base
         id: base
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
@@ -134,4 +137,7 @@ jobs:
         run: |
           jq -n --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with: {name: gascity-images-${{ inputs.run_nonce }}, path: image-evidence.json, if-no-files-found: error}
+        with:
+          name: gascity-images-${{ inputs.run_nonce || github.run_id }}
+          path: image-evidence.json
+          if-no-files-found: error
