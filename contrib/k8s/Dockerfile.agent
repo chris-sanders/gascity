@@ -56,6 +56,25 @@ FROM ${BASE_IMAGE}
 # back to gcagent below.
 USER root
 
+# Public, credential-free Codex integration. The compatibility wrapper keeps
+# the frozen provider argv valid for the pinned native CLI.
+ARG CODEX_VERSION=0.153.4
+ARG CODEX_TARBALL_SHA512=c7511cc01958dc039b33555350734cd80cc0250b32ade19d6a0a45faa162622fce6b7d15064b6fbc6d02ead2ed0b3a96ea18d93569066505a679593b32e24a5a
+ARG CODEX_PLATFORM_PACKAGE=linux-x64
+ARG CODEX_TARGET_TRIPLE=x86_64-unknown-linux-musl
+COPY contrib/k8s/codex-compat.sh /tmp/codex-compat.sh
+RUN set -eux; codex_dir="/opt/codex-${CODEX_VERSION}"; mkdir -p "$codex_dir"; \
+    curl -fsSL --retry 3 "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_VERSION}-${CODEX_PLATFORM_PACKAGE}.tgz" -o /tmp/codex.tgz; \
+    echo "${CODEX_TARBALL_SHA512}  /tmp/codex.tgz" | sha512sum --check --strict; \
+    tar -xzf /tmp/codex.tgz --strip-components=1 -C "$codex_dir"; \
+    test -x "$codex_dir/vendor/${CODEX_TARGET_TRIPLE}/bin/codex"; \
+    mkdir -p /usr/local/libexec; ln -s "$codex_dir/vendor/${CODEX_TARGET_TRIPLE}/bin/codex" /usr/local/libexec/gascity-codex-native; \
+    install -m 0755 /tmp/codex-compat.sh /usr/local/bin/codex; \
+    test "$(/usr/local/bin/codex --version)" = "codex-cli ${CODEX_VERSION}"; rm -f /tmp/codex.tgz /tmp/codex-compat.sh
+LABEL io.gascity.codex.version="${CODEX_VERSION}" \
+      io.gascity.codex.tarball.sha512="${CODEX_TARBALL_SHA512}" \
+      io.gascity.codex.compatibility="frozen-provider-ask-for-approval-v2"
+
 # bd (beads) CLI, rebuilt above from checksum-pinned release source.
 COPY --from=bd-builder /out/bd /usr/local/bin/bd
 RUN BD_DISABLE_METRICS=1 BD_DISABLE_EVENT_FLUSH=1 bd --version
@@ -85,5 +104,7 @@ RUN chown gcagent:gcagent /workspace
 # (UID 0) via securityContext so the entrypoint can create the dynamic user
 # before dropping privileges.
 USER gcagent
+
+ENV CODEX_MANAGED_PACKAGE_ROOT=/opt/codex-${CODEX_VERSION}
 
 CMD ["/bin/bash"]

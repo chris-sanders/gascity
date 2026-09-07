@@ -937,6 +937,7 @@ func TestBuildPodEnvRemapsVars(t *testing.T) {
 		"GC_CITY_PATH":                        "/host/city",
 		"GC_DIR":                              "/host/city/rig",
 		"GC_RIG_ROOT":                         "/host/city/rig",
+		"GC_BEADS_SCOPE_ROOT":                 "/host/city/rig",
 		"GC_STORE_ROOT":                       "/host/city/rig",
 		"BEADS_DIR":                           "/host/city/rig/.beads",
 		"GT_ROOT":                             "/host/city",
@@ -985,6 +986,12 @@ func TestBuildPodEnvRemapsVars(t *testing.T) {
 	// GC_RIG_ROOT should be remapped from controller city path to /workspace.
 	if envMap["GC_RIG_ROOT"] != "/workspace/rig" {
 		t.Errorf("GC_RIG_ROOT = %q, want /workspace/rig", envMap["GC_RIG_ROOT"])
+	}
+
+	// This value is generated after controller configuration is merged, so it
+	// must be projected at the pod boundary just like the other city paths.
+	if envMap["GC_BEADS_SCOPE_ROOT"] != "/workspace/rig" {
+		t.Errorf("GC_BEADS_SCOPE_ROOT = %q, want /workspace/rig", envMap["GC_BEADS_SCOPE_ROOT"])
 	}
 
 	// GC_STORE_ROOT should be remapped from controller city path to /workspace.

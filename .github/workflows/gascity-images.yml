@@ -1,0 +1,131 @@
+name: Gas City public runtime images
+run-name: Gas City public images ${{ inputs.source_sha }} (${{ inputs.run_nonce || 'manual' }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact public fork commit to build
+        required: true
+        type: string
+      platform:
+        description: Bootstrap platform
+        required: true
+        default: linux/amd64
+        type: string
+      run_nonce:
+        description: Unique deterministic-run locator
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      UPSTREAM_BASE_SHA: 6ba434271c5f76bc150f694ebeef9d713be16b3a
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      PLATFORM: ${{ inputs.platform }}
+      CODEX_VERSION: 0.153.4
+      CODEX_TARBALL_SHA512: c7511cc01958dc039b33555350734cd80cc0250b32ade19d6a0a45faa162622fce6b7d15064b6fbc6d02ead2ed0b3a96ea18d93569066505a679593b32e24a5a
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with: {ref: ${{ inputs.source_sha }}, fetch-depth: 0, persist-credentials: false}
+      - name: Verify public source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$PLATFORM" == linux/amd64 ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_BASE_SHA" HEAD
+          echo "TAG=bootstrap-${SOURCE_SHA:0:12}" >> "$GITHUB_ENV"
+          echo "BASE=ghcr.io/chris-sanders/gascity-agent-base" >> "$GITHUB_ENV"
+          echo "AGENT=ghcr.io/chris-sanders/gascity-agent" >> "$GITHUB_ENV"
+          echo "CONTROLLER=ghcr.io/chris-sanders/gascity-controller" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with: {go-version-file: go.mod, cache: true}
+      - name: Prove source-level runtime contracts
+        run: |
+          set -euo pipefail
+          go test ./internal/runtime/k8s -run '^TestBuildPodEnvRemapsVars$' -count=1
+          chmod +x contrib/k8s/codex-compat.sh contrib/k8s/test-codex-compat.sh
+          contrib/k8s/test-codex-compat.sh
+          . ./deps.env
+          BR_INSTALL_BIN_DIR="$PWD" .github/scripts/install-br-archive.sh "$BR_VERSION"
+          CGO_ENABLED=0 go build -buildvcs=false -trimpath -o gc ./cmd/gc
+          test -x gc && test -x br
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with: {registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }}}
+      - name: Build and publish base
+        id: base
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: contrib/k8s/Dockerfile.base
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ${{ env.BASE }}:${{ env.TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/chris-sanders/gascity
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
+      - name: Build and publish Codex agent
+        id: agent
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: contrib/k8s/Dockerfile.agent
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ${{ env.AGENT }}:${{ env.TAG }}
+          build-args: BASE_IMAGE=${{ env.BASE }}@${{ steps.base.outputs.digest }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/chris-sanders/gascity
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
+            io.gascity.codex.version=${{ env.CODEX_VERSION }}
+            io.gascity.codex.tarball.sha512=${{ env.CODEX_TARBALL_SHA512 }}
+      - name: Build and publish controller
+        id: controller
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: contrib/k8s/Dockerfile.controller
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ${{ env.CONTROLLER }}:${{ env.TAG }}
+          build-args: BASE=${{ env.AGENT }}@${{ steps.agent.outputs.digest }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/chris-sanders/gascity
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
+      - name: Probe immutable images as non-root
+        env:
+          BASE_DIGEST: ${{ steps.base.outputs.digest }}
+          AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
+          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for pair in "$BASE:$BASE_DIGEST" "$AGENT:$AGENT_DIGEST" "$CONTROLLER:$CONTROLLER_DIGEST"; do docker pull "${pair/:/@}"; done
+          agent="$AGENT@$AGENT_DIGEST"; controller="$CONTROLLER@$CONTROLLER_DIGEST"
+          docker run --rm --entrypoint gc "$agent" version
+          docker run --rm -e BD_DISABLE_METRICS=1 -e BD_DISABLE_EVENT_FLUSH=1 --entrypoint bd "$agent" --version
+          docker run --rm --entrypoint dolt "$agent" version
+          docker run --rm --entrypoint kubectl "$controller" version --client=true
+          test "$(docker run --rm --entrypoint codex "$agent" --version)" = "codex-cli $CODEX_VERSION"
+          docker run --rm --entrypoint codex "$agent" exec --sandbox read-only --ask-for-approval untrusted --help >/dev/null
+          docker run --rm --entrypoint /bin/sh "$agent" -c 'test "$(id -u)" != 0; test ! -e "$HOME/.codex/auth.json"; test -w /workspace'
+      - name: Emit compact evidence
+        env:
+          BASE_DIGEST: ${{ steps.base.outputs.digest }}
+          AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
+          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+        run: |
+          jq -n --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: {name: gascity-images-${{ inputs.run_nonce }}, path: image-evidence.json, if-no-files-found: error}
