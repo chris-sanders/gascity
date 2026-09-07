@@ -8,9 +8,9 @@ digest-only evidence. It never publishes `latest`.
 
 The workflow publishes credential-free images at:
 
-* `ghcr.io/chris-sanders/gascity-agent-base`
-* `ghcr.io/chris-sanders/gascity-agent`
-* `ghcr.io/chris-sanders/gascity-controller`
+* `ghcr.io/chris-sanders/gascity-runtime-base`
+* `ghcr.io/chris-sanders/gascity-runtime-agent`
+* `ghcr.io/chris-sanders/gascity-runtime-controller`
 
 The agent pins Codex CLI `0.153.4` and its npm archive SHA-512. Runtime
 credentials belong in deployment-local Secrets and must never be added here.

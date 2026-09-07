@@ -49,9 +49,9 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           git merge-base --is-ancestor "$UPSTREAM_BASE_SHA" HEAD
           echo "TAG=bootstrap-${SOURCE_SHA:0:12}" >> "$GITHUB_ENV"
-          echo "BASE=ghcr.io/chris-sanders/gascity-agent-base" >> "$GITHUB_ENV"
-          echo "AGENT=ghcr.io/chris-sanders/gascity-agent" >> "$GITHUB_ENV"
-          echo "CONTROLLER=ghcr.io/chris-sanders/gascity-controller" >> "$GITHUB_ENV"
+          echo "BASE=ghcr.io/chris-sanders/gascity-runtime-base" >> "$GITHUB_ENV"
+          echo "AGENT=ghcr.io/chris-sanders/gascity-runtime-agent" >> "$GITHUB_ENV"
+          echo "CONTROLLER=ghcr.io/chris-sanders/gascity-runtime-controller" >> "$GITHUB_ENV"
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with: {go-version-file: go.mod, cache: true}
       - name: Prove source-level runtime contracts
