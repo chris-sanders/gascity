@@ -129,6 +129,27 @@ jobs:
           test "$(docker run --rm --entrypoint codex "$agent" --version)" = "codex-cli $CODEX_VERSION"
           docker run --rm --entrypoint codex "$agent" exec --sandbox read-only --ask-for-approval untrusted --help >/dev/null
           docker run --rm --entrypoint /bin/sh "$agent" -c 'test "$(id -u)" != 0; test ! -e "$HOME/.codex/auth.json"; test -w /workspace'
+      - name: Prove anonymous exact-digest manifest access
+        env:
+          BASE_DIGEST: ${{ steps.base.outputs.digest }}
+          AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
+          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+        run: |
+          set -euo pipefail
+          anonymous_manifest() {
+            local repository="$1" digest="$2" challenge realm service token status
+            challenge="$(curl -sSI -H 'Accept: application/vnd.oci.image.index.v1+json' "https://ghcr.io/v2/${repository}/manifests/${digest}" | tr -d '\r' | awk 'BEGIN{IGNORECASE=1}/^www-authenticate: Bearer/{sub(/^www-authenticate: /, "");print;exit}')"
+            realm="$(sed -n 's/.*realm="\([^"]*\)".*/\1/p' <<<"$challenge")"
+            service="$(sed -n 's/.*service="\([^"]*\)".*/\1/p' <<<"$challenge")"
+            test -n "$realm" && test -n "$service"
+            token="$(curl -fsS -G "$realm" --data-urlencode "service=$service" --data-urlencode "scope=repository:${repository}:pull" | jq -r .token)"
+            test -n "$token" && test "$token" != null
+            status="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' "https://ghcr.io/v2/${repository}/manifests/${digest}")"
+            test "$status" = 200
+          }
+          anonymous_manifest chris-sanders/gascity-runtime-base "$BASE_DIGEST"
+          anonymous_manifest chris-sanders/gascity-runtime-agent "$AGENT_DIGEST"
+          anonymous_manifest chris-sanders/gascity-runtime-controller "$CONTROLLER_DIGEST"
       - name: Emit compact evidence
         env:
           BASE_DIGEST: ${{ steps.base.outputs.digest }}
