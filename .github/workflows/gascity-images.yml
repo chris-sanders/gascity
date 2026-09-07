@@ -2,6 +2,9 @@ name: Gas City public runtime images
 run-name: Gas City public images ${{ inputs.source_sha }} (${{ inputs.run_nonce || 'manual' }})
 
 on:
+  push:
+    branches:
+      - bootstrap/public-runtime-6ba434
   workflow_dispatch:
     inputs:
       source_sha:
@@ -28,13 +31,16 @@ jobs:
     timeout-minutes: 90
     env:
       UPSTREAM_BASE_SHA: 6ba434271c5f76bc150f694ebeef9d713be16b3a
-      SOURCE_SHA: ${{ inputs.source_sha }}
-      PLATFORM: ${{ inputs.platform }}
+      SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+      PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
       CODEX_VERSION: 0.153.4
       CODEX_TARBALL_SHA512: c7511cc01958dc039b33555350734cd80cc0250b32ade19d6a0a45faa162622fce6b7d15064b6fbc6d02ead2ed0b3a96ea18d93569066505a679593b32e24a5a
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with: {ref: ${{ inputs.source_sha }}, fetch-depth: 0, persist-credentials: false}
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: Verify public source provenance
         shell: bash
         run: |
