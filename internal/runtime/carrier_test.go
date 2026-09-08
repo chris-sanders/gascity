@@ -56,6 +56,7 @@ func TestTmuxCarrier_NudgeTypesThenSubmits(t *testing.T) {
 		t.Fatalf("Nudge: %v", err)
 	}
 	wantExec(t, f,
+		"tmux send-keys -t main C-u",
 		"tmux send-keys -t main -l hi there",
 		"tmux send-keys -t main Enter",
 	)
@@ -70,6 +71,7 @@ func TestTmuxCarrier_NudgeUsesResolvedProviderSubmitSequence(t *testing.T) {
 		t.Fatalf("Nudge: %v", err)
 	}
 	wantExec(t, f,
+		"tmux send-keys -t main C-u",
 		"tmux send-keys -t main -l hi there",
 		"tmux send-keys -t main Escape",
 		"tmux send-keys -t main Enter",
@@ -151,12 +153,12 @@ func TestTmuxCarrier_NudgeMessageIsASingleArg(t *testing.T) {
 	if err := c.Nudge(context.Background(), "s", TextContent("hi there friend")); err != nil {
 		t.Fatalf("Nudge: %v", err)
 	}
-	if len(rec.calls) != 2 {
-		t.Fatalf("got %d exec calls, want 2", len(rec.calls))
+	if len(rec.calls) != 3 {
+		t.Fatalf("got %d exec calls, want 3", len(rec.calls))
 	}
 	want := []string{"tmux", "send-keys", "-t", "main", "-l", "hi there friend"}
-	if !slices.Equal(rec.calls[0], want) {
-		t.Errorf("first argv = %v, want %v (message must be one element)", rec.calls[0], want)
+	if !slices.Equal(rec.calls[1], want) {
+		t.Errorf("literal argv = %v, want %v (message must be one element)", rec.calls[1], want)
 	}
 }
 

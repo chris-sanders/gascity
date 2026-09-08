@@ -89,6 +89,15 @@ func (c *tmuxCarrier) Nudge(ctx context.Context, name string, content []ContentB
 	if message == "" {
 		return nil
 	}
+	// Clear any draft left by an earlier startup nudge or a submit race before
+	// pasting the next message. Codex can render a ready prompt while retaining
+	// that draft after a startup trust dialog; without this replacement step a
+	// new nudge is concatenated with stale input and the provider may cancel the
+	// combined composer instead of starting the intended turn.
+	if _, err := c.tmux(ctx, name, "send-keys", "-t", c.target, "C-u"); err != nil {
+		return err
+	}
+	time.Sleep(50 * time.Millisecond)
 	// Type the literal text, then submit — the two-step send-keys the k8s
 	// provider uses (a single send-keys would interpret the text as key names).
 	// If typing fails, the error surfaces and Enter is skipped: the caller
