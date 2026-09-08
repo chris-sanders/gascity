@@ -437,6 +437,22 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			Command:         []string{"sh", "-c", "while [ ! -f /workspace/.gc-ready ]; do sleep 0.5; done"},
 			VolumeMounts:    initVolMounts,
 		}}
+		// Codex workers explicitly require non-root execution on the pod. The
+		// agent image uses the named gcagent user, which Kubernetes cannot
+		// verify under runAsNonRoot for an init container unless the manifest
+		// supplies a numeric identity too. The staging wait only needs the
+		// shared volumes, so give it the same fixed worker identity and
+		// least-privilege policy as the main container.
+		if p.codexAuthSecret != "" {
+			uid := int64(1000)
+			pod.Spec.InitContainers[0].SecurityContext = &corev1.SecurityContext{
+				RunAsNonRoot:             boolPtr(true),
+				RunAsUser:                &uid,
+				RunAsGroup:               &uid,
+				AllowPrivilegeEscalation: boolPtr(false),
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			}
+		}
 	}
 
 	return pod, nil

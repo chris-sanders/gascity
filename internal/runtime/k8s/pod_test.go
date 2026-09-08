@@ -105,7 +105,9 @@ func TestBuildPod_NoSchedulingFields_NoBehaviorChange(t *testing.T) {
 func TestBuildPod_CodexAuthUsesReadOnlySeedAndFreshWritableHome(t *testing.T) {
 	p := newProviderWithOps(newFakeK8sOps())
 	p.codexAuthSecret = "codex-credentials"
-	pod, err := buildPod("test-session", runtime.Config{Command: "codex exec hello"}, p)
+	cfg := perBeadWorkDirConfig()
+	cfg.Command = "codex exec hello"
+	pod, err := buildPod("test-session", cfg, p)
 	if err != nil {
 		t.Fatalf("buildPod: %v", err)
 	}
@@ -147,6 +149,19 @@ func TestBuildPod_CodexAuthUsesReadOnlySeedAndFreshWritableHome(t *testing.T) {
 	}
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
 		t.Fatal("Codex worker pod is not explicitly non-root")
+	}
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("len(InitContainers) = %d, want 1 for a staged worker", len(pod.Spec.InitContainers))
+	}
+	stageSecurity := pod.Spec.InitContainers[0].SecurityContext
+	if stageSecurity == nil || stageSecurity.RunAsNonRoot == nil || !*stageSecurity.RunAsNonRoot {
+		t.Fatal("Codex staging init container is not explicitly non-root")
+	}
+	if stageSecurity.RunAsUser == nil || *stageSecurity.RunAsUser != 1000 {
+		t.Fatalf("staging init RunAsUser = %v, want numeric UID 1000", stageSecurity.RunAsUser)
+	}
+	if stageSecurity.RunAsGroup == nil || *stageSecurity.RunAsGroup != 1000 {
+		t.Fatalf("staging init RunAsGroup = %v, want numeric GID 1000", stageSecurity.RunAsGroup)
 	}
 }
 
