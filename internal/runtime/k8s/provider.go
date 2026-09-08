@@ -26,8 +26,9 @@ import (
 
 // Compile-time interface checks.
 var (
-	_ runtime.Provider     = (*Provider)(nil)
-	_ runtime.ExecProvider = (*Provider)(nil)
+	_ runtime.Provider             = (*Provider)(nil)
+	_ runtime.ExecProvider         = (*Provider)(nil)
+	_ runtime.InstanceTokenStopper = (*Provider)(nil)
 )
 
 // Provider is a native Kubernetes session provider using client-go.
@@ -607,6 +608,62 @@ func (p *Provider) Stop(name string) error {
 	return nil
 }
 
+// StopIfInstanceToken deletes only the carrier incarnation whose direct
+// PodSpec GC_INSTANCE_TOKEN matches expectedToken. The token check covers the
+// tmux-dead state, where tmux metadata is unavailable; the UID precondition
+// closes the list/verify/delete race where the pod is replaced under the same
+// Kubernetes name after verification.
+func (p *Provider) StopIfInstanceToken(name, expectedToken string) error {
+	ctx := context.Background()
+	name = strings.TrimSpace(name)
+	expectedToken = strings.TrimSpace(expectedToken)
+	if name == "" || expectedToken == "" {
+		return fmt.Errorf("%w: session name and expected token are required", runtime.ErrInstanceTokenMismatch)
+	}
+
+	deletable, ok := p.ops.(podUIDDeleteOps)
+	if !ok {
+		return fmt.Errorf("%w: provider cannot enforce pod UID deletion precondition", runtime.ErrInstanceTokenMismatch)
+	}
+
+	pods, err := p.ops.listPods(ctx, "gc-session="+SanitizeLabel(name), "")
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			p.deleteProviderName(name)
+			return nil
+		}
+		return fmt.Errorf("k8s stop %q: listing pods: %w", name, err)
+	}
+	if len(pods) == 0 {
+		p.deleteProviderName(name)
+		return nil
+	}
+
+	// Verify every candidate before deleting any of them. A label collision or
+	// a terminating old pod must never turn a partially verified batch into a
+	// name-only delete of another incarnation.
+	for i := range pods {
+		actualToken, present := podIdentityValue(&pods[i], "GC_INSTANCE_TOKEN")
+		if !present || strings.TrimSpace(actualToken) != expectedToken || pods[i].UID == "" {
+			return fmt.Errorf("%w: session %q carrier identity does not match", runtime.ErrInstanceTokenMismatch, name)
+		}
+	}
+
+	for i := range pods {
+		if delErr := deletable.deletePodWithUID(ctx, pods[i].Name, pods[i].UID, 5); delErr != nil {
+			if apierrors.IsNotFound(delErr) {
+				continue // the verified carrier disappeared; nothing new was deleted
+			}
+			if apierrors.IsConflict(delErr) {
+				return fmt.Errorf("%w: session %q carrier was replaced", runtime.ErrInstanceTokenMismatch, name)
+			}
+			return fmt.Errorf("deleting pod %q: %w", pods[i].Name, delErr)
+		}
+	}
+	p.deleteProviderName(name)
+	return nil
+}
+
 // Interrupt sends Ctrl-C to the tmux session inside the pod.
 func (p *Provider) Interrupt(name string) error {
 	_ = p.carrier().Interrupt(context.Background(), name) // best-effort
@@ -777,11 +834,27 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 // are never resolved here, and arbitrary pod configuration is not exposed via
 // the runtime metadata API.
 func (p *Provider) podIdentityEnv(ctx context.Context, podName, key string) (string, bool) {
-	if key != "GC_SESSION_ID" && key != "GC_SESSION_NAME" {
+	if !isPodIdentityKey(key) {
 		return "", false
 	}
 	pod, err := p.ops.getPod(ctx, podName)
 	if err != nil || pod == nil {
+		return "", false
+	}
+	return podIdentityValue(pod, key)
+}
+
+func isPodIdentityKey(key string) bool {
+	switch key {
+	case "GC_SESSION_ID", "GC_SESSION_NAME", "GC_INSTANCE_TOKEN":
+		return true
+	default:
+		return false
+	}
+}
+
+func podIdentityValue(pod *corev1.Pod, key string) (string, bool) {
+	if pod == nil || !isPodIdentityKey(key) {
 		return "", false
 	}
 	for _, container := range pod.Spec.Containers {

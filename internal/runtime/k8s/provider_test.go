@@ -12,6 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	execerr "k8s.io/client-go/util/exec"
 
@@ -549,6 +550,7 @@ func TestGetMetaFallsBackToPodIdentityWhenTmuxIsGone(t *testing.T) {
 		Env: []corev1.EnvVar{
 			{Name: "GC_SESSION_ID", Value: "gc-session"},
 			{Name: "GC_SESSION_NAME", Value: "gc-test-agent"},
+			{Name: "GC_INSTANCE_TOKEN", Value: "replacement-token"},
 		},
 	}}
 
@@ -567,6 +569,19 @@ func TestGetMetaFallsBackToPodIdentityWhenTmuxIsGone(t *testing.T) {
 	}
 	if got != "gc-session" {
 		t.Fatalf("GetMeta = %q, want pod identity gc-session", got)
+	}
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_INSTANCE_TOKEN"},
+		"", errors.New("no server running"))
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-g", "GC_INSTANCE_TOKEN"},
+		"", errors.New("no server running"))
+	got, err = p.GetMeta("gc-test-agent", "GC_INSTANCE_TOKEN")
+	if err != nil {
+		t.Fatalf("GetMeta token: %v", err)
+	}
+	if got != "replacement-token" {
+		t.Fatalf("GetMeta token = %q, want pod identity replacement-token", got)
 	}
 
 	// The fallback is intentionally identity-only and must not expose arbitrary
@@ -587,6 +602,74 @@ func TestGetMetaFallsBackToPodIdentityWhenTmuxIsGone(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("GetMeta private key = %q, want empty", got)
+	}
+}
+
+func TestStopIfInstanceTokenRefusesReusedCarrier(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "gc-test-agent", "gc-test-agent")
+	fake.pods["gc-test-agent"].UID = types.UID("replacement-uid")
+	fake.pods["gc-test-agent"].Spec.Containers = []corev1.Container{{
+		Name: "agent",
+		Env:  []corev1.EnvVar{{Name: "GC_INSTANCE_TOKEN", Value: "replacement-token"}},
+	}}
+
+	err := p.StopIfInstanceToken("gc-test-agent", "stale-token")
+	if !errors.Is(err, runtime.ErrInstanceTokenMismatch) {
+		t.Fatalf("StopIfInstanceToken error = %v, want instance-token mismatch", err)
+	}
+	if _, exists := fake.pods["gc-test-agent"]; !exists {
+		t.Fatal("token-mismatched replacement carrier was deleted")
+	}
+	for _, call := range fake.calls {
+		if call.method == "deletePod" {
+			t.Fatal("StopIfInstanceToken attempted deletion before verifying the replacement token")
+		}
+	}
+}
+
+func TestStopIfInstanceTokenUsesPodUIDFence(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "gc-test-agent", "gc-test-agent")
+	fake.pods["gc-test-agent"].UID = types.UID("old-uid")
+	fake.pods["gc-test-agent"].Spec.Containers = []corev1.Container{{
+		Name: "agent",
+		Env:  []corev1.EnvVar{{Name: "GC_INSTANCE_TOKEN", Value: "old-token"}},
+	}}
+	fake.deleteUIDFunc = func(name string, _ types.UID) error {
+		// The old pod was replaced after list+identity verification but before
+		// the delete reached the apiserver. The fake's UID precondition must
+		// refuse to delete this same-name replacement.
+		fake.pods[name] = &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+				UID:  types.UID("new-uid"),
+				Labels: map[string]string{
+					"app":        "gc-agent",
+					"gc-session": "gc-test-agent",
+				},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name: "agent",
+				Env:  []corev1.EnvVar{{Name: "GC_INSTANCE_TOKEN", Value: "new-token"}},
+			}}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		return nil
+	}
+
+	err := p.StopIfInstanceToken("gc-test-agent", "old-token")
+	if !errors.Is(err, runtime.ErrInstanceTokenMismatch) {
+		t.Fatalf("StopIfInstanceToken race error = %v, want instance-token mismatch", err)
+	}
+	replacement, exists := fake.pods["gc-test-agent"]
+	if !exists {
+		t.Fatal("same-name replacement carrier was deleted")
+	}
+	if got := replacement.Spec.Containers[0].Env[0].Value; got != "new-token" {
+		t.Fatalf("remaining carrier token = %q, want new-token", got)
 	}
 }
 
@@ -1016,6 +1099,9 @@ func mustBuildPodEnv(t *testing.T, cfgEnv map[string]string, podWorkDir, managed
 func TestBuildPodEnvRemapsVars(t *testing.T) {
 	cfgEnv := map[string]string{
 		"GC_AGENT":                            "mayor",
+		"GC_SESSION_ID":                       "session-1",
+		"GC_SESSION_NAME":                     "worker-1",
+		"GC_INSTANCE_TOKEN":                   "token-1",
 		"GC_CITY":                             "/host/city",
 		"GC_CITY_PATH":                        "/host/city",
 		"GC_DIR":                              "/host/city/rig",
@@ -1064,6 +1150,15 @@ func TestBuildPodEnvRemapsVars(t *testing.T) {
 	// GC_DIR should be remapped to pod work dir.
 	if envMap["GC_DIR"] != "/workspace/rig" {
 		t.Errorf("GC_DIR = %q, want /workspace/rig", envMap["GC_DIR"])
+	}
+	for key, want := range map[string]string{
+		"GC_SESSION_ID":     "session-1",
+		"GC_SESSION_NAME":   "worker-1",
+		"GC_INSTANCE_TOKEN": "token-1",
+	} {
+		if envMap[key] != want {
+			t.Errorf("%s = %q, want %q", key, envMap[key], want)
+		}
 	}
 
 	// GC_RIG_ROOT should be remapped from controller city path to /workspace.

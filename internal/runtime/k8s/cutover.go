@@ -19,6 +19,7 @@ type seamBackedProvider struct {
 
 var (
 	_ runtime.Provider                = (*seamBackedProvider)(nil)
+	_ runtime.InstanceTokenStopper    = (*seamBackedProvider)(nil)
 	_ runtime.SleepCapabilityProvider = (*seamBackedProvider)(nil)
 	_ runtime.RelaunchProvider        = (*seamBackedProvider)(nil)
 )
@@ -42,4 +43,11 @@ func (s *seamBackedProvider) SleepCapability(name string) runtime.SessionSleepCa
 // (respawn-pane via execInPod; B2, RelaunchProvider).
 func (s *seamBackedProvider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
 	return s.raw.Relaunch(ctx, name, cfg)
+}
+
+// StopIfInstanceToken must bypass the name-only seam teardown: the raw K8s
+// provider can enforce both the PodSpec token and the Kubernetes UID
+// precondition, while the generic seam only has a reusable name.
+func (s *seamBackedProvider) StopIfInstanceToken(name, expectedToken string) error {
+	return s.raw.StopIfInstanceToken(name, expectedToken)
 }

@@ -66,6 +66,11 @@ var ErrExecUnsupported = errors.New("runtime does not implement the exec op")
 // separate signals for separate call paths.
 var ErrRuntimeUnavailable = errors.New("runtime unavailable: liveness observation failed")
 
+// ErrInstanceTokenMismatch reports that a destructive runtime operation was
+// refused because the named carrier belongs to a different session
+// incarnation, or its identity could not be verified.
+var ErrInstanceTokenMismatch = errors.New("instance token mismatch")
+
 // ErrRelaunchUnsupported reports that the underlying runtime cannot relaunch the
 // agent in a warm box (it is not a [RelaunchProvider], or is conjoined like
 // subprocess/acp/t3bridge). Composite/wrapping providers return it from their
@@ -227,6 +232,14 @@ type Provider interface {
 	// Capabilities reports what this provider can reliably detect.
 	// Used by the reconciler to skip inapplicable wake reasons.
 	Capabilities() ProviderCapabilities
+}
+
+// InstanceTokenStopper is an optional provider capability for destructive
+// cleanup of a possibly-reused session name. Implementations must verify the
+// carrier's GC_INSTANCE_TOKEN and delete only that verified incarnation. A
+// provider that can only stop by name must not implement this interface.
+type InstanceTokenStopper interface {
+	StopIfInstanceToken(name, expectedToken string) error
 }
 
 // PendingInteraction describes a blocking interaction raised by a session.

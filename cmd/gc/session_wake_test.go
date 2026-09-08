@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -613,6 +614,43 @@ func TestVerifiedStop_MatchingToken(t *testing.T) {
 	}
 	if sp.IsRunning(info.SessionName) {
 		t.Error("expected session to be stopped")
+	}
+}
+
+type orphanTokenStopProvider struct {
+	*runtime.Fake
+	calls int
+	err   error
+}
+
+func (p *orphanTokenStopProvider) StopIfInstanceToken(string, string) error {
+	p.calls++
+	return p.err
+}
+
+func TestVerifiedStopOrphanRuntimeUsesIdentitySafeStop(t *testing.T) {
+	sp := &orphanTokenStopProvider{
+		Fake: runtime.NewFake(),
+		err:  runtime.ErrInstanceTokenMismatch,
+	}
+	if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	err := verifiedStopOrphanRuntime(sessionpkg.Info{
+		ID:                  "stale-session",
+		SessionNameMetadata: "worker",
+		Provider:            "k8s",
+		InstanceToken:       "stale-token",
+	}, sp, nil)
+	if !errors.Is(err, errTokenMismatch) {
+		t.Fatalf("verifiedStopOrphanRuntime error = %v, want token mismatch", err)
+	}
+	if sp.calls != 1 {
+		t.Fatalf("StopIfInstanceToken calls = %d, want 1", sp.calls)
+	}
+	if !sp.IsRunning("worker") {
+		t.Fatal("identity-safe stop mismatch killed the name-reused carrier")
 	}
 }
 

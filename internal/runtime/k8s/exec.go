@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -24,6 +26,14 @@ type k8sOps interface {
 	deletePod(ctx context.Context, name string, grace int64) error
 	listPods(ctx context.Context, selector string, fieldSelector string) ([]corev1.Pod, error)
 	execInPod(ctx context.Context, pod, container string, cmd []string, stdin io.Reader) (string, error)
+}
+
+// podUIDDeleteOps is the identity-safe deletion extension used by
+// StopIfInstanceToken. Kubernetes applies the UID precondition at the
+// apiserver, so a pod deleted and recreated under the same name cannot be
+// mistaken for the pod that was verified before deletion.
+type podUIDDeleteOps interface {
+	deletePodWithUID(ctx context.Context, name string, uid types.UID, grace int64) error
 }
 
 // realK8sOps wraps a Kubernetes clientset and REST config for real API calls.
@@ -44,6 +54,13 @@ func (r *realK8sOps) getPod(ctx context.Context, name string) (*corev1.Pod, erro
 func (r *realK8sOps) deletePod(ctx context.Context, name string, grace int64) error {
 	return r.clientset.CoreV1().Pods(r.namespace).Delete(ctx, name, metav1.DeleteOptions{
 		GracePeriodSeconds: &grace,
+	})
+}
+
+func (r *realK8sOps) deletePodWithUID(ctx context.Context, name string, uid types.UID, grace int64) error {
+	return r.clientset.CoreV1().Pods(r.namespace).Delete(ctx, name, metav1.DeleteOptions{
+		GracePeriodSeconds: &grace,
+		Preconditions:      &metav1.Preconditions{UID: &uid},
 	})
 }
 
@@ -105,13 +122,14 @@ type fakeK8sOps struct {
 	calls []fakeCall
 
 	// Configurable behaviors.
-	execOutput map[string]string                              // pod+cmd key → stdout
-	execErr    map[string]error                               // pod+cmd key → error
-	execFunc   func(pod string, cmd []string) (string, error) // dynamic override, checked first
-	createErr  error
-	deleteErr  error
-	getErr     error
-	listErr    error
+	execOutput    map[string]string                              // pod+cmd key → stdout
+	execErr       map[string]error                               // pod+cmd key → error
+	execFunc      func(pod string, cmd []string) (string, error) // dynamic override, checked first
+	createErr     error
+	deleteErr     error
+	deleteUIDFunc func(name string, uid types.UID) error
+	getErr        error
+	listErr       error
 }
 
 type fakeCall struct {
@@ -161,6 +179,27 @@ func (f *fakeK8sOps) deletePod(_ context.Context, name string, _ int64) error {
 	f.record("deletePod", name, nil)
 	if f.deleteErr != nil {
 		return f.deleteErr
+	}
+	delete(f.pods, name)
+	return nil
+}
+
+func (f *fakeK8sOps) deletePodWithUID(_ context.Context, name string, uid types.UID, _ int64) error {
+	f.record("deletePod", name, nil)
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	if f.deleteUIDFunc != nil {
+		if err := f.deleteUIDFunc(name, uid); err != nil {
+			return err
+		}
+	}
+	p, ok := f.pods[name]
+	if !ok {
+		return apierrors.NewNotFound(corev1.Resource("pods"), name)
+	}
+	if p.UID != uid {
+		return apierrors.NewConflict(corev1.Resource("pods"), name, fmt.Errorf("pod UID changed from %q", uid))
 	}
 	delete(f.pods, name)
 	return nil

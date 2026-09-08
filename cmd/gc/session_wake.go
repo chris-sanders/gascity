@@ -752,6 +752,15 @@ func verifiedStopOrphanRuntime(info sessions.Info, sp runtime.Provider, cfg *con
 		return nil
 	}
 	if expectedToken := strings.TrimSpace(info.InstanceToken); expectedToken != "" {
+		if stopper, ok := sp.(runtime.InstanceTokenStopper); ok {
+			if err := stopper.StopIfInstanceToken(name, expectedToken); err != nil {
+				if errors.Is(err, runtime.ErrInstanceTokenMismatch) {
+					return fmt.Errorf("%w for session %s", errTokenMismatch, info.ID)
+				}
+				return err
+			}
+			return nil
+		}
 		actualToken, _ := sp.GetMeta(name, "GC_INSTANCE_TOKEN")
 		if actualToken != "" && actualToken != expectedToken {
 			return fmt.Errorf("%w for session %s", errTokenMismatch, info.ID)
