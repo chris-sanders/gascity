@@ -2041,6 +2041,63 @@ func TestStartAcceptsStartupDialogsBeforeCreationCompletes(t *testing.T) {
 	t.Fatal("Start did not accept the detected startup dialog before returning")
 }
 
+func TestStartWaitsForReadyPromptBeforeNudge(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 0
+	p.startupReadyTimeout = time.Second
+
+	captureCalls := 0
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
+			return "", nil
+		}
+		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "capture-pane" {
+			captureCalls++
+			if captureCalls < 3 {
+				return "Do you trust the contents of this directory?\n› 1. Yes, continue\n", nil
+			}
+			return "› Ask Codex to do anything\n", nil
+		}
+		return "", nil
+	}
+
+	accept := false
+	cfg := runtime.Config{
+		Command:              "codex",
+		Env:                  map[string]string{"GC_AGENT": "codex", "GC_CITY": "/workspace"},
+		ReadyPromptPrefix:    "› ",
+		AcceptStartupDialogs: &accept,
+		Nudge:                "Run gc hook.",
+	}
+	if err := p.Start(context.Background(), "gc-test-agent", cfg); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if captureCalls < 3 {
+		t.Fatalf("capture-pane calls = %d, want readiness polling past the trust screen", captureCalls)
+	}
+	firstNudge := -1
+	for i, c := range fake.calls {
+		if c.method == "execInPod" && len(c.cmd) >= 6 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" && c.cmd[4] == "-l" {
+			firstNudge = i
+			break
+		}
+	}
+	if firstNudge < 0 {
+		t.Fatal("Start did not send its nudge")
+	}
+	readyProbe := -1
+	for i, c := range fake.calls[:firstNudge] {
+		if c.method == "execInPod" && len(c.cmd) >= 3 && c.cmd[0] == "tmux" && c.cmd[1] == "capture-pane" {
+			readyProbe = i
+		}
+	}
+	if readyProbe < 0 {
+		t.Fatal("Start nudged without a preceding ready-prompt probe")
+	}
+}
+
 func TestStartHonorsCancellationDuringPostStartSettle(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)

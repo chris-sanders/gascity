@@ -53,6 +53,7 @@ type Provider struct {
 	codexAuthSecret      string              // GC_K8S_CODEX_AUTH_SECRET: read-only auth.json seed
 	postStartSettle      time.Duration       // settle time before post-start liveness check
 	startupDialogTimeout time.Duration       // shared startup-dialog budget; zero uses runtime default
+	startupReadyTimeout  time.Duration       // bounded wait for a configured interactive prompt
 	stderr               io.Writer           // warning output (default os.Stderr)
 	providerMu           sync.RWMutex
 	providerNames        map[string]string // session name → resolved provider name
@@ -128,6 +129,7 @@ func NewProvider() (*Provider, error) {
 		prebaked:             os.Getenv("GC_K8S_PREBAKED") == "true",
 		postStartSettle:      3 * time.Second,
 		startupDialogTimeout: runtime.StartupDialogTimeout(),
+		startupReadyTimeout:  30 * time.Second,
 		stderr:               os.Stderr,
 		nodeSelector:         scheduling.nodeSelector,
 		tolerations:          scheduling.tolerations,
@@ -172,6 +174,7 @@ func newProviderWithOps(ops k8sOps) *Provider {
 		cpuLimit:             "2",
 		memLimit:             "4Gi",
 		startupDialogTimeout: time.Millisecond,
+		startupReadyTimeout:  30 * time.Second,
 		stderr:               io.Discard,
 		providerNames:        make(map[string]string),
 	}
@@ -298,6 +301,16 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 	}
 
+	// A live tmux server is not the same thing as a ready interactive agent.
+	// Codex can still be showing its workspace-trust screen when the server
+	// appears; sending the startup nudge in that window lets its Escape key
+	// cancel the CLI before the first turn. Wait for the provider's declared
+	// prompt after dialog handling, before any nudge reaches the pane.
+	if err := p.waitForReadyPrompt(ctx, name, cfg); err != nil {
+		cleanup("agent prompt not ready")
+		return fmt.Errorf("waiting for ready prompt for session %q: %w", name, err)
+	}
+
 	requiresPostStartLiveness := k8sRequiresPostStartLiveness(cfg)
 
 	// Post-start liveness check: verify interactive sessions survived startup.
@@ -355,6 +368,77 @@ func (p *Provider) acceptStartupDialogs(ctx context.Context, name string) error 
 			return p.carrier().SendKeys(ctx, name, keys...)
 		},
 	)
+}
+
+const startupReadyPollInterval = 250 * time.Millisecond
+
+func (p *Provider) waitForReadyPrompt(ctx context.Context, name string, cfg runtime.Config) error {
+	prefix := strings.TrimSpace(cfg.ReadyPromptPrefix)
+	if prefix == "" {
+		if cfg.ReadyDelayMs <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(time.Duration(cfg.ReadyDelayMs) * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
+
+	timeout := p.startupReadyTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		content, err := p.carrier().Peek(ctx, name, 120)
+		if err == nil {
+			if readyPromptVisible(content, prefix) {
+				return nil
+			}
+		} else {
+			lastErr = err
+		}
+		if !time.Now().Before(deadline) {
+			if lastErr != nil {
+				return lastErr
+			}
+			return fmt.Errorf("prompt %q did not appear within %s", prefix, timeout)
+		}
+		timer := time.NewTimer(startupReadyPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func readyPromptVisible(content, prefix string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.ReplaceAll(line, "\u00a0", " ")
+		line = strings.TrimLeft(line, " \t│┃")
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		// Codex's trust screen uses the same composer glyph for its numbered
+		// selection row. It is not the ready composer and must not receive the
+		// provider nudge's Escape-then-Enter submit sequence.
+		if len(rest) >= 2 && rest[0] >= '0' && rest[0] <= '9' && rest[1] == '.' {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // runPodPostLaunchSetup enables pane logging and runs session_setup and
@@ -430,6 +514,13 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 
 	// Re-run the post-launch setup tail (pipe-pane logging + session_setup[/script]).
 	p.runPodPostLaunchSetup(ctx, podName, cfg)
+
+	// Respawned agents have the same interactive startup boundary as freshly
+	// created pods. Do not nudge a warm carrier until its declared prompt is
+	// visible; tmux liveness alone only proves that the server survived.
+	if err := p.waitForReadyPrompt(ctx, name, cfg); err != nil {
+		return fmt.Errorf("waiting for ready prompt after relaunch for session %q: %w", name, err)
+	}
 
 	// Post-relaunch liveness: detect an agent that dies immediately.
 	if k8sRequiresPostStartLiveness(cfg) {
