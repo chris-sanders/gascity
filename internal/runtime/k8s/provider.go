@@ -911,6 +911,12 @@ func waitForTmux(ctx context.Context, ops k8sOps, name string, timeout time.Dura
 }
 
 // initCityInPod copies the city directory and runs gc init inside the pod.
+// The staged city carries the canonical hosted-Dolt identity, but the session
+// env may only carry the connection target. Supply the project/database
+// identity from the staged metadata when the target is present; otherwise
+// clear the hosted-Dolt env for this filesystem-only scaffold operation. This
+// keeps gc init from rejecting a valid staged city before initBeadsInPod strips
+// the controller-side identity for the pod's own server handshake.
 func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string) error {
 	// Copy city dir (excluding .gc/) into the pod.
 	if err := copyDirToPod(ctx, ops, podName, "agent", ctrlCity, "/tmp/city-src"); err != nil {
@@ -919,8 +925,23 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string) er
 	// Run gc init --from with GC_DOLT=skip so gc init does not attempt to
 	// start a local Dolt server. Pod sessions consume the projected GC_DOLT_*
 	// connection target through env; they do not rewrite canonical .beads files.
-	_, err := ops.execInPod(ctx, podName, "agent",
-		[]string{"env", "GC_DOLT=skip", "gc", "init", "--from", "/tmp/city-src", "/workspace", "--no-start", "--skip-provider-readiness"}, nil)
+	// Hosted init validation still requires the project/database identity, so
+	// recover those non-secret fields from the staged canonical metadata when
+	// the projected target is complete. A filesystem-only scaffold must clear
+	// the partial target instead of making gc init reject the copied city.
+	initScript := `set -eu
+PROJECT_ID="${GC_BEADS_PROJECT_ID:-}"
+DOLT_DATABASE="${GC_DOLT_DATABASE:-}"
+if [ -f /tmp/city-src/.beads/metadata.json ]; then
+  PROJECT_ID="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1])).get("project_id", "")).strip())' /tmp/city-src/.beads/metadata.json 2>/dev/null || true)"
+  DOLT_DATABASE="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1])).get("dolt_database", "")).strip())' /tmp/city-src/.beads/metadata.json 2>/dev/null || true)"
+fi
+if [ -n "${GC_DOLT_HOST:-}" ] && [ -n "${GC_DOLT_PORT:-}" ] && [ -n "$DOLT_DATABASE" ] && [ -n "$PROJECT_ID" ]; then
+  GC_DOLT=skip GC_DOLT_DATABASE="$DOLT_DATABASE" GC_BEADS_PROJECT_ID="$PROJECT_ID" gc init --from /tmp/city-src /workspace --no-start --skip-provider-readiness
+else
+  env -u GC_DOLT_HOST -u GC_DOLT_PORT -u GC_DOLT_USER -u GC_DOLT_DATABASE -u GC_BEADS_PROJECT_ID GC_DOLT=skip gc init --from /tmp/city-src /workspace --no-start --skip-provider-readiness
+fi`
+	_, err := ops.execInPod(ctx, podName, "agent", []string{"sh", "-c", initScript}, nil)
 	if err != nil {
 		return err
 	}
@@ -945,9 +966,6 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 	doltPort := projected["GC_DOLT_PORT"]
 	storeRoot := projectedPodStoreRoot(cfg, workDir)
 	prefix := strings.TrimSpace(cfg.Env["GC_BEADS_PREFIX"])
-	if prefix == "" {
-		return fmt.Errorf("missing projected GC_BEADS_PREFIX")
-	}
 
 	portNum, err := strconv.Atoi(doltPort)
 	if err != nil {
@@ -976,6 +994,7 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 			`p=json.loads(sys.stdin.read()); m.update(p); m.pop('project_id', None); `+
 			`json.dump(m,open('.beads/metadata.json','w'),indent=2)"; `+
 			`else PREFIX=$(echo '%s' | base64 -d) && `+
+			`[ -n "$PREFIX" ] || { echo 'missing projected GC_BEADS_PREFIX' >&2; exit 1; } && `+
 			`DOLT_HOST=$(echo '%s' | base64 -d) && `+
 			`DOLT_PORT=$(echo '%s' | base64 -d) && `+
 			`yes | BEADS_DIR="$WD/.beads" bd init --server --server-host "$DOLT_HOST" --server-port "$DOLT_PORT" -p "$PREFIX" --skip-hooks --skip-agents; fi`,

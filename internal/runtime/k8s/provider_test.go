@@ -2275,13 +2275,8 @@ func TestInitCityInPodSkipsDolt(t *testing.T) {
 	// separately by verifyBeadsInPod.
 	var gcInitCmd []string
 	for _, c := range fake.calls {
-		if c.method == "execInPod" && len(c.cmd) > 0 {
-			for _, arg := range c.cmd {
-				if arg == "gc" {
-					gcInitCmd = c.cmd
-					break
-				}
-			}
+		if c.method == "execInPod" && len(c.cmd) >= 3 && c.cmd[0] == "sh" && c.cmd[1] == "-c" && strings.Contains(c.cmd[2], "gc init --from") {
+			gcInitCmd = c.cmd
 		}
 		if gcInitCmd != nil {
 			break
@@ -2291,15 +2286,12 @@ func TestInitCityInPodSkipsDolt(t *testing.T) {
 		t.Fatal("gc init command not found in exec calls")
 	}
 
-	hasSkip := false
-	for _, arg := range gcInitCmd {
-		if arg == "GC_DOLT=skip" {
-			hasSkip = true
-			break
-		}
-	}
-	if !hasSkip {
+	gcInitScript := gcInitCmd[2]
+	if !strings.Contains(gcInitScript, "GC_DOLT=skip") {
 		t.Errorf("gc init should run with GC_DOLT=skip; got cmd=%v", gcInitCmd)
+	}
+	if !strings.Contains(gcInitScript, "GC_BEADS_PROJECT_ID") || !strings.Contains(gcInitScript, "dolt_database") {
+		t.Errorf("gc init should recover staged hosted-Dolt identity; got script=%s", gcInitScript)
 	}
 
 	// Pod-local init only scaffolds a session filesystem; it must not register
@@ -2307,14 +2299,7 @@ func TestInitCityInPodSkipsDolt(t *testing.T) {
 	// gateway-backed provider cannot satisfy a first-party-login probe, and the
 	// controller owns readiness). Assert both flags are present.
 	for _, flag := range []string{"--no-start", "--skip-provider-readiness"} {
-		found := false
-		for _, arg := range gcInitCmd {
-			if arg == flag {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !strings.Contains(gcInitScript, flag) {
 			t.Errorf("gc init should run with %s; got cmd=%v", flag, gcInitCmd)
 		}
 	}
