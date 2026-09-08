@@ -262,7 +262,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		// The EmptyDir mountpoint itself is kubelet-owned even with fsGroup.
 		// Create a worker-owned home below that mount so the non-root agent can
 		// enforce 0700/0600 without a privileged init container.
-		credCopy += `mkdir -p "$CODEX_HOME" && cp -L /var/run/gascity/codex-seed/auth.json "$CODEX_HOME/auth.json" && chmod 0700 "$CODEX_HOME" && chmod 0600 "$CODEX_HOME/auth.json"; `
+		credCopy += `mkdir -p "$CODEX_HOME" && cp -L /var/run/gascity/codex-seed/auth.json "$CODEX_HOME/auth.json" && chmod g-s "$CODEX_HOME" && chmod 0700 "$CODEX_HOME" && chmod 0600 "$CODEX_HOME/auth.json"; `
 	} else {
 		credCopy = `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; `
 	}

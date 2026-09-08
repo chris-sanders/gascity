@@ -132,7 +132,8 @@ func TestBuildPod_CodexAuthUsesReadOnlySeedAndFreshWritableHome(t *testing.T) {
 	if home == nil || home.MountPath != "/home/gcagent/.codex" {
 		t.Fatalf("missing writable Codex home mount: %#v", home)
 	}
-	if !strings.Contains(strings.Join(pod.Spec.Containers[0].Args, " "), "chmod 0600 \"$CODEX_HOME/auth.json\"") {
+	entrypoint := strings.Join(pod.Spec.Containers[0].Args, " ")
+	if !strings.Contains(entrypoint, "chmod g-s \"$CODEX_HOME\"") || !strings.Contains(entrypoint, "chmod 0600 \"$CODEX_HOME/auth.json\"") {
 		t.Fatal("entrypoint does not restrict copied auth.json")
 	}
 	var codexHome bool
