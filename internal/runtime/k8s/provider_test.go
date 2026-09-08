@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,18 @@ import (
 func TestProviderImplementsInterface(_ *testing.T) {
 	// Compile-time check is in provider.go, but verify at test time too.
 	var _ runtime.Provider = (*Provider)(nil)
+}
+
+func TestProviderSubmitKeysFollowResolvedSessionProvider(t *testing.T) {
+	p := newProviderWithOps(nil)
+	p.setProviderName("codex-worker", "codex")
+	if got, want := p.submitKeys("codex-worker"), []string{"Escape", "Enter"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("codex submit keys = %v, want %v", got, want)
+	}
+	p.setProviderName("claude-worker", "claude")
+	if got, want := p.submitKeys("claude-worker"), []string{"Enter"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("claude submit keys = %v, want %v", got, want)
+	}
 }
 
 func TestManagedServiceAliasDefaults(t *testing.T) {

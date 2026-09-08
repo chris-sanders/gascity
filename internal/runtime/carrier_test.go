@@ -61,6 +61,27 @@ func TestTmuxCarrier_NudgeTypesThenSubmits(t *testing.T) {
 	)
 }
 
+func TestTmuxCarrier_NudgeUsesResolvedProviderSubmitSequence(t *testing.T) {
+	f := NewFake()
+	c := NewTmuxCarrierWithSubmitKeys(f, "main", func(string) []string {
+		return NudgeSubmitKeySequenceForProvider("codex")
+	})
+	if err := c.Nudge(context.Background(), "s", TextContent("hi there")); err != nil {
+		t.Fatalf("Nudge: %v", err)
+	}
+	wantExec(t, f,
+		"tmux send-keys -t main -l hi there",
+		"tmux send-keys -t main Escape",
+		"tmux send-keys -t main Enter",
+	)
+}
+
+func TestNudgeSubmitKeySequenceForProviderDefaultsToEnter(t *testing.T) {
+	if got := NudgeSubmitKeySequenceForProvider("claude"); !slices.Equal(got, []string{"Enter"}) {
+		t.Fatalf("claude submit sequence = %v, want [Enter]", got)
+	}
+}
+
 func TestTmuxCarrier_NudgeEmptyIsNoOp(t *testing.T) {
 	f := NewFake()
 	c := NewTmuxCarrier(f, "main")

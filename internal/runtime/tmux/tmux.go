@@ -92,7 +92,7 @@ var defaultNudgeSubmitKeySequence = []string{"Enter"}
 // to need — is a single entry in this table plus a test, not a rewrite of
 // NudgeSession.
 var nudgeSubmitKeySequences = map[string][]string{
-	"codex": {"Escape", "Enter"},
+	"codex": runtime.NudgeSubmitKeySequenceForProvider("codex"),
 }
 
 // nudgeSubmitKeySequenceForFamily returns the declared submit key sequence

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -53,6 +54,8 @@ type Provider struct {
 	postStartSettle      time.Duration       // settle time before post-start liveness check
 	startupDialogTimeout time.Duration       // shared startup-dialog budget; zero uses runtime default
 	stderr               io.Writer           // warning output (default os.Stderr)
+	providerMu           sync.RWMutex
+	providerNames        map[string]string // session name → resolved provider name
 }
 
 type schedulingFields struct {
@@ -131,6 +134,7 @@ func NewProvider() (*Provider, error) {
 		affinity:             scheduling.affinity,
 		priorityClassName:    scheduling.priorityClassName,
 		codexAuthSecret:      strings.TrimSpace(os.Getenv("GC_K8S_CODEX_AUTH_SECRET")),
+		providerNames:        make(map[string]string),
 	}, nil
 }
 
@@ -169,6 +173,7 @@ func newProviderWithOps(ops k8sOps) *Provider {
 		memLimit:             "4Gi",
 		startupDialogTimeout: time.Millisecond,
 		stderr:               io.Discard,
+		providerNames:        make(map[string]string),
 	}
 }
 
@@ -325,6 +330,8 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 	}
 
+	p.setProviderName(name, cfg.ProviderName)
+
 	// Send initial nudge if configured (matches tmux adapter step 6).
 	if cfg.Nudge != "" {
 		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
@@ -442,6 +449,7 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 		}
 	}
 
+	p.setProviderName(name, cfg.ProviderName)
 	if cfg.Nudge != "" {
 		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 	}
@@ -470,6 +478,7 @@ func (p *Provider) Stop(name string) error {
 	pods, err := p.ops.listPods(ctx, "gc-session="+label, "")
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			p.deleteProviderName(name)
 			return nil // session genuinely gone
 		}
 		return fmt.Errorf("k8s stop %q: listing pods: %w", name, err)
@@ -483,6 +492,7 @@ func (p *Provider) Stop(name string) error {
 	if len(errs) > 0 {
 		return fmt.Errorf("k8s stop %q: %w", name, errors.Join(errs...))
 	}
+	p.deleteProviderName(name)
 	return nil
 }
 
@@ -815,7 +825,29 @@ func agentContainerRunning(pod *corev1.Pod) (running, known bool) {
 // the pod exec connection ([Provider.Exec]). The in-box tmux session is always
 // tmuxSession ("main").
 func (p *Provider) carrier() runtime.Carrier {
-	return runtime.NewTmuxCarrier(p, tmuxSession)
+	return runtime.NewTmuxCarrierWithSubmitKeys(p, tmuxSession, p.submitKeys)
+}
+
+func (p *Provider) setProviderName(name, provider string) {
+	p.providerMu.Lock()
+	defer p.providerMu.Unlock()
+	if p.providerNames == nil {
+		p.providerNames = make(map[string]string)
+	}
+	p.providerNames[name] = provider
+}
+
+func (p *Provider) deleteProviderName(name string) {
+	p.providerMu.Lock()
+	defer p.providerMu.Unlock()
+	delete(p.providerNames, name)
+}
+
+func (p *Provider) submitKeys(name string) []string {
+	p.providerMu.RLock()
+	provider := p.providerNames[name]
+	p.providerMu.RUnlock()
+	return runtime.NudgeSubmitKeySequenceForProvider(provider)
 }
 
 // Exec implements [runtime.ExecProvider]: it runs argv inside the session
