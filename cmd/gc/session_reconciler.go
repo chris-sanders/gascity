@@ -2267,6 +2267,17 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						}
 						continue
 					}
+					// A provider can report the target as not running while its
+					// carrier/container is still alive (for example, a K8s worker
+					// whose in-pod tmux server exited). Reap that runtime before
+					// closing the orphaned session bead; otherwise the close drops
+					// the only durable name by which the provider can find the Pod.
+					// verifiedStop keeps the instance-token fence for a raced name
+					// reuse and remains idempotent when the runtime is genuinely gone.
+					if err := verifiedStopOrphanRuntime(info, sp, cfg); err != nil && !runtime.IsSessionGone(err) {
+						fmt.Fprintf(stderr, "session reconciler: reaping orphan runtime %s: %v\n", name, err) //nolint:errcheck
+						continue
+					}
 					closed := closeSessionBeadIfReachableStoreUnassigned(cityPath, cfg, store, rigStores, infoByID[id], reason, clk.Now().UTC(), stderr, false)
 					if !closed && reason == "orphaned" {
 						// The guard refused because the seat still holds work. Nothing

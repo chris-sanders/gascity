@@ -6707,6 +6707,11 @@ func TestReconcileSessionBeads_OrphanNotRunningClosed(t *testing.T) {
 
 	env.reconcile([]beads.Bead{session})
 
+	stopCalls := env.sp.CountCalls("Stop", "orphan")
+	if stopCalls != 1 {
+		t.Fatalf("orphan runtime Stop calls = %d, want 1 before session close", stopCalls)
+	}
+
 	b, _ := env.store.Get(session.ID)
 	if b.Status != "closed" {
 		t.Errorf("orphan bead status = %q, want closed", b.Status)

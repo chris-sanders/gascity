@@ -739,6 +739,35 @@ func verifiedStop(info sessions.Info, store beads.Store, sp runtime.Provider, cf
 	return handle.Kill(context.Background())
 }
 
+// verifiedStopOrphanRuntime reaps a provider runtime after its session bead's
+// liveness probe has confirmed the runtime is not running. It intentionally
+// uses a runtime-only worker handle: Manager.Kill rejects an asleep session
+// bead, while an orphaned provider carrier (such as a K8s Pod whose tmux
+// server exited) still needs the provider Stop call before the bead is closed.
+// Keep the instance-token fence because the provider name may have been reused
+// between the liveness probe and this cleanup action.
+func verifiedStopOrphanRuntime(info sessions.Info, sp runtime.Provider, cfg *config.City) error {
+	name := strings.TrimSpace(info.SessionNameMetadata)
+	if name == "" || sp == nil {
+		return nil
+	}
+	if expectedToken := strings.TrimSpace(info.InstanceToken); expectedToken != "" {
+		actualToken, _ := sp.GetMeta(name, "GC_INSTANCE_TOKEN")
+		if actualToken != "" && actualToken != expectedToken {
+			return fmt.Errorf("%w for session %s", errTokenMismatch, info.ID)
+		}
+	}
+	providerName := strings.TrimSpace(info.Provider)
+	if providerName == "" {
+		providerName = name
+	}
+	handle, err := runtimeWorkerHandleWithConfig("", nil, sp, cfg, name, providerName, "", nil)
+	if err != nil {
+		return err
+	}
+	return handle.Kill(context.Background())
+}
+
 // verifiedInterrupt sends an interrupt signal after verifying instance_token.
 func verifiedInterrupt(session beads.Bead, store beads.Store, sp runtime.Provider, cfg *config.City) error {
 	name := session.Metadata["session_name"]
