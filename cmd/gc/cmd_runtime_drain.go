@@ -514,12 +514,11 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
 			fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		sp, err := newSessionProvider()
-		if err != nil {
-			if local, ok := newLocalWorkerProvider(); ok {
-				sp = local
-				err = nil
-			}
+		var sp runtime.Provider
+		if local, ok := newLocalWorkerProvider(); ok {
+			sp = local
+		} else {
+			sp, err = newSessionProvider()
 		}
 		if err != nil {
 			fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -534,12 +533,11 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	sp, err := newSessionProvider()
-	if err != nil {
-		if local, ok := newLocalWorkerProvider(); ok {
-			sp = local
-			err = nil
-		}
+	var sp runtime.Provider
+	if local, ok := newLocalWorkerProvider(); ok {
+		sp = local
+	} else {
+		sp, err = newSessionProvider()
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
