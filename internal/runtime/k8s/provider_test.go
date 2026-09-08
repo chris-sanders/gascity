@@ -1973,6 +1973,41 @@ func TestStartSucceedsWhenSessionStaysAlive(t *testing.T) {
 	}
 }
 
+func TestStartAcceptsStartupDialogsBeforeCreationCompletes(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 0
+	p.startupDialogTimeout = time.Second
+
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
+			return "", nil
+		}
+		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "capture-pane" {
+			return "Do you trust the contents of this directory?\n", nil
+		}
+		return "", nil
+	}
+
+	cfg := runtime.Config{
+		Command:              "codex",
+		Env:                  map[string]string{"GC_AGENT": "codex", "GC_CITY": "/workspace"},
+		ProcessNames:         []string{"codex"},
+		AcceptStartupDialogs: boolPtr(true),
+	}
+	if err := p.Start(context.Background(), "gc-test-agent", cfg); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	for _, c := range fake.calls {
+		if c.method == "execInPod" && len(c.cmd) == 5 &&
+			c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" && c.cmd[4] == "Enter" {
+			return
+		}
+	}
+	t.Fatal("Start did not accept the detected startup dialog before returning")
+}
+
 func TestStartHonorsCancellationDuringPostStartSettle(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
