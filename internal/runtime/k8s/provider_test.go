@@ -2184,6 +2184,34 @@ func TestStartSendsNudge(t *testing.T) {
 	}
 }
 
+func TestStartPropagatesInitialNudgeFailureAndCleansUp(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 0
+
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "has-session", "-t", "main"}, "", nil)
+	wantErr := errors.New("tmux input unavailable")
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "send-keys", "-t", "main", "C-u"}, "", wantErr)
+
+	cfg := runtime.Config{
+		Command: "codex",
+		Env: map[string]string{
+			"GC_AGENT": "codex",
+			"GC_CITY":  "/workspace",
+		},
+		Nudge: "Run gc hook.",
+	}
+	err := p.Start(context.Background(), "gc-test-agent", cfg)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Start error = %v, want nudge error %v", err, wantErr)
+	}
+	if _, exists := fake.pods["gc-test-agent"]; exists {
+		t.Fatal("pod should have been deleted after initial nudge failure")
+	}
+}
+
 func TestStartSkipsNudgeWhenEmpty(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)

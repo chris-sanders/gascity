@@ -347,7 +347,10 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 
 	// Send initial nudge if configured (matches tmux adapter step 6).
 	if cfg.Nudge != "" {
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+		if err := p.Nudge(name, runtime.TextContent(cfg.Nudge)); err != nil {
+			cleanup("initial nudge failed")
+			return fmt.Errorf("sending initial nudge for session %q: %w", name, err)
+		}
 	}
 
 	return nil
@@ -542,7 +545,9 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 
 	p.setProviderName(name, cfg.ProviderName)
 	if cfg.Nudge != "" {
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+		if err := p.Nudge(name, runtime.TextContent(cfg.Nudge)); err != nil {
+			return fmt.Errorf("sending relaunch nudge for session %q: %w", name, err)
+		}
 	}
 	return nil
 }
