@@ -2098,6 +2098,50 @@ func TestStartWaitsForReadyPromptBeforeNudge(t *testing.T) {
 	}
 }
 
+func TestStartHandlesStartupDialogThatArrivesAfterInitialComposer(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 0
+	p.startupDialogTimeout = time.Second
+	p.startupReadyTimeout = time.Second
+
+	captureCalls := 0
+	accepted := false
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
+			return "", nil
+		}
+		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "capture-pane" {
+			captureCalls++
+			if accepted || captureCalls <= 4 {
+				return "› Ask Codex to do anything\n", nil
+			}
+			return "Do you trust the contents of this directory?\n› 1. Yes, continue\n", nil
+		}
+		if len(cmd) >= 5 && cmd[0] == "tmux" && cmd[1] == "send-keys" && cmd[4] == "Enter" {
+			accepted = true
+		}
+		return "", nil
+	}
+
+	accept := true
+	cfg := runtime.Config{
+		Command:              "codex",
+		Env:                  map[string]string{"GC_AGENT": "codex", "GC_CITY": "/workspace"},
+		ReadyPromptPrefix:    "› ",
+		AcceptStartupDialogs: &accept,
+	}
+	if err := p.Start(context.Background(), "gc-test-agent", cfg); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !accepted {
+		t.Fatal("Start did not accept the startup dialog that arrived after the initial composer")
+	}
+	if captureCalls <= 4 {
+		t.Fatalf("capture-pane calls = %d, want readiness probe after initial composer", captureCalls)
+	}
+}
+
 func TestStartHonorsCancellationDuringPostStartSettle(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)

@@ -361,6 +361,10 @@ func (p *Provider) acceptStartupDialogs(ctx context.Context, name string) error 
 	if timeout <= 0 {
 		timeout = runtime.StartupDialogTimeout()
 	}
+	return p.acceptStartupDialogsWithTimeout(ctx, name, timeout)
+}
+
+func (p *Provider) acceptStartupDialogsWithTimeout(ctx context.Context, name string, timeout time.Duration) error {
 	return runtime.AcceptStartupDialogsWithTimeout(
 		ctx,
 		timeout,
@@ -374,6 +378,12 @@ func (p *Provider) acceptStartupDialogs(ctx context.Context, name string) error 
 }
 
 const startupReadyPollInterval = 250 * time.Millisecond
+
+// A provider can briefly render its normal composer before a first-run modal
+// arrives. Probe startup dialogs during readiness with a short budget so a
+// late modal is handled without turning every readiness poll into a full
+// startup-dialog wait.
+const startupDialogProbeTimeout = 100 * time.Millisecond
 
 func (p *Provider) waitForReadyPrompt(ctx context.Context, name string, cfg runtime.Config) error {
 	prefix := strings.TrimSpace(cfg.ReadyPromptPrefix)
@@ -405,6 +415,11 @@ func (p *Provider) waitForReadyPrompt(ctx context.Context, name string, cfg runt
 		if err == nil {
 			if readyPromptVisible(content, prefix) {
 				return nil
+			}
+			if runtime.ShouldAcceptStartupDialogs(cfg) {
+				if err := p.acceptStartupDialogsWithTimeout(ctx, name, startupDialogProbeTimeout); err != nil {
+					lastErr = err
+				}
 			}
 		} else {
 			lastErr = err
