@@ -254,11 +254,13 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			linuxUsername,
 		)
 	}
-	credCopy := `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; `
+	credCopy := ""
 	if p.codexAuthSecret != "" {
 		// The Secret volume remains read-only.  Codex refreshes auth state, so
 		// every worker gets a new EmptyDir-backed home seeded from auth.json.
 		credCopy += `mkdir -p "$CODEX_HOME" && cp -L /var/run/gascity/codex-seed/auth.json "$CODEX_HOME/auth.json" && chmod 0700 "$CODEX_HOME" && chmod 0600 "$CODEX_HOME/auth.json"; `
+	} else {
+		credCopy = `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; `
 	}
 	credCopy += `git config --global --add safe.directory '*' 2>/dev/null; `
 	wsWait := ""
@@ -316,17 +318,19 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		})
 	}
 
-	mainVolMounts = append(mainVolMounts, corev1.VolumeMount{
-		Name: "claude-config", MountPath: "/tmp/claude-secret", ReadOnly: true,
-	})
-	volumes = append(volumes, corev1.Volume{
-		Name: "claude-config", VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{
-				SecretName: "claude-credentials",
-				Optional:   boolPtr(true),
+	if p.codexAuthSecret == "" {
+		mainVolMounts = append(mainVolMounts, corev1.VolumeMount{
+			Name: "claude-config", MountPath: "/tmp/claude-secret", ReadOnly: true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "claude-config", VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: "claude-credentials",
+					Optional:   boolPtr(true),
+				},
 			},
-		},
-	})
+		})
+	}
 	if p.codexAuthSecret != "" {
 		mainVolMounts = append(mainVolMounts,
 			corev1.VolumeMount{Name: "codex-auth-seed", MountPath: "/var/run/gascity/codex-seed", ReadOnly: true},

@@ -122,6 +122,11 @@ func TestBuildPod_CodexAuthUsesReadOnlySeedAndFreshWritableHome(t *testing.T) {
 	if seed == nil || !seed.ReadOnly || seed.MountPath != "/var/run/gascity/codex-seed" {
 		t.Fatalf("missing read-only Codex seed mount: %#v", seed)
 	}
+	for _, m := range pod.Spec.Containers[0].VolumeMounts {
+		if m.Name == "claude-config" {
+			t.Fatal("Codex worker must not mount legacy Claude credentials")
+		}
+	}
 	if home == nil || home.MountPath != "/home/gcagent/.codex" {
 		t.Fatalf("missing writable Codex home mount: %#v", home)
 	}
