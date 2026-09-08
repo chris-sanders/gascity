@@ -540,6 +540,56 @@ func TestGetMetaFallsBackToGlobalTmuxEnvironment(t *testing.T) {
 	}
 }
 
+func TestGetMetaFallsBackToPodIdentityWhenTmuxIsGone(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "gc-test-agent", "gc-test-agent")
+	fake.pods["gc-test-agent"].Spec.Containers = []corev1.Container{{
+		Name: "agent",
+		Env: []corev1.EnvVar{
+			{Name: "GC_SESSION_ID", Value: "gc-session"},
+			{Name: "GC_SESSION_NAME", Value: "gc-test-agent"},
+		},
+	}}
+
+	// Both tmux metadata scopes are unavailable because the carrier's tmux
+	// server has died, but the Kubernetes Pod still exists for closed-bead reap.
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_SESSION_ID"},
+		"", errors.New("no server running"))
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-g", "GC_SESSION_ID"},
+		"", errors.New("no server running"))
+
+	got, err := p.GetMeta("gc-test-agent", "GC_SESSION_ID")
+	if err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	}
+	if got != "gc-session" {
+		t.Fatalf("GetMeta = %q, want pod identity gc-session", got)
+	}
+
+	// The fallback is intentionally identity-only and must not expose arbitrary
+	// direct PodSpec environment values through GetMeta.
+	fake.pods["gc-test-agent"].Spec.Containers[0].Env = append(
+		fake.pods["gc-test-agent"].Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "PRIVATE_VALUE", Value: "must-not-leak"},
+	)
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "PRIVATE_VALUE"},
+		"", errors.New("no server running"))
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-g", "PRIVATE_VALUE"},
+		"", errors.New("no server running"))
+	got, err = p.GetMeta("gc-test-agent", "PRIVATE_VALUE")
+	if err != nil {
+		t.Fatalf("GetMeta private key: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("GetMeta private key = %q, want empty", got)
+	}
+}
+
 func TestPeek(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)

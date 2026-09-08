@@ -748,6 +748,15 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 		output, err = p.ops.execInPod(ctx, podName, "agent",
 			[]string{"tmux", "show-environment", "-g", key}, nil)
 		if err != nil {
+			// The agent's tmux server can die while the carrier pod remains
+			// Running (for example, a provider restart after Codex exits during
+			// startup). Identity written into the pod environment is still
+			// authoritative in that state, and lets the controller attribute the
+			// runtime to its closed session bead so the closed-bead reaper can
+			// delete the carrier instead of leaking it.
+			if value, ok := p.podIdentityEnv(ctx, podName, key); ok {
+				return value, nil
+			}
 			return "", nil
 		}
 	}
@@ -760,6 +769,32 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 		return val, nil
 	}
 	return "", nil
+}
+
+// podIdentityEnv returns only direct, non-SecretRef identity values from the
+// agent container's PodSpec. It is deliberately a narrow fallback for carrier
+// identity, not a general environment reader: Kubernetes Secret-backed values
+// are never resolved here, and arbitrary pod configuration is not exposed via
+// the runtime metadata API.
+func (p *Provider) podIdentityEnv(ctx context.Context, podName, key string) (string, bool) {
+	if key != "GC_SESSION_ID" && key != "GC_SESSION_NAME" {
+		return "", false
+	}
+	pod, err := p.ops.getPod(ctx, podName)
+	if err != nil || pod == nil {
+		return "", false
+	}
+	for _, container := range pod.Spec.Containers {
+		if container.Name != "agent" {
+			continue
+		}
+		for _, env := range container.Env {
+			if env.Name == key && env.ValueFrom == nil {
+				return env.Value, true
+			}
+		}
+	}
+	return "", false
 }
 
 // RemoveMeta removes a metadata key from the tmux environment.
