@@ -840,6 +840,58 @@ func TestNewDrainOpsAlwaysReturnsNonNil(t *testing.T) {
 	}
 }
 
+func TestNewLocalWorkerProviderRequiresInBoxSession(t *testing.T) {
+	t.Setenv("GC_TMUX_SESSION", "")
+	t.Setenv("GC_SESSION_ID", "worker-session")
+	if _, ok := newLocalWorkerProvider(); ok {
+		t.Fatal("local worker provider enabled without GC_TMUX_SESSION")
+	}
+
+	t.Setenv("GC_TMUX_SESSION", "main")
+	t.Setenv("GC_SESSION_ID", "")
+	if _, ok := newLocalWorkerProvider(); ok {
+		t.Fatal("local worker provider enabled without session identity")
+	}
+
+	t.Setenv("GC_SESSION_ID", "worker-session")
+	sp, ok := newLocalWorkerProvider()
+	if !ok {
+		t.Fatal("local worker provider not enabled for an in-box session")
+	}
+	local, ok := sp.(*localWorkerProvider)
+	if !ok {
+		t.Fatalf("provider type = %T, want *localWorkerProvider", sp)
+	}
+	if local.tmuxSession != "main" {
+		t.Fatalf("tmux session = %q, want main", local.tmuxSession)
+	}
+}
+
+func TestLocalWorkerProviderTargetsOwnTmuxSession(t *testing.T) {
+	fake := runtime.NewFake()
+	if err := fake.Start(context.Background(), "main", runtime.Config{}); err != nil {
+		t.Fatalf("fake.Start: %v", err)
+	}
+	local := &localWorkerProvider{Provider: fake, tmuxSession: "main"}
+	dops := newDrainOps(local)
+
+	if err := dops.setDrainAck("controller-visible-name"); err != nil {
+		t.Fatalf("setDrainAck: %v", err)
+	}
+	acked, err := dops.isDrainAcked("main")
+	if err != nil {
+		t.Fatalf("isDrainAcked: %v", err)
+	}
+	if !acked {
+		t.Fatal("own tmux session did not receive drain acknowledgement")
+	}
+	if value, err := fake.GetMeta("controller-visible-name", "GC_DRAIN_ACK"); err != nil {
+		t.Fatalf("GetMeta(controller-visible-name): %v", err)
+	} else if value != "" {
+		t.Fatalf("controller-visible-name received drain acknowledgement %q", value)
+	}
+}
+
 func TestProviderDrainOpsRoundTrip(t *testing.T) {
 	// Verify drain ops work through Provider meta interface.
 	sp := runtime.NewFake()

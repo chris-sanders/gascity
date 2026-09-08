@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessiontmux "github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/spf13/cobra"
 )
 
@@ -39,6 +40,44 @@ type drainOps interface {
 // providerDrainOps implements drainOps using runtime.Provider metadata.
 type providerDrainOps struct {
 	sp runtime.Provider
+}
+
+// localWorkerProvider redirects metadata operations to the tmux server that
+// owns the current process. A Kubernetes worker runs gc inside the same pod as
+// its tmux session, but deliberately has no Kubernetes API credentials. The
+// controller uses the k8s provider to reach that session; the worker's
+// drain-ack path must use the in-box tmux carrier instead of trying to
+// reconstruct the controller-side provider.
+type localWorkerProvider struct {
+	runtime.Provider
+	tmuxSession string
+}
+
+func (p *localWorkerProvider) SetMeta(_ string, key, value string) error {
+	return p.Provider.SetMeta(p.tmuxSession, key, value)
+}
+
+func (p *localWorkerProvider) GetMeta(_ string, key string) (string, error) {
+	return p.Provider.GetMeta(p.tmuxSession, key)
+}
+
+func (p *localWorkerProvider) RemoveMeta(_ string, key string) error {
+	return p.Provider.RemoveMeta(p.tmuxSession, key)
+}
+
+// newLocalWorkerProvider returns the in-box tmux provider used by a managed
+// worker for its own metadata. The marker set by the K8s pod contract keeps
+// this fallback scoped to a process that actually has a local tmux session;
+// ordinary provider-construction failures still return to the caller.
+func newLocalWorkerProvider() (runtime.Provider, bool) {
+	tmuxSession := strings.TrimSpace(os.Getenv("GC_TMUX_SESSION"))
+	if tmuxSession == "" || defaultSessionDisplayIdentity() == "" {
+		return nil, false
+	}
+	return &localWorkerProvider{
+		Provider:    sessiontmux.NewSeamBackedWithConfig(sessiontmux.DefaultConfig()),
+		tmuxSession: tmuxSession,
+	}, true
 }
 
 type runtimeDrainCheckJSON struct {
@@ -477,6 +516,12 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
 		}
 		sp, err := newSessionProvider()
 		if err != nil {
+			if local, ok := newLocalWorkerProvider(); ok {
+				sp = local
+				err = nil
+			}
+		}
+		if err != nil {
 			fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
@@ -490,6 +535,12 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
 		return 1
 	}
 	sp, err := newSessionProvider()
+	if err != nil {
+		if local, ok := newLocalWorkerProvider(); ok {
+			sp = local
+			err = nil
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
