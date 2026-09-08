@@ -133,9 +133,18 @@ COPY --from=tool-builder /out/dolt /usr/local/bin/dolt
 RUN gh --version && dolt version
 
 # Default non-root user for Claude Code (--dangerously-skip-permissions rejects root).
+# Ubuntu's base image already reserves UID/GID 1000 for its `ubuntu` user, while
+# the Kubernetes worker contract deliberately fixes workers at UID/GID 1000.
+# Replace that unused image user so the named gcagent account, its home, and the
+# Pod security context all identify the same principal.
 # When LINUX_USERNAME is set at runtime, the pod entrypoint creates a dynamic
 # user via useradd and drops privileges via su. gcagent is kept as fallback.
-RUN useradd -m -s /bin/bash gcagent \
+RUN if getent passwd ubuntu >/dev/null; then userdel -r ubuntu; fi \
+    && if getent group ubuntu >/dev/null; then groupmod --new-name gcagent ubuntu; else groupadd --gid 1000 gcagent; fi \
+    && useradd --uid 1000 --gid gcagent --no-create-home --home-dir /home/gcagent -s /bin/bash gcagent \
+    && install -d -o gcagent -g gcagent /home/gcagent \
+    && test "$(id -u gcagent)" = 1000 \
+    && test "$(id -g gcagent)" = 1000 \
     && echo "gcagent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/gcagent \
     && chmod 0440 /etc/sudoers.d/gcagent
 ENV HOME=/home/gcagent

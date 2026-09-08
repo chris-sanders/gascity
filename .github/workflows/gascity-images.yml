@@ -128,7 +128,7 @@ jobs:
           docker run --rm --entrypoint kubectl "$controller" version --client=true
           test "$(docker run --rm --entrypoint codex "$agent" --version)" = "codex-cli $CODEX_VERSION"
           docker run --rm --entrypoint codex "$agent" exec --sandbox read-only --ask-for-approval untrusted --help >/dev/null
-          docker run --rm --entrypoint /bin/sh "$agent" -c 'test "$(id -u)" != 0; test ! -e "$HOME/.codex/auth.json"; test -w /workspace'
+          docker run --rm --entrypoint /bin/sh "$agent" -c 'test "$(id -u)" = 1000; test "$(id -g)" = 1000; test ! -e "$HOME/.codex/auth.json"; test -w /workspace'
       - name: Prove anonymous exact-digest manifest access
         env:
           BASE_DIGEST: ${{ steps.base.outputs.digest }}
