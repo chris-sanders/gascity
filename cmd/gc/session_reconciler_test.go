@@ -12487,6 +12487,9 @@ func TestReconcileSessionBeads_ClosesOrphanedFailedCreateAndFreesSlot(t *testing
 		t.Fatalf("failed-create pending metadata = claim %q started_at %q, want cleared",
 			got.Metadata["pending_create_claim"], got.Metadata["pending_create_started_at"])
 	}
+	if got := sp.CountCalls("Stop", failedBead.Metadata["session_name"]); got != 1 {
+		t.Fatalf("failed-create orphan runtime Stop calls = %d, want 1 before session close", got)
+	}
 	if strings.Contains(stderr.String(), "unknown state") {
 		t.Errorf("reconciler logged unknown state for failed-create bead: %s", stderr.String())
 	}

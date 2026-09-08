@@ -1944,6 +1944,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						}
 						continue
 					}
+					// A failed-create transition can leave a provider carrier behind
+					// even though its session liveness probe is false (for example, a
+					// K8s Pod whose in-pod tmux server never came up). Reap that carrier
+					// while the session bead still supplies its durable name and token;
+					// closing first would make the Pod unreachable to later cleanup.
+					if err := verifiedStopOrphanRuntime(info, sp, cfg); err != nil && !runtime.IsSessionGone(err) {
+						fmt.Fprintf(stderr, "session reconciler: reaping failed-create runtime %s: %v\n", name, err) //nolint:errcheck
+						continue
+					}
 					closedFailedCreate := closeSessionBeadIfReachableStoreUnassigned(cityPath, cfg, store, rigStores, infoByID[id], string(sessionpkg.StateFailedCreate), clk.Now().UTC(), stderr, false)
 					if closedFailedCreate {
 						// Reflect the in-memory close on the snapshot: the cross-session
