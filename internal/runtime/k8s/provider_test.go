@@ -507,6 +507,26 @@ func TestMetaOps(t *testing.T) {
 	}
 }
 
+func TestGetMetaFallsBackToGlobalTmuxEnvironment(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "gc-test-agent", "gc-test-agent")
+
+	key := []string{"tmux", "show-environment", "-t", tmuxSession, "GC_SESSION_ID"}
+	fake.setExecResult("gc-test-agent", key, "", errors.New("unknown variable"))
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-g", "GC_SESSION_ID"},
+		"GC_SESSION_ID=gc-session\n", nil)
+
+	got, err := p.GetMeta("gc-test-agent", "GC_SESSION_ID")
+	if err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	}
+	if got != "gc-session" {
+		t.Fatalf("GetMeta = %q, want gc-session", got)
+	}
+}
+
 func TestPeek(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)

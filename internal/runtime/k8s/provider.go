@@ -619,7 +619,16 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 	output, err := p.ops.execInPod(ctx, podName, "agent",
 		[]string{"tmux", "show-environment", "-t", tmuxSession, key}, nil)
 	if err != nil {
-		return "", nil
+		// Pod-provided identity variables are inherited by the tmux server's
+		// global environment, while SetMeta writes session-scoped values. Read
+		// the global environment as a fallback so startup identity checks can
+		// match a freshly-created pod before the first session-scoped metadata
+		// write lands.
+		output, err = p.ops.execInPod(ctx, podName, "agent",
+			[]string{"tmux", "show-environment", "-g", key}, nil)
+		if err != nil {
+			return "", nil
+		}
 	}
 	output = strings.TrimSpace(output)
 	// tmux output: "KEY=VALUE" (set), "-KEY" (unset).
