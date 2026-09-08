@@ -137,7 +137,7 @@ func TestBuildPod_CodexAuthUsesReadOnlySeedAndFreshWritableHome(t *testing.T) {
 	}
 	var codexHome bool
 	for _, e := range pod.Spec.Containers[0].Env {
-		if e.Name == "CODEX_HOME" && e.Value == "/home/gcagent/.codex" {
+		if e.Name == "CODEX_HOME" && e.Value == codexHomePath {
 			codexHome = true
 		}
 		if e.Name == "OPENAI_API_KEY" || e.Name == "CODEX_API_KEY" {
@@ -145,7 +145,7 @@ func TestBuildPod_CodexAuthUsesReadOnlySeedAndFreshWritableHome(t *testing.T) {
 		}
 	}
 	if !codexHome {
-		t.Fatal("CODEX_HOME is not set")
+		t.Fatalf("CODEX_HOME is not set to worker-owned subdirectory %q", codexHomePath)
 	}
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
 		t.Fatal("Codex worker pod is not explicitly non-root")

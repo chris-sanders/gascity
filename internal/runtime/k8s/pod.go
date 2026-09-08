@@ -21,6 +21,7 @@ import (
 const (
 	podManagedDoltHost = "dolt.gc.svc.cluster.local"
 	podManagedDoltPort = "3307"
+	codexHomePath      = "/home/gcagent/.codex/gascity"
 
 	// podWorkspaceRoot is the pod-side projection of the city root. It is the
 	// only directory guaranteed to exist when the container starts — it is the
@@ -258,6 +259,9 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	if p.codexAuthSecret != "" {
 		// The Secret volume remains read-only.  Codex refreshes auth state, so
 		// every worker gets a new EmptyDir-backed home seeded from auth.json.
+		// The EmptyDir mountpoint itself is kubelet-owned even with fsGroup.
+		// Create a worker-owned home below that mount so the non-root agent can
+		// enforce 0700/0600 without a privileged init container.
 		credCopy += `mkdir -p "$CODEX_HOME" && cp -L /var/run/gascity/codex-seed/auth.json "$CODEX_HOME/auth.json" && chmod 0700 "$CODEX_HOME" && chmod 0600 "$CODEX_HOME/auth.json"; `
 	} else {
 		credCopy = `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; `
@@ -400,7 +404,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		},
 	}
 	if p.codexAuthSecret != "" {
-		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "CODEX_HOME", Value: "/home/gcagent/.codex"})
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{Name: "CODEX_HOME", Value: codexHomePath})
 		uid := int64(1000)
 		pod.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsNonRoot: boolPtr(true), FSGroup: &uid}
 		pod.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{
