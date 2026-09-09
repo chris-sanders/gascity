@@ -1221,10 +1221,15 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string) er
 	// the projected target is complete. A filesystem-only scaffold must clear
 	// the partial target instead of making gc init reject the copied city.
 	initScript := `set -eu
+# stageFiles preserves source modes while copying the controller workspace.
+# A fresh worker must be able to initialize its staged checkout, including
+# read-only .git pack files and formula files dereferenced from symlinks.
+chmod -R u+rwX /workspace
+
 # stageFiles may have copied the controller's scoped bead stores into the
-# worker workspace. Those stores contain read-only formula files (often
-# dereferenced from pack symlinks), and gc init --from must create the
-# worker's own writable scoped stores instead of trying to rewrite them.
+# worker workspace. Those stores are not authoritative in this fresh pod;
+# gc init --from must create the worker's own scoped stores instead of
+# trying to rewrite the staged copies.
 find /workspace -type d -name .beads -prune -exec rm -rf -- {} +
 PROJECT_ID="${GC_BEADS_PROJECT_ID:-}"
 DOLT_DATABASE="${GC_DOLT_DATABASE:-}"

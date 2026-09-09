@@ -2638,6 +2638,9 @@ func TestInitCityInPodSkipsDolt(t *testing.T) {
 	if !strings.Contains(gcInitScript, "find /workspace -type d -name .beads") {
 		t.Errorf("gc init should remove staged scoped bead stores before initialization; got script=%s", gcInitScript)
 	}
+	if !strings.Contains(gcInitScript, "chmod -R u+rwX /workspace") {
+		t.Errorf("gc init should make staged workspace content writable; got script=%s", gcInitScript)
+	}
 
 	// Pod-local init only scaffolds a session filesystem; it must not register
 	// or start a city, and must not run provider login/readiness probes (a
