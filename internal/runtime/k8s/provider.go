@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1209,9 +1210,17 @@ func waitForTmux(ctx context.Context, ops k8sOps, name string, timeout time.Dura
 // keeps gc init from rejecting a valid staged city before initBeadsInPod strips
 // the controller-side identity for the pod's own server handshake.
 func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string) error {
-	// Copy city dir (excluding .gc/) into the pod.
+	// Copy the city directory into the pod. The site binding is copied
+	// explicitly below because the controller city may be projected from a rig
+	// subdirectory and the generic directory staging contract does not promise
+	// that .gc/ runtime state is present in the staging source.
 	if err := copyDirToPod(ctx, ops, podName, "agent", ctrlCity, "/tmp/city-src"); err != nil {
 		return err
+	}
+	if siteBinding := citySiteBindingSource(ctrlCity); siteBinding != "" {
+		if err := copyToPod(ctx, ops, podName, "agent", siteBinding, "/tmp/city-src/.gc/site.toml"); err != nil {
+			return fmt.Errorf("staging worker site binding: %w", err)
+		}
 	}
 	// Run gc init --from with GC_DOLT=skip so gc init does not attempt to
 	// start a local Dolt server. Pod sessions consume the projected GC_DOLT_*
@@ -1261,6 +1270,27 @@ fi`
 	_, _ = ops.execInPod(ctx, podName, "agent",
 		[]string{"rm", "-rf", "/tmp/city-src"}, nil)
 	return nil
+}
+
+// citySiteBindingSource finds the nearest controller-local site binding. A
+// provider may receive a rig work directory as its city argument, while the
+// binding itself belongs to the enclosing city root.
+func citySiteBindingSource(ctrlCity string) string {
+	current := filepath.Clean(ctrlCity)
+	if current == "." || current == "" {
+		return ""
+	}
+	for {
+		candidate := filepath.Join(current, ".gc", "site.toml")
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return ""
+		}
+		current = parent
+	}
 }
 
 // initBeadsInPod ensures the pod workspace has usable .beads state. It keeps

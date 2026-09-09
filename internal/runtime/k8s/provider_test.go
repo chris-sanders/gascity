@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -2606,8 +2608,15 @@ func TestBuildPodServiceAccount(t *testing.T) {
 
 func TestInitCityInPodSkipsDolt(t *testing.T) {
 	fake := newFakeK8sOps()
+	ctrlCity := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ctrlCity, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ctrlCity, ".gc", "site.toml"), []byte("workspace_name = \"gc\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	err := initCityInPod(context.Background(), fake, "gc-mayor", "/city")
+	err := initCityInPod(context.Background(), fake, "gc-mayor", ctrlCity)
 	if err != nil {
 		t.Fatalf("initCityInPod: %v", err)
 	}
@@ -2642,23 +2651,28 @@ func TestInitCityInPodSkipsDolt(t *testing.T) {
 		t.Errorf("gc init should make staged workspace content writable; got script=%s", gcInitScript)
 	}
 
+	if got := citySiteBindingSource(filepath.Join(ctrlCity, "rigs", "gascity")); got != filepath.Join(ctrlCity, ".gc", "site.toml") {
+		t.Fatalf("citySiteBindingSource() = %q, want controller root binding", got)
+	}
+	var siteBindingCopy bool
+	for _, c := range fake.calls {
+		if c.method == "execInPod" && len(c.cmd) >= 5 && c.cmd[0] == "tar" && c.cmd[1] == "xf" && c.cmd[2] == "-" && c.cmd[3] == "-C" && c.cmd[4] == "/tmp/city-src/.gc" {
+			siteBindingCopy = true
+			break
+		}
+	}
+	if !siteBindingCopy {
+		t.Fatal("site binding source was not copied into the staged city")
+	}
 	var siteBindingCmd []string
 	for _, c := range fake.calls {
-		if c.method == "execInPod" && len(c.cmd) >= 3 && c.cmd[0] == "sh" && c.cmd[1] == "-c" && strings.Contains(c.cmd[2], "preserving") {
-			// The production command is deliberately identified by its source and
-			// destination rather than by a user-facing log string.
-			continue
-		}
 		if c.method == "execInPod" && len(c.cmd) >= 3 && c.cmd[0] == "sh" && c.cmd[1] == "-c" && strings.Contains(c.cmd[2], "/tmp/city-src/.gc/site.toml") {
 			siteBindingCmd = c.cmd
 			break
 		}
 	}
-	if siteBindingCmd == nil {
-		t.Fatal("site binding preservation command not found in exec calls")
-	}
-	if !strings.Contains(siteBindingCmd[2], "/workspace/.gc/site.toml") {
-		t.Errorf("site binding preservation should target the worker site binding: %s", siteBindingCmd[2])
+	if siteBindingCmd == nil || !strings.Contains(siteBindingCmd[2], "/workspace/.gc/site.toml") {
+		t.Fatalf("site binding preservation should target the worker site binding: %v", siteBindingCmd)
 	}
 
 	// Pod-local init only scaffolds a session filesystem; it must not register
