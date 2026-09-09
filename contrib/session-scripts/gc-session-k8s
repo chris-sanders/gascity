@@ -483,6 +483,12 @@ case "$op" in
         "${KUBECTL[@]}" exec "$pod" -c stage -- mkdir -p "$pod_work_dir" 2>/dev/null || true
         "${KUBECTL[@]}" cp "$work_dir/." "$pod:$pod_work_dir/" -c stage 2>/dev/null || \
           echo "start: warning: failed to copy work_dir $work_dir" >&2
+        # The staged rig checkout may carry the controller's .beads state.
+        # Remove that copied store before gc init --from creates the worker's
+        # own scoped metadata and formula links; preserving it can leave the
+        # worker unable to rewrite .beads/formulas due to its source mode.
+        "${KUBECTL[@]}" exec "$pod" -c stage -- rm -rf "$pod_work_dir/.beads" 2>/dev/null || \
+          echo "start: warning: failed to remove staged rig bead state" >&2
       fi
 
       # Copy overlay_dir into /workspace/ via init container.
