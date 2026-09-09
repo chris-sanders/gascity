@@ -1224,7 +1224,7 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string) er
 # stageFiles preserves source modes while copying the controller workspace.
 # A fresh worker must be able to initialize its staged checkout, including
 # read-only .git pack files and formula files dereferenced from symlinks.
-chmod -R u+rwX /workspace
+find /workspace -mindepth 1 -exec chmod u+rwX {} +
 
 # stageFiles may have copied the controller's scoped bead stores into the
 # worker workspace. Those stores are not authoritative in this fresh pod;

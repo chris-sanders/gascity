@@ -2638,7 +2638,7 @@ func TestInitCityInPodSkipsDolt(t *testing.T) {
 	if !strings.Contains(gcInitScript, "find /workspace -type d -name .beads") {
 		t.Errorf("gc init should remove staged scoped bead stores before initialization; got script=%s", gcInitScript)
 	}
-	if !strings.Contains(gcInitScript, "chmod -R u+rwX /workspace") {
+	if !strings.Contains(gcInitScript, "find /workspace -mindepth 1 -exec chmod u+rwX") {
 		t.Errorf("gc init should make staged workspace content writable; got script=%s", gcInitScript)
 	}
 
