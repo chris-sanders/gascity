@@ -2642,6 +2642,25 @@ func TestInitCityInPodSkipsDolt(t *testing.T) {
 		t.Errorf("gc init should make staged workspace content writable; got script=%s", gcInitScript)
 	}
 
+	var siteBindingCmd []string
+	for _, c := range fake.calls {
+		if c.method == "execInPod" && len(c.cmd) >= 3 && c.cmd[0] == "sh" && c.cmd[1] == "-c" && strings.Contains(c.cmd[2], "preserving") {
+			// The production command is deliberately identified by its source and
+			// destination rather than by a user-facing log string.
+			continue
+		}
+		if c.method == "execInPod" && len(c.cmd) >= 3 && c.cmd[0] == "sh" && c.cmd[1] == "-c" && strings.Contains(c.cmd[2], "/tmp/city-src/.gc/site.toml") {
+			siteBindingCmd = c.cmd
+			break
+		}
+	}
+	if siteBindingCmd == nil {
+		t.Fatal("site binding preservation command not found in exec calls")
+	}
+	if !strings.Contains(siteBindingCmd[2], "/workspace/.gc/site.toml") {
+		t.Errorf("site binding preservation should target the worker site binding: %s", siteBindingCmd[2])
+	}
+
 	// Pod-local init only scaffolds a session filesystem; it must not register
 	// or start a city, and must not run provider login/readiness probes (a
 	// gateway-backed provider cannot satisfy a first-party-login probe, and the

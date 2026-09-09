@@ -1246,6 +1246,17 @@ fi`
 	if err != nil {
 		return err
 	}
+	// gc init --from intentionally omits .gc/ runtime state, but site.toml is
+	// the machine-local binding that makes declared rigs resolvable in a fresh
+	// worker. Preserve that non-secret topology input after init; otherwise a
+	// worker can reach its scoped bd store while city-wide readers such as
+	// `gc ready` silently omit the rig and its graph work.
+	if _, err := ops.execInPod(ctx, podName, "agent", []string{
+		"sh", "-c",
+		`if [ -f /tmp/city-src/.gc/site.toml ]; then mkdir -p /workspace/.gc && cp -f /tmp/city-src/.gc/site.toml /workspace/.gc/site.toml; fi`,
+	}, nil); err != nil {
+		return fmt.Errorf("preserving worker site binding: %w", err)
+	}
 	// Clean up.
 	_, _ = ops.execInPod(ctx, podName, "agent",
 		[]string{"rm", "-rf", "/tmp/city-src"}, nil)
