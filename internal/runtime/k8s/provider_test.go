@@ -2635,6 +2635,9 @@ func TestInitCityInPodSkipsDolt(t *testing.T) {
 	if !strings.Contains(gcInitScript, "GC_BEADS_PROJECT_ID") || !strings.Contains(gcInitScript, "dolt_database") {
 		t.Errorf("gc init should recover staged hosted-Dolt identity; got script=%s", gcInitScript)
 	}
+	if !strings.Contains(gcInitScript, "find /workspace -type d -name .beads") {
+		t.Errorf("gc init should remove staged scoped bead stores before initialization; got script=%s", gcInitScript)
+	}
 
 	// Pod-local init only scaffolds a session filesystem; it must not register
 	// or start a city, and must not run provider login/readiness probes (a
