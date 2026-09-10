@@ -83,8 +83,16 @@ func TerminateCommand(cmd *exec.Cmd, knownPGID int, timeout time.Duration, opts 
 		}
 		pgid = resolved
 	}
-	if err := Terminate(pgid, timeout, opts); err != nil {
-		return killDirect(cmd.Process, fmt.Errorf("terminate process group %d: %w", pgid, err))
+	terminateErr := Terminate(pgid, timeout, opts)
+	// A process-group member can outlive the shell that started it. If the
+	// shell is killed before it reaps that descendant, the descendant becomes
+	// an adopted zombie of the supervisor (which is commonly PID 1 in a
+	// container). Reap only zombies from this group, and never the direct
+	// cmd.Process child: os/exec owns that wait and may be waiting for it
+	// concurrently.
+	reapGroupZombies(pgid, cmd.Process.Pid)
+	if terminateErr != nil {
+		return killDirect(cmd.Process, fmt.Errorf("terminate process group %d: %w", pgid, terminateErr))
 	}
 	return nil
 }

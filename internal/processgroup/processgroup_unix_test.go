@@ -3,13 +3,17 @@
 package processgroup
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/processgroup/processgrouptest"
+	"golang.org/x/sys/unix"
 )
 
 func TestTerminateEscalatesToSIGKILL(t *testing.T) {
@@ -89,4 +93,53 @@ func TestTerminateCommandPreservesGroupFailureAfterDirectKill(t *testing.T) {
 		t.Fatalf("TerminateCommand() error = %v, want unsafe process group detail", err)
 	}
 	_ = cmd.Wait()
+}
+
+func TestTerminateCommandReapsAdoptedGroupZombies(t *testing.T) {
+	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
+		t.Skipf("child subreaper unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) })
+
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.pid")
+	cmd := exec.Command("sh", "-c", "trap '' TERM; sleep 30 & echo $! > "+childPath+"; wait")
+	StartCommandInNewGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start command: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+
+	var childPID int
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(childPath)
+		if err == nil {
+			childPID, err = strconv.Atoi(strings.TrimSpace(string(data)))
+			if err == nil && childPID > 0 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if childPID == 0 {
+		t.Fatal("timed out waiting for child pid")
+	}
+
+	_ = TerminateCommand(cmd, cmd.Process.Pid, 100*time.Millisecond, Options{})
+	_ = cmd.Wait()
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join("/proc", strconv.Itoa(childPID))); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("adopted process %d was not reaped", childPID)
 }
