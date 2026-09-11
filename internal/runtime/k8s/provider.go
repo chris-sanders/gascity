@@ -46,19 +46,111 @@ type Provider struct {
 	memRequest           string
 	cpuLimit             string
 	memLimit             string
-	serviceAccount       string              // pod service account name (GC_K8S_SERVICE_ACCOUNT)
-	prebaked             bool                // skip staging + init container for prebaked images
-	nodeSelector         map[string]string   // GC_K8S_NODE_SELECTOR (JSON)
-	tolerations          []corev1.Toleration // GC_K8S_TOLERATIONS (JSON)
-	affinity             *corev1.Affinity    // GC_K8S_AFFINITY (JSON)
-	priorityClassName    string              // GC_K8S_PRIORITY_CLASS_NAME
-	codexAuthSecret      string              // GC_K8S_CODEX_AUTH_SECRET: read-only auth.json seed
-	postStartSettle      time.Duration       // settle time before post-start liveness check
-	startupDialogTimeout time.Duration       // shared startup-dialog budget; zero uses runtime default
-	startupReadyTimeout  time.Duration       // bounded wait for a configured interactive prompt
-	stderr               io.Writer           // warning output (default os.Stderr)
+	serviceAccount       string                  // pod service account name (GC_K8S_SERVICE_ACCOUNT)
+	prebaked             bool                    // skip staging + init container for prebaked images
+	nodeSelector         map[string]string       // GC_K8S_NODE_SELECTOR (JSON)
+	tolerations          []corev1.Toleration     // GC_K8S_TOLERATIONS (JSON)
+	affinity             *corev1.Affinity        // GC_K8S_AFFINITY (JSON)
+	priorityClassName    string                  // GC_K8S_PRIORITY_CLASS_NAME
+	codexAuthSecret      string                  // GC_K8S_CODEX_AUTH_SECRET: read-only auth.json seed
+	secretEnv            []secretEnvProjection   // GC_K8S_SECRET_ENV: JSON SecretKeyRef projections
+	secretMounts         []secretMountProjection // GC_K8S_SECRET_MOUNTS: JSON Secret volume projections
+	postStartSettle      time.Duration           // settle time before post-start liveness check
+	startupDialogTimeout time.Duration           // shared startup-dialog budget; zero uses runtime default
+	startupReadyTimeout  time.Duration           // bounded wait for a configured interactive prompt
+	stderr               io.Writer               // warning output (default os.Stderr)
 	providerMu           sync.RWMutex
 	providerNames        map[string]string // session name → resolved provider name
+}
+
+// secretEnvProjection and secretMountProjection are deliberately small,
+// deployment-neutral projections.  They carry Secret references only; secret
+// values never enter a city config, pod command, or image.
+type secretEnvProjection struct {
+	Name     string `json:"name"`
+	Secret   string `json:"secret"`
+	Key      string `json:"key"`
+	Optional bool   `json:"optional"`
+}
+
+type secretMountProjection struct {
+	Secret    string `json:"secret"`
+	MountPath string `json:"mount_path"`
+	Optional  bool   `json:"optional"`
+}
+
+func defaultSecretEnvProjections() []secretEnvProjection {
+	return []secretEnvProjection{{
+		Name: "GITHUB_TOKEN", Secret: "git-credentials", Key: "token", Optional: true,
+	}}
+}
+
+func defaultSecretMountProjections() []secretMountProjection {
+	return []secretMountProjection{{
+		Secret: "claude-credentials", MountPath: "/tmp/claude-secret", Optional: true,
+	}}
+}
+
+func parseSecretProjectionsEnv() (envProjections []secretEnvProjection, mountProjections []secretMountProjection, err error) {
+	if raw, ok := os.LookupEnv("GC_K8S_SECRET_ENV"); ok && strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &envProjections); err != nil {
+			return nil, nil, fmt.Errorf("parsing GC_K8S_SECRET_ENV: %w", err)
+		}
+	} else {
+		envProjections = defaultSecretEnvProjections()
+	}
+	if raw, ok := os.LookupEnv("GC_K8S_SECRET_MOUNTS"); ok && strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &mountProjections); err != nil {
+			return nil, nil, fmt.Errorf("parsing GC_K8S_SECRET_MOUNTS: %w", err)
+		}
+	} else {
+		mountProjections = defaultSecretMountProjections()
+	}
+	if err := validateSecretProjections(envProjections, mountProjections); err != nil {
+		return nil, nil, err
+	}
+	return envProjections, mountProjections, nil
+}
+
+func validateSecretProjections(envProjections []secretEnvProjection, mountProjections []secretMountProjection) error {
+	seenEnv := make(map[string]struct{}, len(envProjections))
+	for _, projection := range envProjections {
+		if !validEnvName(projection.Name) {
+			return fmt.Errorf("GC_K8S_SECRET_ENV has invalid environment name %q", projection.Name)
+		}
+		if projection.Secret == "" || projection.Key == "" {
+			return fmt.Errorf("GC_K8S_SECRET_ENV entry %q requires secret and key", projection.Name)
+		}
+		if _, exists := seenEnv[projection.Name]; exists {
+			return fmt.Errorf("GC_K8S_SECRET_ENV contains duplicate environment name %q", projection.Name)
+		}
+		seenEnv[projection.Name] = struct{}{}
+	}
+	seenMountPath := make(map[string]struct{}, len(mountProjections))
+	for _, projection := range mountProjections {
+		cleanPath := filepath.Clean(projection.MountPath)
+		if projection.Secret == "" || projection.MountPath == "" || cleanPath != projection.MountPath || !strings.HasPrefix(projection.MountPath, "/") || projection.MountPath == "/" {
+			return fmt.Errorf("GC_K8S_SECRET_MOUNTS has invalid mount path %q", projection.MountPath)
+		}
+		if _, exists := seenMountPath[projection.MountPath]; exists {
+			return fmt.Errorf("GC_K8S_SECRET_MOUNTS contains duplicate mount path %q", projection.MountPath)
+		}
+		seenMountPath[projection.MountPath] = struct{}{}
+	}
+	return nil
+}
+
+func validEnvName(name string) bool {
+	if name == "" || !((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z') || name[0] == '_') {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 type schedulingFields struct {
@@ -79,6 +171,11 @@ type schedulingFields struct {
 //   - GC_K8S_CODEX_AUTH_SECRET — optional Secret containing a minimal Codex
 //     auth.json seed.  It is mounted read-only and copied into a fresh writable
 //     CODEX_HOME for each worker; it is never injected as an API-key variable.
+//   - GC_K8S_SECRET_ENV — optional JSON array of SecretKeyRef projections. The
+//     unset default projects GITHUB_TOKEN from git-credentials[token].
+//   - GC_K8S_SECRET_MOUNTS — optional JSON array of Secret volume projections.
+//     The unset default mounts claude-credentials at /tmp/claude-secret unless
+//     a Codex auth seed is configured. An explicit [] projects no Secret volume.
 //
 // The in-cluster Dolt service alias defaults to the provider defaults
 // (dolt.gc.svc.cluster.local:3307). Pods receive projected GC_DOLT_* env;
@@ -111,6 +208,17 @@ func NewProvider() (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	secretEnv, secretMounts, err := parseSecretProjectionsEnv()
+	if err != nil {
+		return nil, err
+	}
+	// Keep nil as the legacy-default marker.  buildPod uses it both to supply
+	// the backward-compatible Claude mount and to preserve its Codex-specific
+	// suppression.  An explicitly configured empty list remains non-nil and
+	// deliberately means "project nothing".
+	if strings.TrimSpace(os.Getenv("GC_K8S_SECRET_MOUNTS")) == "" {
+		secretMounts = nil
+	}
 
 	return &Provider{
 		ops: &realK8sOps{
@@ -138,6 +246,8 @@ func NewProvider() (*Provider, error) {
 		affinity:             scheduling.affinity,
 		priorityClassName:    scheduling.priorityClassName,
 		codexAuthSecret:      strings.TrimSpace(os.Getenv("GC_K8S_CODEX_AUTH_SECRET")),
+		secretEnv:            secretEnv,
+		secretMounts:         secretMounts,
 		providerNames:        make(map[string]string),
 	}, nil
 }

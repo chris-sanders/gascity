@@ -191,6 +191,113 @@ func TestParseSchedulingEnvEmptyAndNullAffinitySemantics(t *testing.T) {
 	})
 }
 
+func TestParseSecretProjectionsEnvDefaultsAndCustom(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		t.Setenv("GC_K8S_SECRET_ENV", "")
+		t.Setenv("GC_K8S_SECRET_MOUNTS", "")
+		envProjections, mountProjections, err := parseSecretProjectionsEnv()
+		if err != nil {
+			t.Fatalf("parseSecretProjectionsEnv: %v", err)
+		}
+		if len(envProjections) != 1 || envProjections[0] != (secretEnvProjection{Name: "GITHUB_TOKEN", Secret: "git-credentials", Key: "token", Optional: true}) {
+			t.Fatalf("default env projections = %#v", envProjections)
+		}
+		if len(mountProjections) != 1 || mountProjections[0] != (secretMountProjection{Secret: "claude-credentials", MountPath: "/tmp/claude-secret", Optional: true}) {
+			t.Fatalf("default mount projections = %#v", mountProjections)
+		}
+	})
+
+	t.Run("custom", func(t *testing.T) {
+		t.Setenv("GC_K8S_SECRET_ENV", `[{"name":"GITEA_TOKEN","secret":"forge-credentials","key":"token","optional":false}]`)
+		t.Setenv("GC_K8S_SECRET_MOUNTS", `[{"secret":"provider-credentials","mount_path":"/var/run/provider","optional":true}]`)
+		envProjections, mountProjections, err := parseSecretProjectionsEnv()
+		if err != nil {
+			t.Fatalf("parseSecretProjectionsEnv: %v", err)
+		}
+		if len(envProjections) != 1 || envProjections[0].Name != "GITEA_TOKEN" || envProjections[0].Secret != "forge-credentials" || envProjections[0].Key != "token" || envProjections[0].Optional {
+			t.Fatalf("custom env projections = %#v", envProjections)
+		}
+		if len(mountProjections) != 1 || mountProjections[0].Secret != "provider-credentials" || mountProjections[0].MountPath != "/var/run/provider" || !mountProjections[0].Optional {
+			t.Fatalf("custom mount projections = %#v", mountProjections)
+		}
+	})
+}
+
+func TestParseSecretProjectionsEnvRejectsInvalidEntries(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		mount string
+	}{
+		{name: "invalid env name", env: `[{"name":"GITEA-TOKEN","secret":"forge-credentials","key":"token"}]`, mount: `[]`},
+		{name: "duplicate env name", env: `[{"name":"TOKEN","secret":"one","key":"token"},{"name":"TOKEN","secret":"two","key":"token"}]`, mount: `[]`},
+		{name: "missing env reference", env: `[{"name":"TOKEN","secret":"","key":"token"}]`, mount: `[]`},
+		{name: "relative mount", env: `[]`, mount: `[{"secret":"provider-credentials","mount_path":"tmp/provider"}]`},
+		{name: "parent mount", env: `[]`, mount: `[{"secret":"provider-credentials","mount_path":"/tmp/../provider"}]`},
+		{name: "duplicate mount path", env: `[]`, mount: `[{"secret":"one","mount_path":"/var/run/provider"},{"secret":"two","mount_path":"/var/run/provider"}]`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GC_K8S_SECRET_ENV", tc.env)
+			t.Setenv("GC_K8S_SECRET_MOUNTS", tc.mount)
+			if _, _, err := parseSecretProjectionsEnv(); err == nil {
+				t.Fatal("expected invalid secret projection to fail")
+			}
+		})
+	}
+}
+
+func TestBuildPod_ProjectsConfiguredSecretReferences(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	p.codexAuthSecret = "codex-credentials"
+	p.secretEnv = []secretEnvProjection{{Name: "GITEA_TOKEN", Secret: "forge-credentials", Key: "token"}}
+	p.secretMounts = []secretMountProjection{{Secret: "provider-credentials", MountPath: "/var/run/provider", Optional: true}}
+
+	pod, err := buildPod("test-session", runtime.Config{Command: "/bin/bash"}, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+
+	var projectedEnv *corev1.EnvVar
+	for i := range pod.Spec.Containers[0].Env {
+		if pod.Spec.Containers[0].Env[i].Name == "GITEA_TOKEN" {
+			projectedEnv = &pod.Spec.Containers[0].Env[i]
+		}
+		if pod.Spec.Containers[0].Env[i].Name == "GITHUB_TOKEN" {
+			t.Fatal("custom secret_env must replace the legacy default projection")
+		}
+	}
+	if projectedEnv == nil || projectedEnv.ValueFrom == nil || projectedEnv.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("GITEA_TOKEN is not SecretKeyRef-backed: %#v", projectedEnv)
+	}
+	ref := projectedEnv.ValueFrom.SecretKeyRef
+	if ref.Name != "forge-credentials" || ref.Key != "token" || ref.Optional == nil || *ref.Optional {
+		t.Fatalf("GITEA_TOKEN SecretKeyRef = %#v", ref)
+	}
+
+	var projectedMount *corev1.VolumeMount
+	var projectedVolume *corev1.Volume
+	for i := range pod.Spec.Containers[0].VolumeMounts {
+		if pod.Spec.Containers[0].VolumeMounts[i].MountPath == "/var/run/provider" {
+			projectedMount = &pod.Spec.Containers[0].VolumeMounts[i]
+		}
+		if pod.Spec.Containers[0].VolumeMounts[i].MountPath == "/tmp/claude-secret" {
+			t.Fatal("custom secret_mounts must replace the legacy default Claude mount")
+		}
+	}
+	if projectedMount == nil || !projectedMount.ReadOnly {
+		t.Fatalf("provider Secret mount = %#v", projectedMount)
+	}
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == projectedMount.Name {
+			projectedVolume = &pod.Spec.Volumes[i]
+		}
+	}
+	if projectedVolume == nil || projectedVolume.Secret == nil || projectedVolume.Secret.SecretName != "provider-credentials" || projectedVolume.Secret.Optional == nil || !*projectedVolume.Secret.Optional {
+		t.Fatalf("provider Secret volume = %#v", projectedVolume)
+	}
+}
+
 func clearSchedulingEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{

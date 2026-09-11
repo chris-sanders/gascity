@@ -14,3 +14,13 @@ The workflow publishes credential-free images at:
 
 The agent pins Codex CLI `0.153.4` and its npm archive SHA-512. Runtime
 credentials belong in deployment-local Secrets and must never be added here.
+
+The Kubernetes provider accepts deployment-neutral Secret projections through
+`GC_K8S_SECRET_ENV` and `GC_K8S_SECRET_MOUNTS`. Each is a JSON array: an env
+entry has `name`, `secret`, `key`, and optional `optional`; a mount has
+`secret`, `mount_path`, and optional `optional`. The unset env default preserves
+`GITHUB_TOKEN` from `git-credentials[token]`; the unset mount default preserves
+the optional `claude-credentials` mount at `/tmp/claude-secret` for non-Codex
+workers. An explicit empty array disables that projection. Values are always
+resolved by Kubernetes from Secret references; they are never copied into
+config, argv, logs, or images.

@@ -57,7 +57,7 @@ jobs:
       - name: Prove source-level runtime contracts
         run: |
           set -euo pipefail
-          go test ./internal/runtime/k8s -run '^TestBuildPodEnvRemapsVars$' -count=1
+          go test ./internal/runtime/k8s -run '^Test(BuildPodEnvRemapsVars|BuildPod_ProjectsConfiguredSecretReferences|ParseSecretProjectionsEnv)' -count=1
           chmod +x contrib/k8s/codex-compat.sh contrib/k8s/test-codex-compat.sh
           contrib/k8s/test-codex-compat.sh
           . ./deps.env

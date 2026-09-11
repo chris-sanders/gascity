@@ -307,6 +307,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	if err != nil {
 		return nil, err
 	}
+	env = appendSecretEnvProjections(env, p.secretEnv)
 
 	// Build volume mounts for the main container.
 	// When prebaked, skip the ws EmptyDir — it would shadow baked image content.
@@ -322,18 +323,34 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		})
 	}
 
-	if p.codexAuthSecret == "" {
-		mainVolMounts = append(mainVolMounts, corev1.VolumeMount{
-			Name: "claude-config", MountPath: "/tmp/claude-secret", ReadOnly: true,
-		})
-		volumes = append(volumes, corev1.Volume{
-			Name: "claude-config", VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: "claude-credentials",
-					Optional:   boolPtr(true),
+	secretMounts := p.secretMounts
+	if secretMounts == nil {
+		secretMounts = defaultSecretMountProjections()
+	}
+	// Preserve the accepted Codex behavior: the legacy default Claude mount is
+	// suppressed when a Codex seed is configured. Explicit deployment mounts are
+	// still honored, which lets operators project a second forge/provider Secret
+	// without changing generic runtime code.
+	if p.codexAuthSecret == "" || p.secretMounts != nil {
+		for i, projection := range secretMounts {
+			volumeName := fmt.Sprintf("gascity-secret-mount-%d", i)
+			if p.secretMounts == nil && i == 0 && projection == defaultSecretMountProjections()[0] {
+				// Preserve the legacy manifest identity for the default mount so
+				// existing workers and diagnostics see no needless volume rename.
+				volumeName = "claude-config"
+			}
+			mainVolMounts = append(mainVolMounts, corev1.VolumeMount{
+				Name: volumeName, MountPath: projection.MountPath, ReadOnly: true,
+			})
+			volumes = append(volumes, corev1.Volume{
+				Name: volumeName, VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: projection.Secret,
+						Optional:   boolPtr(projection.Optional),
+					},
 				},
-			},
-		})
+			})
+		}
 	}
 	if p.codexAuthSecret != "" {
 		mainVolMounts = append(mainVolMounts,
@@ -559,19 +576,26 @@ func buildPodEnv(cfgEnv map[string]string, podWorkDir, managedServiceHost, manag
 		env = append(env, corev1.EnvVar{Name: "CLAUDE_CONFIG_DIR", Value: "/home/gcagent/.claude"})
 	}
 
-	// Inject GITHUB_TOKEN from optional K8s secret for git push in pods.
-	env = append(env, corev1.EnvVar{
-		Name: "GITHUB_TOKEN",
-		ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: "git-credentials"},
-				Key:                  "token",
-				Optional:             boolPtr(true),
-			},
-		},
-	})
-
 	return env, nil
+}
+
+func appendSecretEnvProjections(env []corev1.EnvVar, secretEnv []secretEnvProjection) []corev1.EnvVar {
+	if secretEnv == nil {
+		secretEnv = defaultSecretEnvProjections()
+	}
+	for _, projection := range secretEnv {
+		env = append(env, corev1.EnvVar{
+			Name: projection.Name,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: projection.Secret},
+					Key:                  projection.Key,
+					Optional:             boolPtr(projection.Optional),
+				},
+			},
+		})
+	}
+	return env
 }
 
 // needsStaging returns true if the session config requires file staging
