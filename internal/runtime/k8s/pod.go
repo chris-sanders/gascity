@@ -307,7 +307,10 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	if err != nil {
 		return nil, err
 	}
-	env = appendSecretEnvProjections(env, p.secretEnv)
+	env, err = appendSecretEnvProjections(env, p.secretEnv)
+	if err != nil {
+		return nil, err
+	}
 
 	// Build volume mounts for the main container.
 	// When prebaked, skip the ws EmptyDir — it would shadow baked image content.
@@ -579,11 +582,21 @@ func buildPodEnv(cfgEnv map[string]string, podWorkDir, managedServiceHost, manag
 	return env, nil
 }
 
-func appendSecretEnvProjections(env []corev1.EnvVar, secretEnv []secretEnvProjection) []corev1.EnvVar {
+func appendSecretEnvProjections(env []corev1.EnvVar, secretEnv []secretEnvProjection) ([]corev1.EnvVar, error) {
 	if secretEnv == nil {
 		secretEnv = defaultSecretEnvProjections()
 	}
+	seen := make(map[string]struct{}, len(env)+len(secretEnv))
+	for _, entry := range env {
+		if _, exists := seen[entry.Name]; exists {
+			return nil, fmt.Errorf("runtime worker environment contains duplicate %q", entry.Name)
+		}
+		seen[entry.Name] = struct{}{}
+	}
 	for _, projection := range secretEnv {
+		if _, exists := seen[projection.Name]; exists {
+			return nil, fmt.Errorf("Secret env projection %q collides with a runtime worker environment variable", projection.Name)
+		}
 		env = append(env, corev1.EnvVar{
 			Name: projection.Name,
 			ValueFrom: &corev1.EnvVarSource{
@@ -594,8 +607,9 @@ func appendSecretEnvProjections(env []corev1.EnvVar, secretEnv []secretEnvProjec
 				},
 			},
 		})
+		seen[projection.Name] = struct{}{}
 	}
-	return env
+	return env, nil
 }
 
 // needsStaging returns true if the session config requires file staging

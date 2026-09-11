@@ -298,6 +298,30 @@ func TestBuildPod_ProjectsConfiguredSecretReferences(t *testing.T) {
 	}
 }
 
+func TestBuildPod_RejectsSecretProjectionCollisionsWithRuntimeEnvironment(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured string
+	}{
+		{name: "config env", configured: "GC_AGENT"},
+		{name: "generated tmux env", configured: "GC_TMUX_SESSION"},
+		{name: "generated dolt env", configured: "GC_DOLT_HOST"},
+		{name: "generated claude env", configured: "CLAUDE_CONFIG_DIR"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newProviderWithOps(newFakeK8sOps())
+			p.secretEnv = []secretEnvProjection{{Name: tt.configured, Secret: "worker-secret", Key: "value"}}
+			cfg := runtime.Config{Command: "/bin/bash", Env: map[string]string{"GC_AGENT": "worker", "GC_DOLT_PORT": "3307"}}
+			if _, err := buildPod("collision-test", cfg, p); err == nil {
+				t.Fatalf("buildPod accepted Secret projection collision for %q", tt.configured)
+			} else if !strings.Contains(err.Error(), tt.configured) {
+				t.Fatalf("collision error = %q, want variable name", err)
+			}
+		})
+	}
+}
+
 func clearSchedulingEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
