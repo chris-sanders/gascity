@@ -312,7 +312,26 @@ func prepareForgeQueueWorker() (string, error) {
 	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
 		return "", err
 	}
+	if err := configureForgeQueueGitCredentials(); err != nil {
+		return "", err
+	}
 	return file, nil
+}
+
+// configureForgeQueueGitCredentials installs a process-local Git credential
+// helper for the worker's writable HOME. The helper reads projected token
+// environment variables only when Git asks for credentials; no token is put
+// in Git config, command arguments, the queue bead, or the worker prompt.
+func configureForgeQueueGitCredentials() error {
+	helper := `!f() { test "$1" = get || exit 0; host=""; while IFS= read -r line; do case "$line" in host=*) host="${line#host=}";; esac; done; case "$host" in github.com) token="${GITHUB_TOKEN:-}";; gitea.v2.zarek.cc) token="${GITEA_TOKEN:-}";; *) exit 0;; esac; test -n "$token" || exit 0; printf "protocol=https\nhost=%s\nusername=token\npassword=%s\n\n" "$host" "$token"; }; f`
+	_ = exec.Command("git", "config", "--global", "--unset-all", "credential.helper").Run()
+	if err := exec.Command("git", "config", "--global", "credential.helper", helper).Run(); err != nil {
+		return errors.New("forge queue: could not configure worker Git credentials")
+	}
+	if err := os.Setenv("GIT_TERMINAL_PROMPT", "0"); err != nil {
+		return errors.New("forge queue: could not disable interactive Git prompts")
+	}
+	return nil
 }
 
 func forgeQueueToken() (string, error) {
