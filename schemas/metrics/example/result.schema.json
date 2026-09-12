@@ -216,7 +216,13 @@
               "worktree-cleanup",
               "worktree-ensure",
               "worktree-verify",
-              "storage-preflight"
+              "storage-preflight",
+              "forge-queue-ask",
+              "forge-queue-poll-loop",
+              "forge-queue-poll-once",
+              "forge-queue-prepare-worker",
+              "forge-queue-show",
+              "forge-queue-transition"
             ]
           },
           "event_id": {
