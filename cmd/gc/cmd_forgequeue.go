@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -301,6 +302,10 @@ func prepareForgeQueueWorker() (string, error) {
 	if !strings.Contains(values["GC_QUEUE_REPOSITORY"], "/") {
 		return "", fmt.Errorf("forge queue: worker item repository is invalid")
 	}
+	giteaHost, err := forgeQueueHost(values["GC_QUEUE_GITEA_BASE_URL"])
+	if err != nil {
+		return "", err
+	}
 	file := strings.TrimSpace(os.Getenv("GC_QUEUE_WORKER_ENV_FILE"))
 	if file == "" {
 		file = "/tmp/gascity-forge-queue-worker.env"
@@ -308,7 +313,10 @@ func prepareForgeQueueWorker() (string, error) {
 	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
 		return "", err
 	}
-	content := fmt.Sprintf("GC_QUEUE_FORGE=%s\nGC_QUEUE_REPOSITORY=%s\nGC_QUEUE_GITEA_BASE_URL=%s\nGC_QUEUE_ISSUE=%d\nGC_QUEUE_TARGET_BRANCH=%s\nGC_QUEUE_RESPONSE_COMMENT_ID=%s\n", values["GC_QUEUE_FORGE"], values["GC_QUEUE_REPOSITORY"], values["GC_QUEUE_GITEA_BASE_URL"], issue, values["GC_QUEUE_TARGET_BRANCH"], values["GC_QUEUE_RESPONSE_COMMENT_ID"])
+	content := fmt.Sprintf("GC_QUEUE_FORGE=%s\nGC_QUEUE_REPOSITORY=%s\nGC_QUEUE_GITEA_BASE_URL=%s\nGC_QUEUE_GITEA_HOST=%s\nGC_QUEUE_ISSUE=%d\nGC_QUEUE_TARGET_BRANCH=%s\nGC_QUEUE_RESPONSE_COMMENT_ID=%s\n", values["GC_QUEUE_FORGE"], values["GC_QUEUE_REPOSITORY"], values["GC_QUEUE_GITEA_BASE_URL"], giteaHost, issue, values["GC_QUEUE_TARGET_BRANCH"], values["GC_QUEUE_RESPONSE_COMMENT_ID"])
+	if err := os.Setenv("GC_QUEUE_GITEA_HOST", giteaHost); err != nil {
+		return "", errors.New("forge queue: could not set worker forge host")
+	}
 	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
 		return "", err
 	}
@@ -323,15 +331,31 @@ func prepareForgeQueueWorker() (string, error) {
 // environment variables only when Git asks for credentials; no token is put
 // in Git config, command arguments, the queue bead, or the worker prompt.
 func configureForgeQueueGitCredentials() error {
-	helper := `!f() { test "$1" = get || exit 0; host=""; while IFS= read -r line; do case "$line" in host=*) host="${line#host=}";; esac; done; case "$host" in github.com) token="${GITHUB_TOKEN:-}";; gitea.v2.zarek.cc) token="${GITEA_TOKEN:-}";; *) exit 0;; esac; test -n "$token" || exit 0; printf "protocol=https\nhost=%s\nusername=token\npassword=%s\n\n" "$host" "$token"; }; f`
+	// Git exits non-zero when no previous helper exists.
 	_ = exec.Command("git", "config", "--global", "--unset-all", "credential.helper").Run()
-	if err := exec.Command("git", "config", "--global", "credential.helper", helper).Run(); err != nil {
+	if err := exec.Command("git", "config", "--global", "credential.helper", forgeQueueGitCredentialHelper()).Run(); err != nil {
 		return errors.New("forge queue: could not configure worker Git credentials")
 	}
 	if err := os.Setenv("GIT_TERMINAL_PROMPT", "0"); err != nil {
 		return errors.New("forge queue: could not disable interactive Git prompts")
 	}
 	return nil
+}
+
+func forgeQueueGitCredentialHelper() string {
+	return `!f() { test "$1" = get || exit 0; host=""; while IFS= read -r line; do case "$line" in host=*) host="${line#host=}";; esac; done; case "$host" in github.com) token="${GITHUB_TOKEN:-}";; *) test -n "${GC_QUEUE_GITEA_HOST:-}" && test "$host" = "$GC_QUEUE_GITEA_HOST" || exit 0; token="${GITEA_TOKEN:-}";; esac; test -n "$token" || exit 0; printf "protocol=https\nhost=%s\nusername=token\npassword=%s\n\n" "$host" "$token"; }; f`
+}
+
+func forgeQueueHost(baseURL string) (string, error) {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return "", nil
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+		return "", errors.New("forge queue: worker Gitea base URL is invalid")
+	}
+	return u.Hostname(), nil
 }
 
 func forgeQueueToken() (string, error) {
