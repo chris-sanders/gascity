@@ -342,6 +342,7 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 		newAgentCmd(stdout, stderr),
 		newAgentScriptCmd(stdout, stderr),
 		newGitHubCmd(stdout, stderr),
+		newForgeCmd(stdout, stderr),
 		newEventCmd(stdout, stderr),
 		newEventsCmd(stdout, stderr),
 		newExtMsgCmd(stdout, stderr),

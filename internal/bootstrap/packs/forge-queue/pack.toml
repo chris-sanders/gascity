@@ -1,0 +1,10 @@
+[pack]
+name = "forge-queue"
+schema = 2
+version = "0.1.0"
+description = "Generic forge issue queue worker"
+
+[agent_defaults]
+provider = "codex"
+scope = "rig"
+

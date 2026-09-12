@@ -1,0 +1,7 @@
+scope = "rig"
+wake_mode = "fresh"
+nudge = "Run the deterministic forge queue worker instructions for the assigned issue."
+min_active_sessions = 0
+max_active_sessions = 1
+pre_start = ["gc forge queue prepare-worker"]
+
