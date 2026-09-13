@@ -1,6 +1,8 @@
 package webhookmatch
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -9,6 +11,21 @@ import (
 
 // EventWildcard is the rule.Event value that matches any delivery event type.
 const EventWildcard = "*"
+
+// DurableDeliveryKey converts the receiver's internal deduplication key into
+// a printable, provider-neutral correlation value suitable for bead metadata.
+// The in-memory key deliberately uses a NUL separator so hook names and
+// delivery identities cannot be ambiguous. Dolt JSON metadata must not receive
+// that control character, however: some deployed Dolt versions persist it as
+// a malformed JSON scalar. Hashing preserves equality and collision resistance
+// without coupling the durable record to a provider-specific header format.
+func DurableDeliveryKey(key string) string {
+	if strings.TrimSpace(key) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
 
 // MatchInput is one verified delivery presented to the matcher. The receiver
 // populates it from the E4 [webhookverify.VerifyResult] plus the parsed body.

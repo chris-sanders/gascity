@@ -70,8 +70,11 @@ func TestRouteOrderFiresSeamWithNamespacedVars(t *testing.T) {
 	if disp.last.Source != orderdispatch.SourceWebhook {
 		t.Fatalf("source = %q, want webhook", disp.last.Source)
 	}
-	if disp.last.ExternalDeliveryID != "github\x00sha256:delivery" {
+	if disp.last.ExternalDeliveryID != webhookmatch.DurableDeliveryKey("github\x00sha256:delivery") {
 		t.Fatalf("ExternalDeliveryID = %q, want durable delivery key", disp.last.ExternalDeliveryID)
+	}
+	if strings.ContainsRune(disp.last.ExternalDeliveryID, '\x00') {
+		t.Fatalf("ExternalDeliveryID contains a control character: %q", disp.last.ExternalDeliveryID)
 	}
 	// Raw vars (param-named) for validation + formula ExpandVars.
 	if disp.last.Vars["repo"] != "octo/demo" || disp.last.Vars["pr"] != "1347" {

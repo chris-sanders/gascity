@@ -182,7 +182,7 @@ func routeOrder(ctx context.Context, deps Deps, scope WebhookScope, match webhoo
 		Vars:               match.Vars,
 		ExecEnv:            webhookmatch.ExecEnvVars(match.Vars),
 		Source:             orderdispatch.SourceWebhook,
-		ExternalDeliveryID: match.DeliveryKey,
+		ExternalDeliveryID: webhookmatch.DurableDeliveryKey(match.DeliveryKey),
 	})
 	if err != nil {
 		return res, err

@@ -87,6 +87,20 @@ func TestMatch_CarriesDurableDeliveryKey(t *testing.T) {
 	}
 }
 
+func TestDurableDeliveryKey_IsPrintableAndDeterministic(t *testing.T) {
+	const internal = "github\x00sha256:delivery"
+	got := DurableDeliveryKey(internal)
+	if got == "" || strings.ContainsAny(got, "\x00\r\n") {
+		t.Fatalf("DurableDeliveryKey = %q, want printable non-empty value", got)
+	}
+	if got != DurableDeliveryKey(internal) {
+		t.Fatalf("DurableDeliveryKey is not deterministic: %q vs %q", got, DurableDeliveryKey(internal))
+	}
+	if got == DurableDeliveryKey("other\x00sha256:delivery") {
+		t.Fatal("different webhook namespaces must not share a durable delivery key")
+	}
+}
+
 // A delivery whose event matches but a Match entry fails does not match.
 func TestMatch_EventMatchesButPredicateFails(t *testing.T) {
 	rule := config.WebhookRule{
