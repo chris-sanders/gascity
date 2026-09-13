@@ -99,9 +99,12 @@ type controllerState struct {
 	adapterReg             *extmsg.AdapterRegistry
 	maintenanceLoop        *supervisor.StoreMaintenanceLoop // nil when [maintenance.dolt] enabled=false
 	updateMu               sync.Mutex                       // serializes rebuild+swap so stale reloads cannot overtake newer mutations
-	webhookDeliveryMu      sync.Mutex                       // serializes durable webhook delivery lookup/create across per-request dispatchers
-	beadEventStartSeq      uint64
-	beadEventStartSeqOK    bool // false when LatestSeq errored at construction; 0+true = genuinely empty log
+	// webhookDeliveryState is process-local replay suppression shared by the
+	// per-request webhook dispatchers. Durable tracking and root idempotency
+	// metadata remain the restart-safe authority.
+	webhookDeliveryState *webhookDeliveryState
+	beadEventStartSeq    uint64
+	beadEventStartSeqOK  bool // false when LatestSeq errored at construction; 0+true = genuinely empty log
 
 	// completionsDeltaIndex is the tick delta pass's warm completion-fact
 	// idempotency record: loaded from the journal once, then kept current by the
@@ -226,21 +229,22 @@ func newControllerStateWithRoutes(
 		fmt.Fprintf(os.Stderr, "api: rollout gates: %v (using zero Flags; legacy paths)\n", rolloutErr)
 	}
 	cs := &controllerState{
-		cfg:                 cfg,
-		sp:                  sp,
-		cacheCtx:            ctx,
-		storageRoutes:       routes,
-		eventProv:           ep,
-		usageSink:           usageSinkForCity(cfg, cityPath),
-		editor:              configedit.NewEditor(fsys.OSFS{}, tomlPath),
-		cityName:            cityName,
-		cityPath:            cityPath,
-		version:             version,
-		startedAt:           time.Now(),
-		adapterReg:          extmsg.NewAdapterRegistry(),
-		beadEventStartSeq:   beadEventStartSeq,
-		beadEventStartSeqOK: beadEventStartSeqOK,
-		rolloutFlags:        rolloutFlags,
+		cfg:                  cfg,
+		sp:                   sp,
+		cacheCtx:             ctx,
+		storageRoutes:        routes,
+		eventProv:            ep,
+		usageSink:            usageSinkForCity(cfg, cityPath),
+		editor:               configedit.NewEditor(fsys.OSFS{}, tomlPath),
+		cityName:             cityName,
+		cityPath:             cityPath,
+		version:              version,
+		startedAt:            time.Now(),
+		adapterReg:           extmsg.NewAdapterRegistry(),
+		beadEventStartSeq:    beadEventStartSeq,
+		beadEventStartSeqOK:  beadEventStartSeqOK,
+		rolloutFlags:         rolloutFlags,
+		webhookDeliveryState: newWebhookDeliveryState(),
 	}
 	// Boot-resolved rollout notices are retained on the Flags value; echo
 	// them once at startup so an env override contradicting explicit config
@@ -3008,7 +3012,13 @@ func (d controllerWebhookDispatcher) dispatcher() *memoryOrderDispatcher {
 		rec = events.Discard
 	}
 	m := newMemoryOrderDispatcher(routes, nil, cs.cityPath, cfg, rec, os.Stderr)
-	m.externalDeliveryMu = &cs.webhookDeliveryMu
+	cs.mu.Lock()
+	if cs.webhookDeliveryState == nil {
+		cs.webhookDeliveryState = newWebhookDeliveryState()
+	}
+	deliveryState := cs.webhookDeliveryState
+	cs.mu.Unlock()
+	m.externalDeliveryState = deliveryState
 	return m
 }
 

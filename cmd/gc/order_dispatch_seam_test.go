@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/orderdispatch"
@@ -200,4 +202,112 @@ func TestDispatchSeamReusesDurableWebhookRun(t *testing.T) {
 	if len(runs) != 1 || runs[0].ExternalDeliveryID != request.ExternalDeliveryID {
 		t.Fatalf("native runs = %+v, want one run carrying delivery correlation", runs)
 	}
+}
+
+// TestDispatchSeamRecoversTrackingBeforeMaterialization uses the explicit test
+// seam to stop after the native tracking bead is written and before the async
+// formula path starts. A fresh dispatcher then replays the same authenticated
+// delivery against the same durable stores. The replay must recover that run,
+// materialize one native workflow, and remain idempotent after materialization.
+func TestDispatchSeamRecoversTrackingBeforeMaterialization(t *testing.T) {
+	cityPath, cfg, order := newGraphOrderFixture(t)
+	order.Trigger = "webhook"
+	store := beads.NewMemStore()
+	request := orderdispatch.DispatchRequest{
+		Order:              order,
+		Source:             orderdispatch.SourceWebhook,
+		ExternalDeliveryID: "github\x00sha256:tracking-before-materialization",
+	}
+
+	newDispatcher := func() (*memoryOrderDispatcher, context.CancelFunc) {
+		dispatchCtx, cancel := context.WithCancel(context.Background())
+		return &memoryOrderDispatcher{
+			aa:                   []orders.Order{order},
+			storeFn:              func(execStoreTarget) (beads.Store, error) { return store, nil },
+			cfg:                  cfg,
+			cityName:             "test-city",
+			cityPath:             cityPath,
+			rec:                  &memRecorder{},
+			stderr:               io.Discard,
+			maxDispatchesPerTick: 1,
+			dispatchCtx:          dispatchCtx,
+			dispatchCancel:       cancel,
+		}, cancel
+	}
+
+	first, cancelFirst := newDispatcher()
+	first.testAfterTrackingCreated = func(orders.OrderRun) bool { return true }
+	firstResult, err := first.Dispatch(context.Background(), request)
+	cancelFirst()
+	if err != nil {
+		t.Fatalf("first Dispatch: %v", err)
+	}
+	if !firstResult.Fired || firstResult.Reused || firstResult.TrackingID == "" {
+		t.Fatalf("first Dispatch = %+v, want one new tracking run", firstResult)
+	}
+
+	if roots := workflowRootCount(t, store); roots != 0 {
+		t.Fatalf("workflow roots after deterministic crash barrier = %d, want 0", roots)
+	}
+
+	recovered, cancelRecovered := newDispatcher()
+	recoveredResult, err := recovered.Dispatch(context.Background(), request)
+	if err != nil {
+		cancelRecovered()
+		t.Fatalf("recovery Dispatch: %v", err)
+	}
+	if !recoveredResult.Fired || !recoveredResult.Reused || recoveredResult.TrackingID != firstResult.TrackingID {
+		cancelRecovered()
+		t.Fatalf("recovery Dispatch = %+v, want reuse of %s", recoveredResult, firstResult.TrackingID)
+	}
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if !recovered.drain(drainCtx) {
+		drainCancel()
+		cancelRecovered()
+		t.Fatal("recovered dispatch did not drain")
+	}
+	drainCancel()
+	cancelRecovered()
+
+	if roots := workflowRootCount(t, store); roots != 1 {
+		t.Fatalf("workflow roots after recovery = %d, want exactly 1", roots)
+	}
+	root := workflowRoot(t, store)
+	wantMaterializationKey := orders.ExternalDeliveryIdempotencyKey(order.ScopedName(), request.ExternalDeliveryID)
+	if got := root.Metadata["idempotency_key"]; got != wantMaterializationKey {
+		t.Fatalf("recovered workflow root idempotency key = %q, want %q; root=%+v", got, wantMaterializationKey, root)
+	}
+	var tracking []beads.Bead
+	for _, bead := range allBeads(t, store) {
+		if hasLabel(bead.Labels, labelOrderTracking) {
+			tracking = append(tracking, bead)
+		}
+	}
+	if len(tracking) != 1 || tracking[0].ID != firstResult.TrackingID {
+		t.Fatalf("native tracking beads after recovery = %+v, want exactly the original run", tracking)
+	}
+
+	replay, cancelReplay := newDispatcher()
+	replayResult, err := replay.Dispatch(context.Background(), request)
+	cancelReplay()
+	if err != nil {
+		t.Fatalf("post-materialization replay: %v", err)
+	}
+	if !replayResult.Fired || !replayResult.Reused || replayResult.TrackingID != firstResult.TrackingID {
+		t.Fatalf("post-materialization replay = %+v, want durable reuse", replayResult)
+	}
+	if roots := workflowRootCount(t, store); roots != 1 {
+		t.Fatalf("workflow roots after post-materialization replay = %d, want exactly 1", roots)
+	}
+}
+
+func workflowRootCount(t *testing.T, store beads.Store) int {
+	t.Helper()
+	count := 0
+	for _, bead := range allBeads(t, store) {
+		if bead.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflow {
+			count++
+		}
+	}
+	return count
 }

@@ -957,7 +957,7 @@ func TestOrderDispatchEventWispLatestSeqErrorDoesNotInstantiate(t *testing.T) {
 	mad := ad.(*memoryOrderDispatcher)
 	mad.stderr = &stderr
 
-	mad.dispatchWisp(context.Background(), store, execStoreTarget{}, mad.aa[0], t.TempDir(), tracking.ID, nil)
+	mad.dispatchWisp(context.Background(), store, execStoreTarget{}, mad.aa[0], t.TempDir(), tracking.ID, "", nil)
 
 	all := trackingBeads(t, store, "order-run:release-watch")
 	if len(all) != 1 {
@@ -1012,7 +1012,7 @@ description = "Inspect convoy {{convoy_id}}"
 	}
 	mad := ad.(*memoryOrderDispatcher)
 
-	mad.dispatchWisp(context.Background(), store, execStoreTarget{}, mad.aa[0], t.TempDir(), tracking.ID, nil)
+	mad.dispatchWisp(context.Background(), store, execStoreTarget{}, mad.aa[0], t.TempDir(), tracking.ID, "", nil)
 
 	all := trackingBeads(t, store, "order-run:convoy-patrol")
 	if len(all) != 1 {
@@ -1296,7 +1296,7 @@ metadata = { "gc.run_target" = "worker" }
 	}
 	var rec memRecorder
 	m := &memoryOrderDispatcher{cfg: cfg, cityName: "test-city", rec: &rec, stderr: io.Discard}
-	m.dispatchWisp(context.Background(), store, target, a, cityPath, tracking.ID, nil)
+	m.dispatchWisp(context.Background(), store, target, a, cityPath, tracking.ID, "", nil)
 
 	all, err := store.ListOpen()
 	if err != nil {
@@ -10322,7 +10322,7 @@ func TestRunDispatchGuardedRecoversPanic(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.runDispatchGuarded(context.Background(), beads.NewMemStore(), execStoreTarget{}, order, "/city", "track-x", nil, nil)
+		m.runDispatchGuarded(context.Background(), beads.NewMemStore(), execStoreTarget{}, order, "/city", "track-x", "", nil, nil)
 	}()
 
 	select {
@@ -10582,7 +10582,7 @@ description = "Handle {{subject}} now."
 		cfg:      &config.City{},
 		cityName: "test-city",
 	}
-	m.dispatchWisp(context.Background(), store, execStoreTarget{}, a, t.TempDir(), "gc-tracking", map[string]string{"subject": "widgets"})
+	m.dispatchWisp(context.Background(), store, execStoreTarget{}, a, t.TempDir(), "gc-tracking", "", map[string]string{"subject": "widgets"})
 
 	// The wisp root is a legacy molecule container; the substituted text lives
 	// on the "work" step bead. Find it by its rendered title prefix.

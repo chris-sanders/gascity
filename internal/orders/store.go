@@ -47,11 +47,6 @@ const (
 	// correlation key, not a second workflow state machine: replay handling
 	// reads the existing native run and returns its id.
 	ExternalDeliveryMetadataKey = beadmeta.ExternalDeliveryMetadataKey
-	// ExternalDeliveryOwnerMetadataKey is a short-lived durable reservation for
-	// materializing an externally correlated order run. It lets a new controller
-	// reclaim a reservation left by a crashed controller without creating a
-	// second workflow.
-	ExternalDeliveryOwnerMetadataKey = beadmeta.ExternalDeliveryOwnerMetadataKey
 
 	labelExec           = "exec"
 	labelExecFailed     = "exec-failed"
@@ -335,68 +330,6 @@ func (s *Store) CreateRun(scoped string, opts RunOpts) (OrderRun, error) {
 		Open:               true,
 		ExternalDeliveryID: strings.TrimSpace(opts.ExternalDeliveryID),
 	}, nil
-}
-
-// ExternalDeliveryOwner returns the current durable materialization owner for
-// runID. An empty owner means no controller currently claims the async launch.
-func (s *Store) ExternalDeliveryOwner(runID string) (string, error) {
-	if s.store.Store == nil {
-		return "", fmt.Errorf("finding external delivery owner %q: nil store", runID)
-	}
-	b, err := s.store.Store.Get(runID)
-	if err != nil {
-		return "", fmt.Errorf("finding external delivery owner %q: %w", runID, err)
-	}
-	return strings.TrimSpace(b.Metadata[ExternalDeliveryOwnerMetadataKey]), nil
-}
-
-// ClaimExternalDeliveryOwner atomically claims runID for owner. The current
-// owner is read only to supply the CAS expected value; the CAS itself decides
-// the winner. An owner may reclaim a reservation left by an older controller,
-// which is the restart half of the webhook crash window. A call by the same
-// owner is a clean loss so duplicate deliveries do not launch another worker.
-func (s *Store) ClaimExternalDeliveryOwner(runID, owner string) (bool, error) {
-	if s.store.Store == nil {
-		return false, fmt.Errorf("claiming external delivery owner %q: nil store", runID)
-	}
-	owner = strings.TrimSpace(owner)
-	if owner == "" {
-		return false, fmt.Errorf("claiming external delivery owner %q: owner is empty", runID)
-	}
-	writer, ok := beads.MetadataCASWriterFor(s.store.Store)
-	if !ok {
-		return false, fmt.Errorf("claiming external delivery owner %q: store has no metadata CAS capability", runID)
-	}
-	b, err := s.store.Store.Get(runID)
-	if err != nil {
-		return false, fmt.Errorf("reading external delivery owner %q: %w", runID, err)
-	}
-	current := strings.TrimSpace(b.Metadata[ExternalDeliveryOwnerMetadataKey])
-	if current == owner {
-		return false, nil
-	}
-	claimed, err := writer.CompareAndSetMetadataKey(runID, ExternalDeliveryOwnerMetadataKey, current, owner)
-	if err != nil {
-		return false, fmt.Errorf("claiming external delivery owner %q: %w", runID, err)
-	}
-	return claimed, nil
-}
-
-// ReleaseExternalDeliveryOwner clears owner if it still owns runID. A lost
-// CAS is a clean race with a recovering controller and is not an error.
-func (s *Store) ReleaseExternalDeliveryOwner(runID, owner string) error {
-	if s.store.Store == nil || strings.TrimSpace(owner) == "" {
-		return nil
-	}
-	writer, ok := beads.MetadataCASWriterFor(s.store.Store)
-	if !ok {
-		return fmt.Errorf("releasing external delivery owner %q: store has no metadata CAS capability", runID)
-	}
-	_, err := writer.CompareAndSetMetadataKey(runID, ExternalDeliveryOwnerMetadataKey, strings.TrimSpace(owner), "")
-	if err != nil {
-		return fmt.Errorf("releasing external delivery owner %q: %w", runID, err)
-	}
-	return nil
 }
 
 // FindRunByExternalDelivery returns the native order run already correlated

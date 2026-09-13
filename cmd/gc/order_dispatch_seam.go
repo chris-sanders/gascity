@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/orderdispatch"
 	"github.com/gastownhall/gascity/internal/orders"
 )
@@ -46,31 +47,86 @@ func (m *memoryOrderDispatcher) Dispatch(ctx context.Context, req orderdispatch.
 		return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("opening store for %s: %w", scoped, err)
 	}
 
-	// Durable correlation is checked and created under one controller-wide
-	// mutex. The bead metadata is the restart-safe authority; the mutex only
-	// prevents two concurrent deliveries in this process from both observing a
-	// missing row before either creates it.
+	// Durable correlation is checked and created under one controller-local
+	// state. The native tracking bead is the durable authority; the in-memory
+	// active set only prevents a same-process replay from relaunching a dispatch
+	// whose tracking bead exists but whose formula graph is not materialized yet.
 	deliveryID := strings.TrimSpace(req.ExternalDeliveryID)
-	if deliveryID != "" && m.externalDeliveryMu != nil {
-		m.externalDeliveryMu.Lock()
-		defer m.externalDeliveryMu.Unlock()
-	}
 	if deliveryID != "" {
-		frontDoor := m.orderFrontDoorFor(store)
-		existing, found, findErr := frontDoor.FindRunByExternalDelivery(scoped, deliveryID)
-		if findErr != nil {
-			closeBeadStoreHandle(store)
-			return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("checking webhook delivery %q for %s: %w", deliveryID, scoped, findErr)
-		}
-		if found {
+		state := m.webhookDeliveryStateForUse()
+		state.mu.Lock()
+		localKey := scoped + "\x00" + deliveryID
+		if trackingID := state.active[localKey]; trackingID != "" {
+			state.mu.Unlock()
 			closeBeadStoreHandle(store)
 			return orderdispatch.DispatchResult{
 				ScopedName: scoped,
-				TrackingID: existing.ID,
+				TrackingID: trackingID,
 				Fired:      true,
 				Reused:     true,
 			}, nil
 		}
+		frontDoor := m.orderFrontDoorFor(store)
+		existing, found, findErr := frontDoor.FindRunByExternalDelivery(scoped, deliveryID)
+		if findErr != nil {
+			state.mu.Unlock()
+			closeBeadStoreHandle(store)
+			return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("checking webhook delivery %q for %s: %w", deliveryID, scoped, findErr)
+		}
+		if found {
+			// Exec orders have no graph materialization to recover; the native
+			// tracking run itself is the durable completed/replayed result.
+			if a.IsExec() {
+				state.mu.Unlock()
+				closeBeadStoreHandle(store)
+				return orderdispatch.DispatchResult{ScopedName: scoped, TrackingID: existing.ID, Fired: true, Reused: true}, nil
+			}
+
+			materializationKey := orders.ExternalDeliveryIdempotencyKey(scoped, deliveryID)
+			_, materialized, materializeErr := findExternalDeliveryMaterialization(m.graphStoreFor(store), materializationKey)
+			if materializeErr != nil {
+				state.mu.Unlock()
+				closeBeadStoreHandle(store)
+				return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("checking webhook materialization %q for %s: %w", deliveryID, scoped, materializeErr)
+			}
+			if materialized {
+				state.mu.Unlock()
+				closeBeadStoreHandle(store)
+				return orderdispatch.DispatchResult{ScopedName: scoped, TrackingID: existing.ID, Fired: true, Reused: true}, nil
+			}
+			if !existing.Open {
+				state.mu.Unlock()
+				closeBeadStoreHandle(store)
+				return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("webhook delivery %q for %s has a closed tracking run %s but no materialized workflow", deliveryID, scoped, existing.ID)
+			}
+
+			state.active[localKey] = existing.ID
+			state.mu.Unlock()
+			closeStore := m.webhookDispatchCloser(store, localKey, scoped)
+			m.launchExistingDispatch(ctx, store, target, a, m.cityPath, existing.ID, materializationKey, req.Vars, req.ExecEnv, closeStore)
+			return orderdispatch.DispatchResult{ScopedName: scoped, TrackingID: existing.ID, Fired: true, Reused: true}, nil
+		}
+		trackingRun, createErr := m.orderFrontDoorFor(store).CreateRun(scoped, orders.RunOpts{ExternalDeliveryID: deliveryID})
+		if createErr != nil {
+			state.mu.Unlock()
+			closeBeadStoreHandle(store)
+			return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("creating tracking bead for %s: %w", scoped, createErr)
+		}
+		state.active[localKey] = trackingRun.ID
+		state.mu.Unlock()
+
+		materializationKey := orders.ExternalDeliveryIdempotencyKey(scoped, deliveryID)
+		closeStore := m.webhookDispatchCloser(store, localKey, scoped)
+		if m.testAfterTrackingCreated != nil && m.testAfterTrackingCreated(trackingRun) {
+			// The test seam intentionally leaves the durable tracking bead open
+			// and closes only this request's store handle: the next dispatcher is
+			// the process that recovers the incomplete native run.
+			closeStore()
+			return orderdispatch.DispatchResult{ScopedName: scoped, TrackingID: trackingRun.ID, Fired: true}, nil
+		}
+		m.addInflight()
+		m.launchDispatchOne(ctx, store, target, a, m.cityPath, trackingRun.ID, materializationKey, req.Vars, req.ExecEnv, closeStore)
+		return orderdispatch.DispatchResult{ScopedName: scoped, TrackingID: trackingRun.ID, Fired: true}, nil
 	}
 
 	// Close this dispatch's own store handle once the async dispatchOne goroutine
@@ -94,4 +150,46 @@ func (m *memoryOrderDispatcher) Dispatch(ctx context.Context, req orderdispatch.
 		return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("creating tracking bead for %s: %w", scoped, err)
 	}
 	return orderdispatch.DispatchResult{ScopedName: scoped, TrackingID: trackingRun.ID, Fired: true}, nil
+}
+
+func findExternalDeliveryMaterialization(store beads.Store, key string) (string, bool, error) {
+	if store == nil || strings.TrimSpace(key) == "" {
+		return "", false, nil
+	}
+	rows, err := store.ListByMetadata(
+		// molecule.Instantiate's existing root option uses the generic
+		// idempotency_key metadata field (the Attach path additionally uses
+		// gc.idempotency_key). Keep this recovery lookup on the Instantiate
+		// contract so it observes both graph-apply and sequential roots.
+		map[string]string{"idempotency_key": key},
+		2,
+		beads.IncludeClosed,
+		beads.WithBothTiers,
+	)
+	if err != nil {
+		return "", false, err
+	}
+	if len(rows) > 1 {
+		return "", false, fmt.Errorf("materialization key %q has %d workflow roots", key, len(rows))
+	}
+	if len(rows) == 0 {
+		return "", false, nil
+	}
+	return rows[0].ID, true, nil
+}
+
+func (m *memoryOrderDispatcher) webhookDispatchCloser(store beads.Store, localKey, scoped string) func() {
+	return func() {
+		m.releaseWebhookDeliveryKey(localKey)
+		if cerr := closeBeadStoreHandle(store); cerr != nil {
+			logDispatchError(m.stderr, "gc: webhook dispatch: closing store for %s: %v", scoped, cerr)
+		}
+	}
+}
+
+func (m *memoryOrderDispatcher) releaseWebhookDeliveryKey(localKey string) {
+	state := m.webhookDeliveryStateForUse()
+	state.mu.Lock()
+	delete(state.active, localKey)
+	state.mu.Unlock()
 }

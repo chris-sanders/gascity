@@ -328,10 +328,16 @@ type memoryOrderDispatcher struct {
 	lastRunCache         map[string]time.Time
 	gateBackoffUntil     map[string]time.Time
 	openWorkSuppression  map[string]orderOpenWorkSuppression
-	// externalDeliveryMu serializes durable delivery lookup plus native run
-	// creation in one controller. The metadata lookup remains the restart-safe
-	// authority; this lock closes the same-process create/create race.
-	externalDeliveryMu *sync.Mutex
+	// externalDeliveryState serializes durable delivery lookup plus native run
+	// creation in one controller. Its active set is process-local: it prevents a
+	// replay from relaunching a still-running dispatch in this process, while the
+	// root idempotency key below is the durable restart/replay evidence.
+	externalDeliveryState *webhookDeliveryState
+	// testAfterTrackingCreated is a deterministic test seam for the narrow
+	// tracking-before-materialization crash window. Returning true simulates the
+	// controller disappearing after the tracking bead is durable and before the
+	// async formula launch; production leaves it nil.
+	testAfterTrackingCreated func(orders.OrderRun) bool
 
 	dispatchCtx    context.Context
 	dispatchCancel context.CancelFunc
@@ -339,6 +345,25 @@ type memoryOrderDispatcher struct {
 	inflightMu   sync.Mutex
 	inflightN    int
 	inflightDone chan struct{} // closed when inflightN returns to 0; nil when idle
+}
+
+type webhookDeliveryState struct {
+	mu     sync.Mutex
+	active map[string]string
+}
+
+func newWebhookDeliveryState() *webhookDeliveryState {
+	return &webhookDeliveryState{active: make(map[string]string)}
+}
+
+func (m *memoryOrderDispatcher) webhookDeliveryStateForUse() *webhookDeliveryState {
+	if m.externalDeliveryState == nil {
+		m.externalDeliveryState = newWebhookDeliveryState()
+	}
+	if m.externalDeliveryState.active == nil {
+		m.externalDeliveryState.active = make(map[string]string)
+	}
+	return m.externalDeliveryState
 }
 
 type orderDispatchTrackingIndex struct {
@@ -504,19 +529,19 @@ func newMemoryOrderDispatcher(routes *storageRoutes, aa []orders.Order, cityPath
 			// every scope target (ga-237xpr).
 			return openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
 		},
-		storageRoutes:        routes,
-		ep:                   ep,
-		execRun:              shellExecRunner,
-		rec:                  rec,
-		stderr:               lockedStderr(stderr),
-		maxTimeout:           cfg.Orders.MaxTimeoutDuration(),
-		maxDispatchesPerTick: maxDispatchesPerTick,
-		cfg:                  cfg,
-		externalDeliveryMu:   &sync.Mutex{},
-		cityName:             loadedCityName(cfg, cityPath),
-		cityPath:             cityPath,
-		dispatchCtx:          dispatchCtx,
-		dispatchCancel:       dispatchCancel,
+		storageRoutes:         routes,
+		ep:                    ep,
+		execRun:               shellExecRunner,
+		rec:                   rec,
+		stderr:                lockedStderr(stderr),
+		maxTimeout:            cfg.Orders.MaxTimeoutDuration(),
+		maxDispatchesPerTick:  maxDispatchesPerTick,
+		cfg:                   cfg,
+		externalDeliveryState: newWebhookDeliveryState(),
+		cityName:              loadedCityName(cfg, cityPath),
+		cityPath:              cityPath,
+		dispatchCtx:           dispatchCtx,
+		dispatchCancel:        dispatchCancel,
 	}
 }
 
@@ -933,14 +958,14 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 // once after dispatchOne returns — i.e. after this goroutine's final store
 // call — so the caller can hold per-tick store handles open until the
 // goroutine releases them (gascity#3157). A nil onDone is treated as a no-op.
-func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars, execEnv map[string]string, onDone func()) {
+func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID, materializationKey string, vars, execEnv map[string]string, onDone func()) {
 	if onDone == nil {
 		onDone = func() {}
 	}
 	if m.dispatchCtx == nil {
 		go func() {
 			defer onDone()
-			m.runDispatchGuarded(ctx, store, target, a, cityPath, trackingID, vars, execEnv)
+			m.runDispatchGuarded(ctx, store, target, a, cityPath, trackingID, materializationKey, vars, execEnv)
 		}()
 		return
 	}
@@ -953,7 +978,7 @@ func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store bea
 		defer onDone()
 		defer stopAfter()
 		defer cancelMerged()
-		m.runDispatchGuarded(mergedCtx, store, target, a, cityPath, trackingID, vars, execEnv)
+		m.runDispatchGuarded(mergedCtx, store, target, a, cityPath, trackingID, materializationKey, vars, execEnv)
 	}()
 }
 
@@ -964,13 +989,13 @@ func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store bea
 // webhook-derived args) would otherwise crash the whole supervisor. dispatchOne's
 // own defers close the tracking bead as the stack unwinds before recovery here;
 // this boundary logs the panic and contains it to the single dispatch.
-func (m *memoryOrderDispatcher) runDispatchGuarded(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars, execEnv map[string]string) {
+func (m *memoryOrderDispatcher) runDispatchGuarded(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID, materializationKey string, vars, execEnv map[string]string) {
 	defer func() {
 		if p := recover(); p != nil {
 			logDispatchError(m.stderr, "gc: order %s: dispatch goroutine panic (tracking %s): %v", a.ScopedName(), trackingID, p)
 		}
 	}()
-	m.dispatchOne(ctx, store, target, a, cityPath, trackingID, vars, execEnv)
+	m.dispatchOne(ctx, store, target, a, cityPath, trackingID, materializationKey, vars, execEnv)
 }
 
 // launchResolvedDispatch is the single fire path shared by the controller tick
@@ -996,8 +1021,20 @@ func (m *memoryOrderDispatcher) launchResolvedDispatchWithOpts(ctx context.Conte
 		return orders.OrderRun{}, err
 	}
 	m.addInflight()
-	m.launchDispatchOne(ctx, store, target, a, cityPath, trackingRun.ID, vars, execEnv, onDone)
+	materializationKey := ""
+	if deliveryID := strings.TrimSpace(opts.ExternalDeliveryID); deliveryID != "" {
+		materializationKey = orders.ExternalDeliveryIdempotencyKey(a.ScopedName(), deliveryID)
+	}
+	m.launchDispatchOne(ctx, store, target, a, cityPath, trackingRun.ID, materializationKey, vars, execEnv, onDone)
 	return trackingRun, nil
+}
+
+// launchExistingDispatch resumes an open native tracking run after a
+// controller restart. The run is already the durable single-flight record, so
+// this path must not create another tracking bead.
+func (m *memoryOrderDispatcher) launchExistingDispatch(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID, materializationKey string, vars, execEnv map[string]string, onDone func()) {
+	m.addInflight()
+	m.launchDispatchOne(ctx, store, target, a, cityPath, trackingID, materializationKey, vars, execEnv, onDone)
 }
 
 // cancel signals all in-flight dispatchOne goroutines to terminate. Safe
@@ -1583,7 +1620,7 @@ func orderTriggerUsesLastRun(a orders.Order) bool {
 // namespaced execEnv (GC_WEBHOOK_ARG_*) so an untrusted payload can never shadow
 // a controller-owned or static [order.env] key (R4); the tick loop and CLI pass
 // nil (raw overlay), preserving existing semantics.
-func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars, execEnv map[string]string) {
+func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID, materializationKey string, vars, execEnv map[string]string) {
 	// Defer order matters: doneInflight runs last, after Close makes the
 	// tracking bead outcome observable to a waiting drain.
 	defer m.doneInflight()
@@ -1637,7 +1674,7 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 		}
 		m.dispatchExec(childCtx, front, target, a, cityPath, trackingID, execOverlay)
 	} else {
-		m.dispatchWisp(childCtx, store, target, a, cityPath, trackingID, vars)
+		m.dispatchWisp(childCtx, store, target, a, cityPath, trackingID, materializationKey, vars)
 	}
 }
 
@@ -2144,7 +2181,7 @@ func sweepStoreListContains(stores []beads.Store, want beads.Store) bool {
 }
 
 // dispatchWisp instantiates a wisp from the order's formula.
-func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars map[string]string) {
+func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID, materializationKey string, vars map[string]string) {
 	scoped := a.ScopedName()
 
 	if err := ctx.Err(); err != nil {
@@ -2272,7 +2309,10 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 	// the created bead text instead of the caller's value (#4668).
 	stampOrderWispRuntimeVars(recipe, effectiveVars)
 
-	cookResult, err := molecule.Instantiate(ctx, graphStore, recipe, molecule.Options{Vars: effectiveVars})
+	cookResult, err := molecule.Instantiate(ctx, graphStore, recipe, molecule.Options{
+		Vars:           effectiveVars,
+		IdempotencyKey: materializationKey,
+	})
 	if err != nil {
 		m.rec.Record(events.Event{
 			Type:    events.OrderFailed,
