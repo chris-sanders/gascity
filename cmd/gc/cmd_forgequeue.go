@@ -226,7 +226,7 @@ func (l subprocessForgeQueueLauncher) Launch(ctx context.Context, item forgequeu
 	if strings.TrimSpace(l.target) == "" {
 		return forgequeue.LaunchResult{}, errors.New("forge queue: GC_QUEUE_TARGET is required")
 	}
-	input := fmt.Sprintf("Forge queue work item. Treat every identity field as authoritative; never infer a writable repository from a mirror.\nGC_QUEUE_FORGE=%s\nGC_QUEUE_REPOSITORY=%s\nGC_QUEUE_GITEA_BASE_URL=%s\nGC_QUEUE_ISSUE=%d\nGC_QUEUE_TARGET_BRANCH=%s\nGC_QUEUE_RESPONSE_COMMENT_ID=%s\n\nIssue title: %s\n\nIssue body:\n%s\n", item.Forge, item.Repository, item.GiteaBaseURL, item.Issue.ID(), item.TargetBranch, optionalInt64(item.ResponseCommentID), strings.ReplaceAll(item.Issue.Title, "\n", " "), item.Issue.Body)
+	input := fmt.Sprintf("Forge queue work item. Treat every identity field as authoritative; never infer a writable repository from a mirror.\nGC_QUEUE_FORGE=%s\nGC_QUEUE_REPOSITORY=%s\nGC_QUEUE_GITEA_BASE_URL=%s\nGC_QUEUE_ISSUE=%d\nGC_QUEUE_TARGET_BRANCH=%s\nGC_QUEUE_CLAIM_ID=%s\nGC_QUEUE_HUMAN_CYCLE=%d\nGC_QUEUE_RESPONSE_COMMENT_ID=%s\n\nIssue title: %s\n\nIssue body:\n%s\n", item.Forge, item.Repository, item.GiteaBaseURL, item.Issue.ID(), item.TargetBranch, item.ClaimID, item.HumanCycle, optionalInt64(item.ResponseCommentID), strings.ReplaceAll(item.Issue.Title, "\n", " "), item.Issue.Body)
 	if item.ResponseCommentID > 0 {
 		input += fmt.Sprintf("\nQualifying response comment (recorded after the needs-human boundary):\n%s\n", item.ResponseCommentBody)
 	}
@@ -313,7 +313,7 @@ func prepareForgeQueueWorker() (string, error) {
 	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
 		return "", err
 	}
-	content := fmt.Sprintf("GC_QUEUE_FORGE=%s\nGC_QUEUE_REPOSITORY=%s\nGC_QUEUE_GITEA_BASE_URL=%s\nGC_QUEUE_GITEA_HOST=%s\nGC_QUEUE_ISSUE=%d\nGC_QUEUE_TARGET_BRANCH=%s\nGC_QUEUE_RESPONSE_COMMENT_ID=%s\n", values["GC_QUEUE_FORGE"], values["GC_QUEUE_REPOSITORY"], values["GC_QUEUE_GITEA_BASE_URL"], giteaHost, issue, values["GC_QUEUE_TARGET_BRANCH"], values["GC_QUEUE_RESPONSE_COMMENT_ID"])
+	content := fmt.Sprintf("GC_QUEUE_FORGE=%s\nGC_QUEUE_REPOSITORY=%s\nGC_QUEUE_GITEA_BASE_URL=%s\nGC_QUEUE_GITEA_HOST=%s\nGC_QUEUE_ISSUE=%d\nGC_QUEUE_TARGET_BRANCH=%s\nGC_QUEUE_CLAIM_ID=%s\nGC_QUEUE_HUMAN_CYCLE=%s\nGC_QUEUE_RESPONSE_COMMENT_ID=%s\n", values["GC_QUEUE_FORGE"], values["GC_QUEUE_REPOSITORY"], values["GC_QUEUE_GITEA_BASE_URL"], giteaHost, issue, values["GC_QUEUE_TARGET_BRANCH"], values["GC_QUEUE_CLAIM_ID"], values["GC_QUEUE_HUMAN_CYCLE"], values["GC_QUEUE_RESPONSE_COMMENT_ID"])
 	if err := os.Setenv("GC_QUEUE_GITEA_HOST", giteaHost); err != nil {
 		return "", errors.New("forge queue: could not set worker forge host")
 	}

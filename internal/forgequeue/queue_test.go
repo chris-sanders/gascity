@@ -3,6 +3,7 @@ package forgequeue
 import (
 	"context"
 	"errors"
+	"os"
 	"sort"
 	"sync"
 	"testing"
@@ -281,5 +282,166 @@ func TestConcurrentPollReturnsBusyAndDoesNotDuplicate(t *testing.T) {
 	}
 	if result.Action != "busy" {
 		t.Fatalf("poll while locked = %#v, want busy", result)
+	}
+}
+
+func TestRecoveryAfterLocalStateLossUsesForgeLaunchResultWithoutDuplicate(t *testing.T) {
+	forge := &fakeForge{issue: identifiedIssue(StateQueued), labels: allQueueLabels()}
+	launcher := &fakeLauncher{}
+	q := testQueue(t, forge, launcher, 4)
+
+	first, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Action != "launched" || len(launcher.items) != 1 {
+		t.Fatalf("initial poll = %#v launches=%d, want one launch", first, len(launcher.items))
+	}
+	if err := os.Remove(q.statePath(7)); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Action != "reconciled" || recovered.WorkflowID != first.WorkflowID || len(launcher.items) != 1 {
+		t.Fatalf("recovery poll = %#v launches=%d, want forge result and no duplicate", recovered, len(launcher.items))
+	}
+	third, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Action != "idle" || len(launcher.items) != 1 {
+		t.Fatalf("post-recovery poll = %#v launches=%d, want idle and no duplicate", third, len(launcher.items))
+	}
+}
+
+func TestRecoveryAfterDurableLaunchIntentBlocksAmbiguousExecution(t *testing.T) {
+	forge := &fakeForge{issue: identifiedIssue(StateWorking), labels: allQueueLabels()}
+	launcher := &fakeLauncher{}
+	q := testQueue(t, forge, launcher, 4)
+	state := q.initState(7, StateWorking, "claim-crash", 0)
+	state.LaunchStatus = "starting"
+	if err := q.writeState(state); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		"gc-queue-claim-v3 claim_id=claim-crash",
+		"gc-queue-state-intent-v3 state=gc:working cycle=0",
+		launchIntentBody("claim-crash", 0, 0),
+	} {
+		if _, err := q.systemComment(context.Background(), 7, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(q.statePath(7)); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != "blocked" || result.Reason != "launch_interrupted" || len(launcher.items) != 0 {
+		t.Fatalf("ambiguous recovery = %#v launches=%d, want explicit block and no retry", result, len(launcher.items))
+	}
+	if got, err := stateOf(forge.issue); err != nil || got != StateBlocked {
+		t.Fatalf("forge state = %q, err=%v, want blocked", got, err)
+	}
+	recovered, err := q.readState(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.LastError != "launch_interrupted" {
+		t.Fatalf("recovered state = %#v, want machine-readable launch_interrupted", recovered)
+	}
+}
+
+func TestRecoveryBeforeLaunchIntentRelaunchesRecoverableWorkOnce(t *testing.T) {
+	forge := &fakeForge{issue: identifiedIssue(StateWorking), labels: allQueueLabels()}
+	launcher := &fakeLauncher{}
+	q := testQueue(t, forge, launcher, 4)
+	state := q.initState(7, StateWorking, "claim-before-launch", 0)
+	if err := q.writeState(state); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		"gc-queue-claim-v3 claim_id=claim-before-launch",
+		"gc-queue-state-intent-v3 state=gc:working cycle=0",
+	} {
+		if _, err := q.systemComment(context.Background(), 7, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(q.statePath(7)); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != "launched" || len(launcher.items) != 1 {
+		t.Fatalf("pre-launch recovery = %#v launches=%d, want one recovered launch", result, len(launcher.items))
+	}
+}
+
+func TestNeedsHumanResumeSurvivesStateLossAndResumesExactlyOnce(t *testing.T) {
+	forge := &fakeForge{issue: identifiedIssue(StateQueued), labels: allQueueLabels()}
+	launcher := &fakeLauncher{}
+	q := testQueue(t, forge, launcher, 4)
+	if _, err := q.PollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Ask(context.Background(), 7, "please choose a deployment target"); err != nil {
+		t.Fatal(err)
+	}
+	forge.mu.Lock()
+	forge.nextComment++
+	forge.comments = append(forge.comments, Comment{ID: forge.nextComment, Body: "resume now", CreatedAt: time.Unix(1700000000, 0)})
+	forge.mu.Unlock()
+	if err := os.Remove(q.statePath(7)); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Action != "launched" || resumed.ResponseID == 0 || len(launcher.items) != 2 {
+		t.Fatalf("resume after state loss = %#v launches=%d, want one resume", resumed, len(launcher.items))
+	}
+	if err := os.Remove(q.statePath(7)); err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.Action != "reconciled" || reconciled.ResponseID != resumed.ResponseID || len(launcher.items) != 2 {
+		t.Fatalf("resume reconciliation = %#v launches=%d, want exact-once resume", reconciled, len(launcher.items))
+	}
+}
+
+func TestTerminalDoneDoesNotRelaunchAfterStateLoss(t *testing.T) {
+	forge := &fakeForge{issue: identifiedIssue(StateQueued), labels: allQueueLabels()}
+	launcher := &fakeLauncher{}
+	q := testQueue(t, forge, launcher, 4)
+	if _, err := q.PollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Transition(context.Background(), 7, StateDone); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(q.statePath(7)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != "idle" || len(launcher.items) != 1 {
+		t.Fatalf("done recovery = %#v launches=%d, want terminal idle", result, len(launcher.items))
 	}
 }

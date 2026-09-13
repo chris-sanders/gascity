@@ -74,6 +74,8 @@ type WorkItem struct {
 	GiteaBaseURL        string
 	Issue               Issue
 	TargetBranch        string
+	ClaimID             string
+	HumanCycle          int
 	ResponseCommentID   int64
 	ResponseCommentBody string
 }
@@ -440,6 +442,122 @@ func latestStateIntent(comments []Comment) (State, int, int64) {
 		}
 	}
 	return state, cycle, id
+}
+
+type launchMarker struct {
+	ID         int64
+	ClaimID    string
+	Cycle      int
+	ResponseID int64
+	Result     LaunchResult
+}
+
+type durableLaunchResult struct {
+	ClaimID    string `json:"claim_id"`
+	Cycle      int    `json:"cycle"`
+	ResponseID int64  `json:"response_id"`
+	WorkflowID string `json:"workflow_id,omitempty"`
+	BeadID     string `json:"bead_id,omitempty"`
+}
+
+func launchIntentBody(claimID string, cycle int, responseID int64) string {
+	return fmt.Sprintf("gc-queue-launch-intent-v3 claim_id=%s cycle=%d response_id=%s", markerToken(claimID), cycle, int64String(responseID))
+}
+
+func launchResultBody(claimID string, cycle int, responseID int64, result LaunchResult) string {
+	payload, _ := json.Marshal(durableLaunchResult{ClaimID: claimID, Cycle: cycle, ResponseID: responseID, WorkflowID: result.WorkflowID, BeadID: result.BeadID})
+	return "gc-queue-launch-result-v3 " + string(payload)
+}
+
+func markerToken(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "none"
+	}
+	return strings.NewReplacer(" ", "_", "\t", "_", "\n", "_").Replace(value)
+}
+
+func latestClaimID(comments []Comment) string {
+	var claim string
+	var id int64
+	for _, comment := range comments {
+		if !strings.HasPrefix(comment.Body, "<!-- gc-queue-system -->\ngc-queue-claim-v3 ") || comment.ID <= id {
+			continue
+		}
+		for _, field := range strings.Fields(comment.Body) {
+			if strings.HasPrefix(field, "claim_id=") {
+				claim = strings.TrimPrefix(field, "claim_id=")
+				if claim == "none" {
+					claim = ""
+				}
+				id = comment.ID
+			}
+		}
+	}
+	return claim
+}
+
+func parseLaunchIntent(comment Comment) (launchMarker, bool) {
+	if !strings.HasPrefix(comment.Body, "<!-- gc-queue-system -->\ngc-queue-launch-intent-v3 ") {
+		return launchMarker{}, false
+	}
+	marker := launchMarker{ID: comment.ID}
+	for _, field := range strings.Fields(comment.Body) {
+		switch {
+		case strings.HasPrefix(field, "claim_id="):
+			marker.ClaimID = strings.TrimPrefix(field, "claim_id=")
+			if marker.ClaimID == "none" {
+				marker.ClaimID = ""
+			}
+		case strings.HasPrefix(field, "cycle="):
+			marker.Cycle, _ = strconv.Atoi(strings.TrimPrefix(field, "cycle="))
+		case strings.HasPrefix(field, "response_id="):
+			value := strings.TrimPrefix(field, "response_id=")
+			if value != "none" {
+				marker.ResponseID, _ = strconv.ParseInt(value, 10, 64)
+			}
+		}
+	}
+	return marker, true
+}
+
+func latestLaunchIntent(comments []Comment, claimID string, cycle int, responseID int64) (launchMarker, bool) {
+	var found launchMarker
+	for _, comment := range comments {
+		marker, ok := parseLaunchIntent(comment)
+		if !ok || marker.Cycle != cycle || marker.ResponseID != responseID {
+			continue
+		}
+		if marker.ClaimID != "" && claimID != "" && marker.ClaimID != claimID {
+			continue
+		}
+		if marker.ID > found.ID {
+			found = marker
+		}
+	}
+	return found, found.ID > 0
+}
+
+func latestLaunchResult(comments []Comment, claimID string, cycle int, responseID int64) (LaunchResult, bool) {
+	var found launchMarker
+	prefix := "<!-- gc-queue-system -->\ngc-queue-launch-result-v3 "
+	for _, comment := range comments {
+		if !strings.HasPrefix(comment.Body, prefix) || comment.ID <= found.ID {
+			continue
+		}
+		var payload durableLaunchResult
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(comment.Body, prefix)), &payload); err != nil {
+			continue
+		}
+		if payload.Cycle != cycle || payload.ResponseID != responseID || payload.ClaimID != claimID {
+			continue
+		}
+		found = launchMarker{ID: comment.ID, ClaimID: payload.ClaimID, Cycle: payload.Cycle, ResponseID: payload.ResponseID, Result: LaunchResult{WorkflowID: payload.WorkflowID, BeadID: payload.BeadID}}
+	}
+	if found.ID == 0 {
+		return LaunchResult{}, false
+	}
+	return found.Result, true
 }
 
 func consumedForCycle(comments []Comment, cycle int) int64 {

@@ -96,11 +96,24 @@ func (q *Queue) reconcile(ctx context.Context, issue Issue) (PollResult, bool, e
 		return PollResult{}, false, err
 	}
 	if state == nil {
-		newState := q.initState(issue.ID(), desired, "recovered-"+strconv.Itoa(issue.ID()), intentCycle)
+		claimID := latestClaimID(comments)
+		if claimID == "" {
+			claimID = "recovered-" + strconv.Itoa(issue.ID())
+		}
+		newState := q.initState(issue.ID(), desired, claimID, intentCycle)
 		if err := q.writeState(newState); err != nil {
 			return PollResult{}, false, err
 		}
 		state = &newState
+	}
+	if state.ClaimID == "" {
+		state.ClaimID = latestClaimID(comments)
+		if state.ClaimID == "" {
+			state.ClaimID = "recovered-" + strconv.Itoa(issue.ID())
+		}
+		if err := q.writeState(*state); err != nil {
+			return PollResult{}, false, err
+		}
 	}
 	if state.HumanCycle < intentCycle {
 		state.HumanCycle = intentCycle
@@ -108,21 +121,72 @@ func (q *Queue) reconcile(ctx context.Context, issue Issue) (PollResult, bool, e
 			return PollResult{}, false, err
 		}
 	}
-	if current == desired {
-		if desired == StateWorking && state.LaunchStatus == "pending" {
-			result, err := q.launch(ctx, issue, *state, 0, "")
-			return result, true, err
+
+	// The forge comments are the recovery ledger. A launch result is written
+	// before the local result cache, so replacing the pod after a successful
+	// launcher call cannot cause a second launch. A launch intent without a
+	// result is deliberately not retried: the side effect may have happened,
+	// so the safe externally-visible outcome is blocked for explicit review.
+	if desired == StateWorking {
+		responseID := consumedForCycle(comments, state.HumanCycle)
+		if result, ok := latestLaunchResult(comments, state.ClaimID, state.HumanCycle, responseID); ok {
+			if current == StateWorking && state.LaunchStatus == "launched" && state.WorkflowID == result.WorkflowID && state.BeadID == result.BeadID {
+				return PollResult{}, false, nil
+			}
+			if current != StateWorking {
+				if err := q.setStateWithIntent(ctx, issue.ID(), StateWorking, state.HumanCycle); err != nil {
+					return PollResult{}, false, err
+				}
+			}
+			state.State = StateWorking
+			state.LaunchStatus = "launched"
+			state.WorkflowID = result.WorkflowID
+			state.BeadID = result.BeadID
+			if err := q.writeState(*state); err != nil {
+				return PollResult{}, false, err
+			}
+			poll := q.result("reconciled", issue.ID(), StateWorking)
+			poll.WorkflowID, poll.BeadID = result.WorkflowID, result.BeadID
+			poll.ResponseID = responseID
+			return poll, true, nil
 		}
-		if desired == StateWorking && state.LaunchStatus == "starting" {
+		if _, ok := latestLaunchIntent(comments, state.ClaimID, state.HumanCycle, responseID); ok {
+			if current != StateWorking {
+				if err := q.setStateWithIntent(ctx, issue.ID(), StateWorking, state.HumanCycle); err != nil {
+					return PollResult{}, false, err
+				}
+				current = StateWorking
+			}
+			state.LaunchStatus = "starting"
 			state.LastError = "launch_interrupted"
 			state.State = StateBlocked
 			if err := q.writeState(*state); err != nil {
 				return PollResult{}, false, err
 			}
-			if err := q.transition(ctx, issue.ID(), StateBlocked, "launch interrupted after durable intent"); err != nil {
+			if err := q.transition(ctx, issue.ID(), StateBlocked, "launch outcome is ambiguous after restart; inspect before requeue"); err != nil {
 				return PollResult{}, false, err
 			}
-			return PollResult{}, true, nil
+			return PollResult{Action: "blocked", Forge: q.Config.Forge, Repository: q.Config.Repository, Issue: issue.ID(), State: StateBlocked, ResponseID: responseID, Reason: "launch_interrupted"}, true, nil
+		}
+		if state.LaunchStatus == "" {
+			state.LaunchStatus = "pending"
+			if err := q.writeState(*state); err != nil {
+				return PollResult{}, false, err
+			}
+		}
+	}
+
+	if current == desired {
+		if desired == StateWorking && state.LaunchStatus == "pending" {
+			responseID := consumedForCycle(comments, state.HumanCycle)
+			responseBody := ""
+			if responseID > 0 {
+				if response, ok := findComment(comments, responseID); ok {
+					responseBody = response.Body
+				}
+			}
+			result, err := q.launch(ctx, issue, *state, responseID, responseBody)
+			return result, true, err
 		}
 		return PollResult{}, false, nil
 	}
@@ -137,6 +201,7 @@ func (q *Queue) reconcile(ctx context.Context, issue Issue) (PollResult, bool, e
 			result, err := q.launchAfterResume(ctx, issue, *state, response)
 			return result, true, err
 		}
+		return PollResult{}, false, nil
 	}
 	if err := q.setStateWithIntent(ctx, issue.ID(), desired, intentCycle); err != nil {
 		return PollResult{}, false, err
@@ -196,14 +261,14 @@ func (q *Queue) launch(ctx context.Context, issue Issue, state itemState, respon
 		result.WorkflowID, result.BeadID = state.WorkflowID, state.BeadID
 		return result, nil
 	}
-	if _, err := q.systemComment(ctx, issue.ID(), fmt.Sprintf("gc-queue-launch-intent-v3 cycle=%d response_id=%s", state.HumanCycle, int64String(responseID))); err != nil {
+	if _, err := q.systemComment(ctx, issue.ID(), launchIntentBody(state.ClaimID, state.HumanCycle, responseID)); err != nil {
 		return PollResult{}, err
 	}
 	state.LaunchStatus = "starting"
 	if err := q.writeState(state); err != nil {
 		return PollResult{}, err
 	}
-	result, err := q.Launcher.Launch(ctx, WorkItem{Forge: q.Config.Forge, Repository: q.Config.Repository, GiteaBaseURL: q.Config.GiteaBaseURL, Issue: issue, TargetBranch: q.Config.TargetBranch, ResponseCommentID: responseID, ResponseCommentBody: responseBody})
+	result, err := q.Launcher.Launch(ctx, WorkItem{Forge: q.Config.Forge, Repository: q.Config.Repository, GiteaBaseURL: q.Config.GiteaBaseURL, Issue: issue, TargetBranch: q.Config.TargetBranch, ClaimID: state.ClaimID, HumanCycle: state.HumanCycle, ResponseCommentID: responseID, ResponseCommentBody: responseBody})
 	if err != nil {
 		state.LaunchStatus = "failed"
 		state.LastError = "launcher_failed"
@@ -216,6 +281,12 @@ func (q *Queue) launch(ctx context.Context, issue Issue, state itemState, respon
 	state.LaunchStatus = "launched"
 	state.WorkflowID = result.WorkflowID
 	state.BeadID = result.BeadID
+	if _, err := q.systemComment(ctx, issue.ID(), launchResultBody(state.ClaimID, state.HumanCycle, responseID, result)); err != nil {
+		state.LaunchStatus = "starting"
+		state.LastError = "launch_result_persist_failed"
+		_ = q.writeState(state)
+		return PollResult{}, fmt.Errorf("persist launch result: %w", err)
+	}
 	if err := q.writeState(state); err != nil {
 		return PollResult{}, err
 	}
