@@ -1,7 +1,9 @@
 package forgequeue
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -77,6 +79,38 @@ func TestHTTPClientUsesBearerForGitHub(t *testing.T) {
 	}
 	if got := request.URL.Query().Get("per_page"); got != "100" {
 		t.Fatalf("GitHub per_page = %q, want 100", got)
+	}
+}
+
+func TestGiteaIssueLabelsUseNumericIDs(t *testing.T) {
+	var requests []*http.Request
+	client := &HTTPClient{
+		BaseURL: "https://gitea.example/api/v1",
+		Token:   "fixture-token",
+		Forge:   "gitea",
+		Repo:    "owner/repo",
+		Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests = append(requests, req)
+			return response(http.StatusOK, `[]`), nil
+		})},
+	}
+
+	if err := client.SetIssueLabels(context.Background(), 7, StateQueued, []Label{{ID: 6, Name: string(StateQueued)}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 || requests[1].Method != http.MethodPost {
+		t.Fatalf("requests = %v, want label delete followed by POST", requestMethods(requests))
+	}
+	var payload map[string][]int64
+	body, err := io.ReadAll(requests[1].Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload["labels"]) != 1 || payload["labels"][0] != 6 {
+		t.Fatalf("Gitea label payload = %s, want numeric label ID 6", body)
 	}
 }
 

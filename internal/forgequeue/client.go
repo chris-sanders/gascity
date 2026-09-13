@@ -163,7 +163,7 @@ func (c *HTTPClient) SetIssueLabels(ctx context.Context, number int, desired Sta
 	if labelID == 0 {
 		return fmt.Errorf("queue label %s is not available", desired)
 	}
-	return c.do(ctx, http.MethodPost, "issues/"+strconv.Itoa(number)+"/labels", nil, map[string][]string{"labels": {strconv.FormatInt(labelID, 10)}}, nil)
+	return c.do(ctx, http.MethodPost, "issues/"+strconv.Itoa(number)+"/labels", nil, map[string][]int64{"labels": {labelID}}, nil)
 }
 
 func (c *HTTPClient) CreateComment(ctx context.Context, number int, body string) (Comment, error) {
