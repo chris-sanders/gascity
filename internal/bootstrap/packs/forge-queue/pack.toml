@@ -6,5 +6,3 @@ description = "Generic forge issue queue worker"
 
 [agent_defaults]
 provider = "codex"
-scope = "rig"
-
