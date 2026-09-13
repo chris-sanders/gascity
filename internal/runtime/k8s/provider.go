@@ -501,6 +501,9 @@ func (p *Provider) waitForReadyPrompt(ctx context.Context, name string, cfg runt
 	prefix := strings.TrimSpace(cfg.ReadyPromptPrefix)
 	if prefix == "" {
 		if cfg.ReadyDelayMs <= 0 {
+			if runtime.ShouldAcceptStartupDialogs(cfg) {
+				return p.acceptStartupDialogs(ctx, name)
+			}
 			return nil
 		}
 		timer := time.NewTimer(time.Duration(cfg.ReadyDelayMs) * time.Millisecond)
@@ -509,8 +512,15 @@ func (p *Provider) waitForReadyPrompt(ctx context.Context, name string, cfg runt
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			return nil
 		}
+		// A provider may render its normal composer before a first-run modal
+		// arrives. The initial startup-dialog pass happens before this delay;
+		// check once more after the configured readiness window so a late trust
+		// screen cannot receive the first work nudge.
+		if runtime.ShouldAcceptStartupDialogs(cfg) {
+			return p.acceptStartupDialogs(ctx, name)
+		}
+		return nil
 	}
 
 	timeout := p.startupReadyTimeout
