@@ -2142,7 +2142,7 @@ func TestOrderDispatchExecFailureRedactsSecrets(t *testing.T) {
 }
 
 // TestOrderDispatchExecFailureRedactsProjectedGitHubToken pins the controller
-// dispatch path for the specific tokens projectGitHubTokenExecEnv injects. The
+// dispatch path for the specific tokens projectForgeTokenExecEnv injects. The
 // exec env now projects the controller's ambient GH_TOKEN/GITHUB_TOKEN into
 // every exec order, so a failing order that echoes one must have it redacted
 // from both the logged output and the OrderFailed event message. The general
@@ -9249,15 +9249,16 @@ func TestOrderExecEnvAppliesOrderEnvOverrides(t *testing.T) {
 }
 
 // TestOrderExecEnvProjectsGitHubToken verifies that the controller's ambient
-// GitHub CLI auth tokens reach an exec order's subprocess env. Merge orders
-// shell out to `gh` (via the workflows pack), which authenticates from GH_TOKEN
-// / GITHUB_TOKEN; both keys are execenv.IsSensitiveKey so the curated exec env
-// would otherwise strip them and every merge order's `gh` call would fail auth.
+// forge auth tokens reach an exec order's subprocess env. Merge orders shell
+// out to `gh` (via the workflows pack), while the Gitea adapter uses
+// GITEA_TOKEN; all three keys are execenv.IsSensitiveKey so the curated exec
+// env would otherwise strip them.
 func TestOrderExecEnvProjectsGitHubToken(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 	t.Setenv("GC_DOLT", "skip")
 	t.Setenv("GH_TOKEN", "ghs_controller_token")
 	t.Setenv("GITHUB_TOKEN", "github_pat_controller")
+	t.Setenv("GITEA_TOKEN", "gitea_controller_token")
 	_ = os.Unsetenv("BEADS_ACTOR")
 
 	cityDir := t.TempDir()
@@ -9271,6 +9272,7 @@ func TestOrderExecEnvProjectsGitHubToken(t *testing.T) {
 	for _, want := range []string{
 		"GH_TOKEN=ghs_controller_token",
 		"GITHUB_TOKEN=github_pat_controller",
+		"GITEA_TOKEN=gitea_controller_token",
 	} {
 		found := false
 		for _, entry := range envSlice {
@@ -9293,10 +9295,12 @@ func TestOrderExecEnvProjectsGitHubToken(t *testing.T) {
 	merged := mergeOrderExecEnv([]string{
 		"GH_TOKEN=ambient_inherited",
 		"GITHUB_TOKEN=ambient_inherited",
+		"GITEA_TOKEN=ambient_inherited",
 	}, envSlice)
 	for _, want := range []string{
 		"GH_TOKEN=ghs_controller_token",
 		"GITHUB_TOKEN=github_pat_controller",
+		"GITEA_TOKEN=gitea_controller_token",
 	} {
 		found := false
 		for _, entry := range merged {
@@ -9312,6 +9316,7 @@ func TestOrderExecEnvProjectsGitHubToken(t *testing.T) {
 	for _, unwanted := range []string{
 		"GH_TOKEN=ambient_inherited",
 		"GITHUB_TOKEN=ambient_inherited",
+		"GITEA_TOKEN=ambient_inherited",
 	} {
 		for _, entry := range merged {
 			if entry == unwanted {
@@ -9405,16 +9410,16 @@ func TestOrderExecEnvRejectsReservedOrderEnvKeys(t *testing.T) {
 // controller-owned in practice while `[order.env]` can still silently shadow it.
 //
 // The invariant is "reserved, or deliberately overridable" rather than plain
-// "reserved". projectGitHubTokenExecEnv projects the controller's ambient `gh`
-// credentials, and those keys are deliberately kept out of the reserved guard so
-// an order can scope its own token; TestOrderExecEnvGitHubTokenOrderEnvOverrideWins
+// "reserved". projectForgeTokenExecEnv projects the controller's ambient forge
+// credentials, and those keys are deliberately kept out of the reserved guard
+// so an order can scope its own token; TestOrderExecEnvGitHubTokenOrderEnvOverrideWins
 // asserts that capability. Reading the exception straight from the production
-// githubTokenExecEnvKeys list keeps the two halves from drifting apart, which is
+// forgeTokenExecEnvKeys list keeps the two halves from drifting apart, which is
 // how this guard went stale in the first place: it was written when every
 // projected key really was reserved, and the token projection later added the
 // first projected-but-overridable keys without updating it.
 //
-// Both tokens are pinned with t.Setenv so the projected key set never depends on
+// All tokens are pinned with t.Setenv so the projected key set never depends on
 // the ambient environment. Without that pin this test passed in CI, which
 // carries no `gh` token, and failed for every developer and agent authenticated
 // with gh.
@@ -9423,6 +9428,7 @@ func TestOrderExecEnvReservedKeysCoverProjectedEnv(t *testing.T) {
 	t.Setenv("GC_DOLT", "skip")
 	t.Setenv("GH_TOKEN", "ghs_controller_token")
 	t.Setenv("GITHUB_TOKEN", "github_pat_controller")
+	t.Setenv("GITEA_TOKEN", "gitea_controller_token")
 
 	cityDir := t.TempDir()
 	packDir := filepath.Join(cityDir, "packs", "maintenance")
@@ -9441,8 +9447,8 @@ func TestOrderExecEnvReservedKeysCoverProjectedEnv(t *testing.T) {
 		t.Fatalf("orderExecEnvWithError() error = %v", err)
 	}
 
-	overridable := make(map[string]bool, len(githubTokenExecEnvKeys))
-	for _, key := range githubTokenExecEnvKeys {
+	overridable := make(map[string]bool, len(forgeTokenExecEnvKeys))
+	for _, key := range forgeTokenExecEnvKeys {
 		overridable[key] = true
 	}
 
@@ -9469,12 +9475,12 @@ func TestOrderExecEnvReservedKeysCoverProjectedEnv(t *testing.T) {
 	// here instead of being absorbed by the allowlist as an empty set.
 	//
 	// Two different mistakes land here. Either the projection stopped emitting a
-	// key it used to emit, or a key joined githubTokenExecEnvKeys without a
+	// key it used to emit, or a key joined forgeTokenExecEnvKeys without a
 	// matching t.Setenv at the top of this test, so it was never in the ambient
 	// environment to project. The env dump below tells them apart.
-	if projectedOverridable != len(githubTokenExecEnvKeys) {
+	if projectedOverridable != len(forgeTokenExecEnvKeys) {
 		t.Fatalf("projected %d of %d deliberately-overridable keys %v; either the projection dropped one, which the allowlist would otherwise mask, or a key was added to that list without a t.Setenv in this test. env=%v",
-			projectedOverridable, len(githubTokenExecEnvKeys), githubTokenExecEnvKeys, envSlice)
+			projectedOverridable, len(forgeTokenExecEnvKeys), forgeTokenExecEnvKeys, envSlice)
 	}
 }
 

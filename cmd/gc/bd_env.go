@@ -2119,33 +2119,34 @@ var hostedBeadsCredentialPassthroughKeys = []string{
 	"STS_TOKEN_URL",
 }
 
-// githubTokenExecEnvKeys are the GitHub CLI auth env vars an exec order needs
-// to run `gh`. Merge orders (and other PR housekeeping) shell out to `gh`,
-// which authenticates from GH_TOKEN (preferred) or GITHUB_TOKEN. Both keys
-// contain the substring TOKEN, so execenv.IsSensitiveKey reports them sensitive
-// and the curated order-exec env — built from a map, then merged through
-// FilterInherited — never carries the controller's ambient token into the child
-// process. Every `gh` call the order runs then fails auth even though the
-// controller holds a valid token. GH_TOKEN wins over GITHUB_TOKEN in `gh`'s own
-// precedence, but both are projected independently when present.
-var githubTokenExecEnvKeys = []string{
+// forgeTokenExecEnvKeys are the forge CLI/API auth env vars an exec order may
+// need. GitHub housekeeping shells out to `gh`, which authenticates from
+// GH_TOKEN (preferred) or GITHUB_TOKEN; Gitea adapters use GITEA_TOKEN for
+// their API calls. These keys contain TOKEN, so execenv.IsSensitiveKey reports
+// them sensitive and the curated order-exec env — built from a map, then merged
+// through FilterInherited — never carries the controller's ambient credentials
+// into the child process. Each value is projected explicitly below so the
+// trusted adapter can authenticate without weakening the inherited-secret
+// boundary.
+var forgeTokenExecEnvKeys = []string{
 	"GH_TOKEN",
 	"GITHUB_TOKEN",
+	"GITEA_TOKEN",
 }
 
-// projectGitHubTokenExecEnv copies the controller's ambient GitHub CLI auth
-// tokens into an exec-order env map so shelled-out `gh` invocations
-// authenticate. It mirrors the ambient value the same way mirrorBeadsDoltEnv
-// carries the hosted-gateway credential command, rather than weakening
-// execenv.IsSensitiveKey: keeping these keys sensitive means execenv.RedactText
-// still masks their values in captured exec output and logs. A value already in
-// the map (an explicit [order.env] entry) is left untouched so an order can
-// scope its own credential, and only non-empty ambient values are projected.
-func projectGitHubTokenExecEnv(env map[string]string) {
+// projectForgeTokenExecEnv copies the controller's ambient forge credentials
+// into an exec-order env map so trusted forge adapters can authenticate. It
+// mirrors the ambient value the same way mirrorBeadsDoltEnv carries the
+// hosted-gateway credential command, rather than weakening execenv.IsSensitiveKey:
+// keeping these keys sensitive means execenv.RedactText still masks the value
+// in captured exec output and logs. A value already in the map (an explicit
+// [order.env] entry) is left untouched so an order can scope its own credential,
+// and only non-empty ambient values are projected.
+func projectForgeTokenExecEnv(env map[string]string) {
 	if env == nil {
 		return
 	}
-	for _, key := range githubTokenExecEnvKeys {
+	for _, key := range forgeTokenExecEnvKeys {
 		if strings.TrimSpace(env[key]) != "" {
 			continue
 		}

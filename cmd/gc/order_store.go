@@ -222,10 +222,11 @@ func orderExecEnvWithError(cityPath string, cfg *config.City, target execStoreTa
 	}
 	applyOrderExecCanonicalDoltEnv(cityPath, target.ScopeRoot, env)
 	ensureProjectedDoltEnvExplicit(env)
-	// Carry the controller's GitHub CLI auth token into the exec order so its
-	// `gh` calls authenticate. Projected before the [order.env] loop below so an
-	// order can still scope its own GH_TOKEN; see projectGitHubTokenExecEnv.
-	projectGitHubTokenExecEnv(env)
+	// Carry the controller's forge API/CLI auth tokens into the exec order so
+	// trusted forge adapters can authenticate. Projected before the [order.env]
+	// loop below so an order can still scope its own token; see
+	// projectForgeTokenExecEnv.
+	projectForgeTokenExecEnv(env)
 	// Order-supplied [order.env] entries take effect last so they can tune
 	// non-controller thresholds (e.g. raising GC_DOCTOR_LATENCY_WARN_S for a
 	// noisy city) without editing the order's shell scripts or the parent

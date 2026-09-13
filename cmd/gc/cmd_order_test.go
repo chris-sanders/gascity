@@ -3308,7 +3308,7 @@ dolt.auto-start: false
 // `gc order run` exec order fails after echoing the controller's projected
 // GitHub token, the token is redacted from the error and combined output
 // printed to stderr. The exec env now projects GH_TOKEN/GITHUB_TOKEN into the
-// child (see projectGitHubTokenExecEnv), so the manual failure path must scrub
+// child (see projectForgeTokenExecEnv), so the manual failure path must scrub
 // them just like the controller dispatch path does.
 func TestOrderRunExecFailureRedactsProjectedGitHubToken(t *testing.T) {
 	disableManagedDoltRecoveryForTest(t)
@@ -3354,8 +3354,8 @@ prefix = "ct"
 // TestOrderRunExecSuccessRedactsProjectedGitHubToken proves that when a manual
 // `gc order run` exec order succeeds after echoing the controller's projected
 // GitHub token, the token is redacted from the combined output printed to
-// stdout. The exec env projects GH_TOKEN/GITHUB_TOKEN into the child (see
-// projectGitHubTokenExecEnv), so the success path must scrub them just like the
+// stdout. The exec env projects forge credentials into the child (see
+// projectForgeTokenExecEnv), so the success path must scrub them just like the
 // failure path does — a passing order that prints the token would otherwise
 // leak it verbatim.
 func TestOrderRunExecSuccessRedactsProjectedGitHubToken(t *testing.T) {
