@@ -161,6 +161,18 @@ func (c *HTTPClient) SetIssueLabels(ctx context.Context, number int, desired Sta
 		}
 	}
 	if labelID == 0 {
+		allLabels, err := c.ListLabels(ctx, 1, 100)
+		if err != nil {
+			return err
+		}
+		for _, label := range allLabels {
+			if label.Name == string(desired) {
+				labelID = label.ID
+				break
+			}
+		}
+	}
+	if labelID == 0 {
 		return fmt.Errorf("queue label %s is not available", desired)
 	}
 	return c.do(ctx, http.MethodPost, "issues/"+strconv.Itoa(number)+"/labels", nil, map[string][]int64{"labels": {labelID}}, nil)

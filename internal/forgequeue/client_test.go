@@ -114,6 +114,43 @@ func TestGiteaIssueLabelsUseNumericIDs(t *testing.T) {
 	}
 }
 
+func TestGiteaStateTransitionResolvesDesiredLabelFromCatalog(t *testing.T) {
+	var requests []*http.Request
+	client := &HTTPClient{
+		BaseURL: "https://gitea.example/api/v1",
+		Token:   "fixture-token",
+		Forge:   "gitea",
+		Repo:    "owner/repo",
+		Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests = append(requests, req)
+			switch {
+			case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/labels"):
+				return response(http.StatusOK, `[{"id":7,"name":"gc:working"}]`), nil
+			default:
+				return response(http.StatusOK, `[]`), nil
+			}
+		})},
+	}
+
+	if err := client.SetIssueLabels(context.Background(), 7, StateWorking, []Label{{ID: 6, Name: string(StateQueued)}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 3 || requests[1].Method != http.MethodGet || requests[2].Method != http.MethodPost {
+		t.Fatalf("requests = %v, want delete, catalog GET, POST", requestMethods(requests))
+	}
+	var payload map[string][]int64
+	body, err := io.ReadAll(requests[2].Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload["labels"]) != 1 || payload["labels"][0] != 7 {
+		t.Fatalf("resolved Gitea label payload = %s, want numeric working ID 7", body)
+	}
+}
+
 func TestConfigRejectsGiteaOutsideHTTPSAllowlist(t *testing.T) {
 	cases := []Config{
 		{Forge: "gitea", Repository: "owner/repo", AllowedRepositories: []string{"other/repo"}, GiteaBaseURL: "https://gitea.example", TargetBranch: "master", StateDir: t.TempDir(), PageSize: 1, MaxPages: 1},
