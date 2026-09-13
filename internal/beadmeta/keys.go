@@ -141,6 +141,7 @@ const (
 	ExecutionRigContextMetadataKey       = "gc.execution_rig_context"
 	ExecutionRoutedToMetadataKey         = "gc.execution_routed_to"
 	ExternalDeliveryMetadataKey          = "gc.order.external_delivery"
+	ExternalDeliveryOwnerMetadataKey     = "gc.order.external_delivery_owner"
 	ExitCodeMetadataKey                  = "gc.exit_code"
 	FailedAttemptMetadataKey             = "gc.failed_attempt"
 	FailureClassMetadataKey              = "gc.failure_class"
