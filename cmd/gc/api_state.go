@@ -99,6 +99,7 @@ type controllerState struct {
 	adapterReg             *extmsg.AdapterRegistry
 	maintenanceLoop        *supervisor.StoreMaintenanceLoop // nil when [maintenance.dolt] enabled=false
 	updateMu               sync.Mutex                       // serializes rebuild+swap so stale reloads cannot overtake newer mutations
+	webhookDeliveryMu      sync.Mutex                       // serializes durable webhook delivery lookup/create across per-request dispatchers
 	beadEventStartSeq      uint64
 	beadEventStartSeqOK    bool // false when LatestSeq errored at construction; 0+true = genuinely empty log
 
@@ -3006,7 +3007,9 @@ func (d controllerWebhookDispatcher) dispatcher() *memoryOrderDispatcher {
 		// discard recorder keeps it panic-free when the city has events disabled.
 		rec = events.Discard
 	}
-	return newMemoryOrderDispatcher(routes, nil, cs.cityPath, cfg, rec, os.Stderr)
+	m := newMemoryOrderDispatcher(routes, nil, cs.cityPath, cfg, rec, os.Stderr)
+	m.externalDeliveryMu = &cs.webhookDeliveryMu
+	return m
 }
 
 // ExtMsgServices returns the external messaging services.

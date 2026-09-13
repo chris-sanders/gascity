@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/gastownhall/gascity/internal/orderdispatch"
 	"github.com/gastownhall/gascity/internal/orders"
@@ -45,6 +46,33 @@ func (m *memoryOrderDispatcher) Dispatch(ctx context.Context, req orderdispatch.
 		return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("opening store for %s: %w", scoped, err)
 	}
 
+	// Durable correlation is checked and created under one controller-wide
+	// mutex. The bead metadata is the restart-safe authority; the mutex only
+	// prevents two concurrent deliveries in this process from both observing a
+	// missing row before either creates it.
+	deliveryID := strings.TrimSpace(req.ExternalDeliveryID)
+	if deliveryID != "" && m.externalDeliveryMu != nil {
+		m.externalDeliveryMu.Lock()
+		defer m.externalDeliveryMu.Unlock()
+	}
+	if deliveryID != "" {
+		frontDoor := m.orderFrontDoorFor(store)
+		existing, found, findErr := frontDoor.FindRunByExternalDelivery(scoped, deliveryID)
+		if findErr != nil {
+			closeBeadStoreHandle(store)
+			return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("checking webhook delivery %q for %s: %w", deliveryID, scoped, findErr)
+		}
+		if found {
+			closeBeadStoreHandle(store)
+			return orderdispatch.DispatchResult{
+				ScopedName: scoped,
+				TrackingID: existing.ID,
+				Fired:      true,
+				Reused:     true,
+			}, nil
+		}
+	}
+
 	// Close this dispatch's own store handle once the async dispatchOne goroutine
 	// has finished with it. Mirrors the tick loop's detached per-tick closer: the
 	// handle must stay open until the goroutine's final store call (the
@@ -58,7 +86,9 @@ func (m *memoryOrderDispatcher) Dispatch(ctx context.Context, req orderdispatch.
 		}
 	}
 
-	trackingRun, err := m.launchResolvedDispatch(ctx, store, target, a, m.cityPath, req.Vars, req.ExecEnv, closeStore)
+	trackingRun, err := m.launchResolvedDispatchWithOpts(ctx, store, target, a, m.cityPath, req.Vars, req.ExecEnv, closeStore, orders.RunOpts{
+		ExternalDeliveryID: deliveryID,
+	})
 	if err != nil {
 		closeStore() // nothing launched; release the handle we opened
 		return orderdispatch.DispatchResult{ScopedName: scoped}, fmt.Errorf("creating tracking bead for %s: %w", scoped, err)

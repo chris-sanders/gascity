@@ -20,6 +20,9 @@ type MatchInput struct {
 	EventType string
 	// DedupID is the stable per-delivery id, surfaced via the @delivery token.
 	DedupID string
+	// DeliveryKey is the authenticated, provider-neutral durable correlation key
+	// for this delivery. The receiver derives it from signed material.
+	DeliveryKey string
 	// Identity is the verified principal (jwt-jwks subject), via @identity.
 	Identity string
 	// Body is the parsed JSON body. Build it with [ParseBody] so numbers keep
@@ -44,6 +47,9 @@ type MatchResult struct {
 	// order-param namespace. Route through [ExecEnvVars] before overlaying an
 	// exec order's environment.
 	Vars map[string]string
+	// DeliveryKey is carried through matching unchanged for the native order
+	// dispatcher to persist on its tracking bead.
+	DeliveryKey string
 	// Reason is a short human-readable explanation of the match.
 	Reason string
 }
@@ -67,13 +73,14 @@ func Match(input MatchInput, rules []config.WebhookRule) (MatchResult, bool, err
 			return MatchResult{}, false, fmt.Errorf("webhookmatch: rule[%d]: %w", i, err)
 		}
 		return MatchResult{
-			Rule:      rule,
-			RuleIndex: i,
-			Target:    rule.TargetOrDefault(),
-			Order:     rule.Order,
-			Rig:       rule.Rig,
-			Vars:      vars,
-			Reason:    fmt.Sprintf("rule[%d] matched event %q", i, rule.Event),
+			Rule:        rule,
+			RuleIndex:   i,
+			Target:      rule.TargetOrDefault(),
+			Order:       rule.Order,
+			Rig:         rule.Rig,
+			Vars:        vars,
+			DeliveryKey: input.DeliveryKey,
+			Reason:      fmt.Sprintf("rule[%d] matched event %q", i, rule.Event),
 		}, true, nil
 	}
 	return MatchResult{Reason: fmt.Sprintf("no rule matched event %q", input.EventType)}, false, nil

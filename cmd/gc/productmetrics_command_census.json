@@ -1576,128 +1576,6 @@
       "id": 54
     },
     {
-      "path": "gc forge",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable-group",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "help",
-      "canonical_target": "@help",
-      "owner": "immediate",
-      "id": 1
-    },
-    {
-      "path": "gc forge queue",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable-group",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "help",
-      "canonical_target": "@help",
-      "owner": "immediate",
-      "id": 1
-    },
-    {
-      "path": "gc forge queue ask",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "forge-queue-ask",
-      "owner": "immediate",
-      "id": 207
-    },
-    {
-      "path": "gc forge queue poll-loop",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "forge-queue-poll-loop",
-      "owner": "immediate",
-      "id": 208
-    },
-    {
-      "path": "gc forge queue poll-once",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "forge-queue-poll-once",
-      "owner": "immediate",
-      "id": 209
-    },
-    {
-      "path": "gc forge queue prepare-worker",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "forge-queue-prepare-worker",
-      "owner": "immediate",
-      "id": 210
-    },
-    {
-      "path": "gc forge queue show",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "classification": "forge-queue-show",
-      "notice_policy": "eligible",
-      "owner": "immediate",
-      "id": 211
-    },
-    {
-      "path": "gc forge queue transition",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "forge-queue-transition",
-      "owner": "immediate",
-      "id": 212
-    },
-    {
       "path": "gc formula",
       "aliases": [],
       "conditional_modes": [],
@@ -4814,5 +4692,36 @@
       "exclusion": "private-completion"
     }
   ],
-  "tombstones": []
+  "tombstones": [
+    {
+      "name": "forge-queue-ask",
+      "id": 207,
+      "wire": "forge-queue-ask"
+    },
+    {
+      "name": "forge-queue-poll-loop",
+      "id": 208,
+      "wire": "forge-queue-poll-loop"
+    },
+    {
+      "name": "forge-queue-poll-once",
+      "id": 209,
+      "wire": "forge-queue-poll-once"
+    },
+    {
+      "name": "forge-queue-prepare-worker",
+      "id": 210,
+      "wire": "forge-queue-prepare-worker"
+    },
+    {
+      "name": "forge-queue-show",
+      "id": 211,
+      "wire": "forge-queue-show"
+    },
+    {
+      "name": "forge-queue-transition",
+      "id": 212,
+      "wire": "forge-queue-transition"
+    }
+  ]
 }

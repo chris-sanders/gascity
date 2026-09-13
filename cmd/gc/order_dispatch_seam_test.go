@@ -152,3 +152,52 @@ func TestDispatchSeamRefusesMissingRequiredParam(t *testing.T) {
 		t.Fatalf("reason = %q, want it to name the missing required param", res.Reason)
 	}
 }
+
+// TestDispatchSeamReusesDurableWebhookRun proves that a delivery retry after
+// the first dispatch has returned reuses the native tracking bead. The second
+// call enters the dispatcher directly, modeling a restarted receiver whose
+// process-local dedup cache is empty.
+func TestDispatchSeamReusesDurableWebhookRun(t *testing.T) {
+	store := beads.NewMemStore()
+	var rec memRecorder
+	execCalls := 0
+	execRun := func(context.Context, string, string, []string) ([]byte, error) {
+		execCalls++
+		return nil, nil
+	}
+	filler := orders.Order{Name: "filler", Trigger: "cooldown", Interval: "1h", Exec: "true"}
+	mad := buildOrderDispatcherFromListExec([]orders.Order{filler}, store, nil, execRun, &rec).(*memoryOrderDispatcher)
+	mad.cityPath = t.TempDir()
+	order := orders.Order{Name: "webhook-work", Trigger: "webhook", Exec: "true"}
+	request := orderdispatch.DispatchRequest{
+		Order:              order,
+		Source:             orderdispatch.SourceWebhook,
+		ExternalDeliveryID: "github\x00sha256:crash-window",
+	}
+
+	first, err := mad.Dispatch(context.Background(), request)
+	if err != nil || !first.Fired || first.Reused {
+		t.Fatalf("first Dispatch = %+v err=%v, want a new native run", first, err)
+	}
+	second, err := mad.Dispatch(context.Background(), request)
+	if err != nil || !second.Fired || !second.Reused {
+		t.Fatalf("retry Dispatch = %+v err=%v, want reuse", second, err)
+	}
+	if second.TrackingID != first.TrackingID {
+		t.Fatalf("retry tracking id = %q, first = %q", second.TrackingID, first.TrackingID)
+	}
+
+	if !mad.drain(context.Background()) {
+		t.Fatal("dispatch did not drain")
+	}
+	if execCalls != 1 {
+		t.Fatalf("exec calls = %d, want exactly one", execCalls)
+	}
+	runs, err := orders.NewStore(beads.OrdersStore{Store: store}).RecentRuns("webhook-work", 10)
+	if err != nil {
+		t.Fatalf("RecentRuns: %v", err)
+	}
+	if len(runs) != 1 || runs[0].ExternalDeliveryID != request.ExternalDeliveryID {
+		t.Fatalf("native runs = %+v, want one run carrying delivery correlation", runs)
+	}
+}

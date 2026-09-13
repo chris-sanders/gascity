@@ -48,9 +48,10 @@ func TestRouteOrderFiresSeamWithNamespacedVars(t *testing.T) {
 	deps := Deps{Dispatcher: disp, ResolveOrder: resolverFor(order)}
 
 	match := webhookmatch.MatchResult{
-		Target: "order",
-		Order:  "pr-review",
-		Vars:   map[string]string{"repo": "octo/demo", "pr": "1347"},
+		Target:      "order",
+		Order:       "pr-review",
+		Vars:        map[string]string{"repo": "octo/demo", "pr": "1347"},
+		DeliveryKey: "github\x00sha256:delivery",
 	}
 
 	res, err := Route(context.Background(), deps, WebhookScope{Name: "github", Scope: "city"}, match)
@@ -68,6 +69,9 @@ func TestRouteOrderFiresSeamWithNamespacedVars(t *testing.T) {
 	}
 	if disp.last.Source != orderdispatch.SourceWebhook {
 		t.Fatalf("source = %q, want webhook", disp.last.Source)
+	}
+	if disp.last.ExternalDeliveryID != "github\x00sha256:delivery" {
+		t.Fatalf("ExternalDeliveryID = %q, want durable delivery key", disp.last.ExternalDeliveryID)
 	}
 	// Raw vars (param-named) for validation + formula ExpandVars.
 	if disp.last.Vars["repo"] != "octo/demo" || disp.last.Vars["pr"] != "1347" {

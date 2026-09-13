@@ -328,6 +328,10 @@ type memoryOrderDispatcher struct {
 	lastRunCache         map[string]time.Time
 	gateBackoffUntil     map[string]time.Time
 	openWorkSuppression  map[string]orderOpenWorkSuppression
+	// externalDeliveryMu serializes durable delivery lookup plus native run
+	// creation in one controller. The metadata lookup remains the restart-safe
+	// authority; this lock closes the same-process create/create race.
+	externalDeliveryMu *sync.Mutex
 
 	dispatchCtx    context.Context
 	dispatchCancel context.CancelFunc
@@ -508,6 +512,7 @@ func newMemoryOrderDispatcher(routes *storageRoutes, aa []orders.Order, cityPath
 		maxTimeout:           cfg.Orders.MaxTimeoutDuration(),
 		maxDispatchesPerTick: maxDispatchesPerTick,
 		cfg:                  cfg,
+		externalDeliveryMu:   &sync.Mutex{},
 		cityName:             loadedCityName(cfg, cityPath),
 		cityPath:             cityPath,
 		dispatchCtx:          dispatchCtx,
@@ -979,7 +984,14 @@ func (m *memoryOrderDispatcher) runDispatchGuarded(ctx context.Context, store be
 // A caller tracking its own WaitGroup must register it before calling and
 // release it in onDone (and, on a returned error, itself — nothing launched).
 func (m *memoryOrderDispatcher) launchResolvedDispatch(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath string, vars, execEnv map[string]string, onDone func()) (orders.OrderRun, error) {
-	trackingRun, err := m.orderFrontDoorFor(store).CreateRun(a.ScopedName(), orders.RunOpts{})
+	return m.launchResolvedDispatchWithOpts(ctx, store, target, a, cityPath, vars, execEnv, onDone, orders.RunOpts{})
+}
+
+// launchResolvedDispatchWithOpts is the same native fire path as
+// launchResolvedDispatch, with optional durable external-delivery correlation
+// metadata for the webhook entry point.
+func (m *memoryOrderDispatcher) launchResolvedDispatchWithOpts(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath string, vars, execEnv map[string]string, onDone func(), opts orders.RunOpts) (orders.OrderRun, error) {
+	trackingRun, err := m.orderFrontDoorFor(store).CreateRun(a.ScopedName(), opts)
 	if err != nil {
 		return orders.OrderRun{}, err
 	}

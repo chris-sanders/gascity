@@ -51,6 +51,9 @@ type DispatchRequest struct {
 	ExecEnv map[string]string
 	// Source records what triggered this dispatch.
 	Source Source
+	// ExternalDeliveryID is the durable provider-neutral correlation key for a
+	// webhook delivery. Empty for tick and manual dispatches.
+	ExternalDeliveryID string
 }
 
 // DispatchResult reports the outcome of routing a request through the seam.
@@ -65,6 +68,9 @@ type DispatchResult struct {
 	Rejected bool
 	// Reason explains a rejection (empty on success).
 	Reason string
+	// Reused is true when a retry found the already-created native order run
+	// associated with ExternalDeliveryID. No second workflow was launched.
+	Reused bool
 }
 
 // Dispatcher fires a pre-resolved order. cmd/gc implements it over the same

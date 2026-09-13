@@ -283,10 +283,11 @@ func (s *Server) dispatchWebhook(w http.ResponseWriter, r *http.Request, req web
 	}
 
 	match, matched, merr := webhookmatch.Match(webhookmatch.MatchInput{
-		EventType: vres.EventType,
-		DedupID:   vres.DedupID,
-		Identity:  vres.Identity,
-		Body:      parsed,
+		EventType:   vres.EventType,
+		DedupID:     vres.DedupID,
+		DeliveryKey: webhookDedupKeyFor(req.hook.Name, vres, body),
+		Identity:    vres.Identity,
+		Body:        parsed,
 	}, req.hook.Rules)
 	if merr != nil {
 		// Structural arg-extraction failure on a matched rule (misconfiguration).
@@ -326,7 +327,7 @@ func (s *Server) dispatchWebhook(w http.ResponseWriter, r *http.Request, req web
 	if eventDedupID == "" {
 		eventDedupID = webhookBodyHash(body)
 	}
-	dedupKey := webhookDedupKeyFor(req.hook.Name, vres, body)
+	dedupKey := match.DeliveryKey
 	if s.webhookDedup.seen(dedupKey) {
 		// Duplicate: ack 2xx so the sender stops retrying, but do NOT dispatch.
 		s.emitWebhookReceived(WebhookReceivedPayload{

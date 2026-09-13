@@ -178,10 +178,11 @@ func routeOrder(ctx context.Context, deps Deps, scope WebhookScope, match webhoo
 	// R4: raw args feed validation + formula ExpandVars; the exec-env overlay is
 	// namespaced so a payload can never shadow a controller/static env key.
 	out, err := deps.Dispatcher.Dispatch(ctx, orderdispatch.DispatchRequest{
-		Order:   a,
-		Vars:    match.Vars,
-		ExecEnv: webhookmatch.ExecEnvVars(match.Vars),
-		Source:  orderdispatch.SourceWebhook,
+		Order:              a,
+		Vars:               match.Vars,
+		ExecEnv:            webhookmatch.ExecEnvVars(match.Vars),
+		Source:             orderdispatch.SourceWebhook,
+		ExternalDeliveryID: match.DeliveryKey,
 	})
 	if err != nil {
 		return res, err

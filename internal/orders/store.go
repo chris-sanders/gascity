@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 )
 
@@ -39,6 +40,11 @@ const (
 	labelOrderRunPrefix   = "order-run:"
 	labelOrderTitlePrefix = "order:"
 	labelSeqPrefix        = "seq:"
+	// ExternalDeliveryMetadataKey records the provider-neutral identity of an
+	// authenticated webhook delivery on the native order-run bead. It is a
+	// correlation key, not a second workflow state machine: replay handling
+	// reads the existing native run and returns its id.
+	ExternalDeliveryMetadataKey = beadmeta.ExternalDeliveryMetadataKey
 
 	labelExec           = "exec"
 	labelExecFailed     = "exec-failed"
@@ -155,6 +161,9 @@ type OrderRun struct {
 	Open bool
 	// Cursor is the decoded EventCursor (max seq across the run's labels).
 	Cursor EventCursor
+	// ExternalDeliveryID is the authenticated, provider-neutral delivery key
+	// that caused this run, when the run came through the webhook dispatcher.
+	ExternalDeliveryID string
 }
 
 // State returns the feed-facing lifecycle status of the run: "failed" when the
@@ -178,6 +187,9 @@ type RunOpts struct {
 	// the trigger-env-failed pre-dispatch path which creates an already-labeled
 	// open bead so the open-work gate suppresses repeat ticks.
 	Outcome RunOutcome
+	// ExternalDeliveryID correlates a webhook delivery with the native tracking
+	// bead so a retry after controller restart reuses the same run.
+	ExternalDeliveryID string
 }
 
 // Store is the order-class domain wrapper. It holds the strongly-typed
@@ -285,21 +297,61 @@ func baseLabels(scoped string, outcome RunOutcome) []string {
 // {order-run, order-tracking[, outcome]}, NoHistory:true}) sites in
 // order_dispatch.go.
 func (s *Store) CreateRun(scoped string, opts RunOpts) (OrderRun, error) {
+	metadata := map[string]string(nil)
+	if deliveryID := strings.TrimSpace(opts.ExternalDeliveryID); deliveryID != "" {
+		metadata = map[string]string{ExternalDeliveryMetadataKey: deliveryID}
+	}
 	created, err := s.store.Create(beads.Bead{
 		Title:     trackingTitle(scoped),
 		Labels:    baseLabels(scoped, opts.Outcome),
+		Metadata:  metadata,
 		NoHistory: true,
 	})
 	if err != nil {
 		return OrderRun{}, fmt.Errorf("creating order run for %q: %w", scoped, err)
 	}
 	return OrderRun{
-		ID:        created.ID,
-		Scoped:    scoped,
-		Outcome:   opts.Outcome,
-		CreatedAt: created.CreatedAt,
-		Open:      true,
+		ID:                 created.ID,
+		Scoped:             scoped,
+		Outcome:            opts.Outcome,
+		CreatedAt:          created.CreatedAt,
+		Open:               true,
+		ExternalDeliveryID: strings.TrimSpace(opts.ExternalDeliveryID),
 	}, nil
+}
+
+// FindRunByExternalDelivery returns the native order run already correlated
+// with deliveryID. It includes closed records because controller restart may
+// have swept an interrupted run before the provider retry arrives. A duplicate
+// correlation is treated as an error rather than guessed at, so a damaged
+// ledger cannot launch an ambiguous second workflow.
+func (s *Store) FindRunByExternalDelivery(scoped, deliveryID string) (OrderRun, bool, error) {
+	if s.store.Store == nil {
+		return OrderRun{}, false, fmt.Errorf("finding external delivery %q: nil store", deliveryID)
+	}
+	deliveryID = strings.TrimSpace(deliveryID)
+	if deliveryID == "" {
+		return OrderRun{}, false, nil
+	}
+	rows, err := s.store.List(beads.ListQuery{
+		Label:         labelOrderRunPrefix + scoped,
+		Metadata:      map[string]string{ExternalDeliveryMetadataKey: deliveryID},
+		IncludeClosed: true,
+		Sort:          beads.SortCreatedDesc,
+		TierMode:      beads.TierBoth,
+		Limit:         2,
+	})
+	if err != nil {
+		return OrderRun{}, false, fmt.Errorf("finding external delivery %q for %q: %w", deliveryID, scoped, err)
+	}
+	if len(rows) == 0 {
+		return OrderRun{}, false, nil
+	}
+	if len(rows) > 1 {
+		return OrderRun{}, false, fmt.Errorf("external delivery %q for %q has %d native runs", deliveryID, scoped, len(rows))
+	}
+	run := decodeRun(scoped, rows[0])
+	return run, true, nil
 }
 
 // SetOutcome stamps the outcome label set on an existing tracking bead. It is
@@ -499,13 +551,14 @@ func RunFromTrackingBead(b beads.Bead) (OrderRun, bool) {
 // outcome (from labels), and event cursor (max seq from labels) are decoded here.
 func decodeRun(scoped string, b beads.Bead) OrderRun {
 	return OrderRun{
-		ID:        b.ID,
-		Scoped:    scoped,
-		Outcome:   outcomeFromLabels(b.Labels),
-		CreatedAt: b.CreatedAt,
-		UpdatedAt: b.UpdatedAt,
-		Open:      b.Status != "closed",
-		Cursor:    EventCursor(MaxSeqFromLabels([][]string{b.Labels})),
+		ID:                 b.ID,
+		Scoped:             scoped,
+		Outcome:            outcomeFromLabels(b.Labels),
+		CreatedAt:          b.CreatedAt,
+		UpdatedAt:          b.UpdatedAt,
+		Open:               b.Status != "closed",
+		Cursor:             EventCursor(MaxSeqFromLabels([][]string{b.Labels})),
+		ExternalDeliveryID: strings.TrimSpace(b.Metadata[ExternalDeliveryMetadataKey]),
 	}
 }
 

@@ -61,6 +61,58 @@ func TestCreateRunWithTriggerEnvFailedOutcome(t *testing.T) {
 	}
 }
 
+// TestExternalDeliveryCorrelationSurvivesClosedRun proves the delivery key is
+// stored on the native tracking bead and remains discoverable after the run is
+// closed, which is the restart/retry case the process-local webhook cache
+// cannot cover.
+func TestExternalDeliveryCorrelationSurvivesClosedRun(t *testing.T) {
+	st, rec := recordingOrdersStore()
+	const delivery = "github\x00sha256:delivery"
+
+	run, err := st.CreateRun("rig/agent", RunOpts{ExternalDeliveryID: delivery})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	created := rec.CallsForOp("Create")
+	if got := created[0].Bead.Metadata[ExternalDeliveryMetadataKey]; got != delivery {
+		t.Fatalf("stored delivery metadata = %q, want %q", got, delivery)
+	}
+	if err := st.CloseRun(run.ID, "dispatch completed with durable result"); err != nil {
+		t.Fatalf("CloseRun: %v", err)
+	}
+
+	got, found, err := st.FindRunByExternalDelivery("rig/agent", delivery)
+	if err != nil {
+		t.Fatalf("FindRunByExternalDelivery: %v", err)
+	}
+	if !found || got.ID != run.ID || got.Open || got.ExternalDeliveryID != delivery {
+		t.Fatalf("found = %v, run = %+v; want closed original run", found, got)
+	}
+
+	if _, found, err := st.FindRunByExternalDelivery("rig/agent", "missing"); err != nil || found {
+		t.Fatalf("missing delivery lookup = found %v err %v, want false/nil", found, err)
+	}
+}
+
+// TestExternalDeliveryCorrelationFailsClosedOnDuplicateRows prevents a
+// damaged ledger from being resolved by guessing which native run to reuse.
+func TestExternalDeliveryCorrelationFailsClosedOnDuplicateRows(t *testing.T) {
+	st, _ := recordingOrdersStore()
+	const delivery = "gitea\x00sha256:delivery"
+	for i := 0; i < 2; i++ {
+		if _, err := st.store.Create(beads.Bead{
+			Title:    "order:rig/agent",
+			Labels:   []string{"order-run:rig/agent", "order-tracking"},
+			Metadata: map[string]string{ExternalDeliveryMetadataKey: delivery},
+		}); err != nil {
+			t.Fatalf("seed run %d: %v", i, err)
+		}
+	}
+	if _, found, err := st.FindRunByExternalDelivery("rig/agent", delivery); err == nil || found {
+		t.Fatalf("duplicate lookup = found %v err %v, want fail closed", found, err)
+	}
+}
+
 // TestSetOutcomeLabelSets proves each outcome maps to the exact label set the
 // dispatcher stamps via store.Update.
 func TestSetOutcomeLabelSets(t *testing.T) {

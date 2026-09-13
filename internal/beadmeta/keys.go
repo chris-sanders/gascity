@@ -140,6 +140,7 @@ const (
 	ExclusiveDrainReservationMetadataKey = "gc.exclusive_drain_reservation"
 	ExecutionRigContextMetadataKey       = "gc.execution_rig_context"
 	ExecutionRoutedToMetadataKey         = "gc.execution_routed_to"
+	ExternalDeliveryMetadataKey          = "gc.order.external_delivery"
 	ExitCodeMetadataKey                  = "gc.exit_code"
 	FailedAttemptMetadataKey             = "gc.failed_attempt"
 	FailureClassMetadataKey              = "gc.failure_class"
@@ -447,6 +448,7 @@ var KnownMetadataKeys = []string{
 	ExclusiveDrainReservationMetadataKey,
 	ExecutionRigContextMetadataKey,
 	ExecutionRoutedToMetadataKey,
+	ExternalDeliveryMetadataKey,
 	ExitCodeMetadataKey,
 	FailedAttemptMetadataKey,
 	FailureClassMetadataKey,

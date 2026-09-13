@@ -71,6 +71,22 @@ func TestMatch_GitHubPROpened(t *testing.T) {
 	}
 }
 
+func TestMatch_CarriesDurableDeliveryKey(t *testing.T) {
+	const key = "github\x00sha256:delivery"
+	res, ok, err := Match(MatchInput{
+		EventType:   "pull_request",
+		DedupID:     "provider-delivery",
+		DeliveryKey: key,
+		Body:        mustParse(t, githubPROpened),
+	}, []config.WebhookRule{githubPRRule()})
+	if err != nil || !ok {
+		t.Fatalf("Match ok=%v err=%v, want match", ok, err)
+	}
+	if res.DeliveryKey != key {
+		t.Fatalf("DeliveryKey = %q, want %q", res.DeliveryKey, key)
+	}
+}
+
 // A delivery whose event matches but a Match entry fails does not match.
 func TestMatch_EventMatchesButPredicateFails(t *testing.T) {
 	rule := config.WebhookRule{
