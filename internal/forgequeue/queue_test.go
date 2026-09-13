@@ -387,6 +387,27 @@ func TestRecoveryBeforeLaunchIntentRelaunchesRecoverableWorkOnce(t *testing.T) {
 	}
 }
 
+func TestLauncherFailurePersistsBlockedMachineState(t *testing.T) {
+	forge := &fakeForge{issue: identifiedIssue(StateQueued), labels: allQueueLabels()}
+	launcher := &fakeLauncher{err: errors.New("launcher unavailable")}
+	q := testQueue(t, forge, launcher, 4)
+
+	result, err := q.PollOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != "blocked" || result.Reason != "launcher_failed" {
+		t.Fatalf("launcher failure result = %#v, want blocked launcher_failed", result)
+	}
+	recovered, err := q.readState(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.State != StateBlocked || recovered.LastError != "launcher_failed" || recovered.LaunchStatus != "failed" {
+		t.Fatalf("launcher failure state = %#v, want blocked machine-readable failure", recovered)
+	}
+}
+
 func TestNeedsHumanResumeSurvivesStateLossAndResumesExactlyOnce(t *testing.T) {
 	forge := &fakeForge{issue: identifiedIssue(StateQueued), labels: allQueueLabels()}
 	launcher := &fakeLauncher{}

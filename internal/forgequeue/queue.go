@@ -270,6 +270,7 @@ func (q *Queue) launch(ctx context.Context, issue Issue, state itemState, respon
 	}
 	result, err := q.Launcher.Launch(ctx, WorkItem{Forge: q.Config.Forge, Repository: q.Config.Repository, GiteaBaseURL: q.Config.GiteaBaseURL, Issue: issue, TargetBranch: q.Config.TargetBranch, ClaimID: state.ClaimID, HumanCycle: state.HumanCycle, ResponseCommentID: responseID, ResponseCommentBody: responseBody})
 	if err != nil {
+		state.State = StateBlocked
 		state.LaunchStatus = "failed"
 		state.LastError = "launcher_failed"
 		_ = q.writeState(state)
