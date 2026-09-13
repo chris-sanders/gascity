@@ -535,13 +535,18 @@ func (p *Provider) waitForReadyPrompt(ctx context.Context, name string, cfg runt
 		}
 		content, err := p.carrier().Peek(ctx, name, 120)
 		if err == nil {
-			if readyPromptVisible(content, prefix) {
-				return nil
-			}
 			if runtime.ShouldAcceptStartupDialogs(cfg) {
 				if err := p.acceptStartupDialogsWithTimeout(ctx, name, startupDialogProbeTimeout); err != nil {
 					lastErr = err
 				}
+			}
+			// A provider can render its normal composer and then overlay a
+			// first-run dialog when the first interaction starts. Probe dialogs
+			// before treating the readiness marker as sufficient; otherwise the
+			// marker in the dialog's own option row makes us return and send the
+			// startup nudge into the blocked pane.
+			if readyPromptVisible(content, prefix) {
+				return nil
 			}
 		} else {
 			lastErr = err
