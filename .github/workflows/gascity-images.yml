@@ -55,6 +55,15 @@ jobs:
           echo "BASE=ghcr.io/chris-sanders/gascity-runtime-base" >> "$GITHUB_ENV"
           echo "AGENT=ghcr.io/chris-sanders/gascity-runtime-agent" >> "$GITHUB_ENV"
           echo "CONTROLLER=ghcr.io/chris-sanders/gascity-runtime-controller" >> "$GITHUB_ENV"
+      - name: Project build-control-only image helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 https://github.com/chris-sanders/gascity.git "$GITHUB_SHA"
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git show "$GITHUB_SHA:contrib/k8s/codex-compat.sh" > contrib/k8s/codex-compat.sh
+          git show "$GITHUB_SHA:contrib/k8s/test-codex-compat.sh" > contrib/k8s/test-codex-compat.sh
+          chmod +x contrib/k8s/codex-compat.sh contrib/k8s/test-codex-compat.sh
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with: {go-version-file: go.mod, cache: true}
       - name: Prove source-level runtime contracts
