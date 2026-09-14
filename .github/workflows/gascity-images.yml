@@ -1,9 +1,16 @@
 name: Gas City public runtime images
-run-name: Gas City Stage 14 images ${{ inputs.source_sha }} from ${{ inputs.upstream_base_sha }} (${{ inputs.run_nonce }})
+run-name: Gas City Stage 14 ${{ inputs.source_class }} images ${{ inputs.source_sha }} from ${{ inputs.upstream_base_sha }} (${{ inputs.run_nonce }})
 
 on:
   workflow_dispatch:
     inputs:
+      source_class:
+        description: Source role being proven (upstream-topic or integration-control)
+        required: true
+        type: choice
+        options:
+          - upstream-topic
+          - integration-control
       source_sha:
         description: Exact public fork commit to build
         required: true
@@ -31,6 +38,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
+      SOURCE_CLASS: ${{ inputs.source_class }}
       UPSTREAM_BASE_SHA: ${{ inputs.upstream_base_sha }}
       SOURCE_SHA: ${{ inputs.source_sha }}
       PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
@@ -46,11 +54,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$SOURCE_CLASS" == upstream-topic || "$SOURCE_CLASS" == integration-control ]]
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$UPSTREAM_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$PLATFORM" == linux/amd64 ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          git merge-base --is-ancestor "$UPSTREAM_BASE_SHA" HEAD
+          if [[ "$SOURCE_CLASS" == upstream-topic ]]; then
+            git merge-base --is-ancestor "$UPSTREAM_BASE_SHA" HEAD
+          else
+            test "$SOURCE_SHA" = "7efc0ff24d70aa8e6b15f8cccb9cd8233cb23132"
+            test "$UPSTREAM_BASE_SHA" = "af596339dacee2ac472b041fec546b15f2665e33"
+          fi
           echo "TAG=stage14-${SOURCE_SHA:0:12}-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
           echo "BASE=ghcr.io/chris-sanders/gascity-runtime-base" >> "$GITHUB_ENV"
           echo "AGENT=ghcr.io/chris-sanders/gascity-runtime-agent" >> "$GITHUB_ENV"
@@ -97,6 +111,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/chris-sanders/gascity
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            io.gascity.source.class=${{ env.SOURCE_CLASS }}
             io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
       - name: Build and publish Codex agent
         id: agent
@@ -111,6 +126,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/chris-sanders/gascity
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            io.gascity.source.class=${{ env.SOURCE_CLASS }}
             io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
             io.gascity.codex.version=${{ env.CODEX_VERSION }}
             io.gascity.codex.tarball.sha512=${{ env.CODEX_TARBALL_SHA512 }}
@@ -127,6 +143,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/chris-sanders/gascity
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            io.gascity.source.class=${{ env.SOURCE_CLASS }}
             io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
       - name: Probe immutable images as non-root
         env:
@@ -171,7 +188,7 @@ jobs:
           AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
           CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
         run: |
-          jq -n --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg control_ref "$GITHUB_REF_NAME" --arg control_sha "$GITHUB_SHA" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),workflow_control_ref:$control_ref,workflow_control_sha:$control_sha,platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
+          jq -n --arg source_class "$SOURCE_CLASS" --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg control_ref "$GITHUB_REF_NAME" --arg control_sha "$GITHUB_SHA" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_class:$source_class,source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),workflow_control_ref:$control_ref,workflow_control_sha:$control_sha,platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gascity-images-${{ inputs.run_nonce || github.run_id }}
