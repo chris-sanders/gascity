@@ -55,12 +55,15 @@ jobs:
           echo "BASE=ghcr.io/chris-sanders/gascity-runtime-base" >> "$GITHUB_ENV"
           echo "AGENT=ghcr.io/chris-sanders/gascity-runtime-agent" >> "$GITHUB_ENV"
           echo "CONTROLLER=ghcr.io/chris-sanders/gascity-runtime-controller" >> "$GITHUB_ENV"
-      - name: Project build-control-only image helpers
+      - name: Project build-control image packaging
         shell: bash
         run: |
           set -euo pipefail
           git fetch --no-tags --depth=1 https://github.com/chris-sanders/gascity.git "$GITHUB_SHA"
           test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git show "$GITHUB_SHA:contrib/k8s/Dockerfile.base" > contrib/k8s/Dockerfile.base
+          git show "$GITHUB_SHA:contrib/k8s/Dockerfile.agent" > contrib/k8s/Dockerfile.agent
+          git show "$GITHUB_SHA:contrib/k8s/Dockerfile.controller" > contrib/k8s/Dockerfile.controller
           git show "$GITHUB_SHA:contrib/k8s/codex-compat.sh" > contrib/k8s/codex-compat.sh
           git show "$GITHUB_SHA:contrib/k8s/test-codex-compat.sh" > contrib/k8s/test-codex-compat.sh
           chmod +x contrib/k8s/codex-compat.sh contrib/k8s/test-codex-compat.sh
