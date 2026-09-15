@@ -17,11 +17,17 @@ ARG CODEX_PLATFORM_PACKAGE=linux-x64
 ARG CODEX_TARGET_TRIPLE=x86_64-unknown-linux-musl
 COPY contrib/k8s/codex-compat.sh /tmp/codex-compat.sh
 RUN set -eux; codex_dir="/opt/codex-${CODEX_VERSION}"; mkdir -p "$codex_dir"; \
-    curl -fsSL --retry 3 "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_VERSION}-${CODEX_PLATFORM_PACKAGE}.tgz" -o /tmp/codex.tgz; \
-    echo "${CODEX_TARBALL_SHA512}  /tmp/codex.tgz" | sha512sum --check --strict; \
-    tar -xzf /tmp/codex.tgz --strip-components=1 -C "$codex_dir"; \
-    test -x "$codex_dir/vendor/${CODEX_TARGET_TRIPLE}/bin/codex"; \
-    mkdir -p /usr/local/libexec; ln -s "$codex_dir/vendor/${CODEX_TARGET_TRIPLE}/bin/codex" /usr/local/libexec/gascity-codex-native; \
+    native=/usr/local/libexec/gascity-codex-native; \
+    if [ -e "$native" ] || [ -L "$native" ]; then \
+      test -x "$native"; \
+      test "$("$native" --version)" = "codex-cli ${CODEX_VERSION}"; \
+    else \
+      curl -fsSL --retry 3 "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_VERSION}-${CODEX_PLATFORM_PACKAGE}.tgz" -o /tmp/codex.tgz; \
+      echo "${CODEX_TARBALL_SHA512}  /tmp/codex.tgz" | sha512sum --check --strict; \
+      tar -xzf /tmp/codex.tgz --strip-components=1 -C "$codex_dir"; \
+      test -x "$codex_dir/vendor/${CODEX_TARGET_TRIPLE}/bin/codex"; \
+      mkdir -p /usr/local/libexec; ln -s "$codex_dir/vendor/${CODEX_TARGET_TRIPLE}/bin/codex" "$native"; \
+    fi; \
     install -m 0755 /tmp/codex-compat.sh /usr/local/bin/codex; \
     test "$(/usr/local/bin/codex --version)" = "codex-cli ${CODEX_VERSION}"; rm -f /tmp/codex.tgz /tmp/codex-compat.sh
 LABEL io.gascity.codex.version="${CODEX_VERSION}" \
