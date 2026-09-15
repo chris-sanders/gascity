@@ -36,3 +36,7 @@ LABEL io.gascity.codex.version="${CODEX_VERSION}" \
       io.gascity.stage14.packaging="additive-agent-layer"
 
 ENV CODEX_MANAGED_PACKAGE_ROOT=/opt/codex-${CODEX_VERSION}
+
+# Preserve the source-owned agent runtime identity after the additive root
+# installation layer completes.
+USER gcagent
