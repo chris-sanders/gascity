@@ -69,18 +69,19 @@ jobs:
           echo "BASE=ghcr.io/chris-sanders/gascity-runtime-base" >> "$GITHUB_ENV"
           echo "AGENT=ghcr.io/chris-sanders/gascity-runtime-agent" >> "$GITHUB_ENV"
           echo "CONTROLLER=ghcr.io/chris-sanders/gascity-runtime-controller" >> "$GITHUB_ENV"
-      - name: Project build-control image packaging
+      - name: Fetch additive build-control packaging
         shell: bash
         run: |
           set -euo pipefail
           git fetch --no-tags --depth=1 https://github.com/chris-sanders/gascity.git "$GITHUB_SHA"
           test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
-          git show "$GITHUB_SHA:contrib/k8s/Dockerfile.base" > contrib/k8s/Dockerfile.base
-          git show "$GITHUB_SHA:contrib/k8s/Dockerfile.agent" > contrib/k8s/Dockerfile.agent
-          git show "$GITHUB_SHA:contrib/k8s/Dockerfile.controller" > contrib/k8s/Dockerfile.controller
+          git show "$GITHUB_SHA:contrib/k8s/Dockerfile.stage14-agent" > contrib/k8s/Dockerfile.stage14-agent
           git show "$GITHUB_SHA:contrib/k8s/codex-compat.sh" > contrib/k8s/codex-compat.sh
           git show "$GITHUB_SHA:contrib/k8s/test-codex-compat.sh" > contrib/k8s/test-codex-compat.sh
-          chmod +x contrib/k8s/codex-compat.sh contrib/k8s/test-codex-compat.sh
+          git show "$GITHUB_SHA:contrib/k8s/verify-source-dependency-contract.sh" > contrib/k8s/verify-source-dependency-contract.sh
+          git show "$GITHUB_SHA:contrib/k8s/test-source-dependency-contract.sh" > contrib/k8s/test-source-dependency-contract.sh
+          chmod +x contrib/k8s/codex-compat.sh contrib/k8s/test-codex-compat.sh \
+            contrib/k8s/verify-source-dependency-contract.sh contrib/k8s/test-source-dependency-contract.sh
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with: {go-version-file: go.mod, cache: true}
       - name: Prove source-level runtime contracts
@@ -89,6 +90,12 @@ jobs:
           go test ./internal/runtime/k8s -run '^Test(BuildPodEnvRemapsVars|BuildPod_ProjectsConfiguredSecretReferences|ParseSecretProjectionsEnv)' -count=1
           chmod +x contrib/k8s/codex-compat.sh contrib/k8s/test-codex-compat.sh
           contrib/k8s/test-codex-compat.sh
+          contrib/k8s/test-source-dependency-contract.sh
+          contrib/k8s/verify-source-dependency-contract.sh \
+            --source-class "$SOURCE_CLASS" \
+            --source-sha "$SOURCE_SHA" \
+            --upstream-base-sha "$UPSTREAM_BASE_SHA" \
+            --output source-dependency-evidence.json
           . ./deps.env
           BR_INSTALL_BIN_DIR="$PWD" .github/scripts/install-br-archive.sh "$BR_VERSION"
           CGO_ENABLED=0 go build -buildvcs=false -trimpath -o gc ./cmd/gc
@@ -113,16 +120,32 @@ jobs:
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
             io.gascity.source.class=${{ env.SOURCE_CLASS }}
             io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
-      - name: Build and publish Codex agent
-        id: agent
+      - name: Build and publish source-owned agent
+        id: source_agent
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: contrib/k8s/Dockerfile.agent
           platforms: ${{ env.PLATFORM }}
           push: true
-          tags: ${{ env.AGENT }}:${{ env.TAG }}
+          tags: ${{ env.AGENT }}:source-${{ env.TAG }}
           build-args: BASE_IMAGE=${{ env.BASE }}@${{ steps.base.outputs.digest }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/chris-sanders/gascity
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            io.gascity.source.class=${{ env.SOURCE_CLASS }}
+            io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
+            io.gascity.packaging=source-owned-runtime
+      - name: Add Stage 14 Codex provider layer
+        id: agent
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: contrib/k8s/Dockerfile.stage14-agent
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: ${{ env.AGENT }}:${{ env.TAG }}
+          build-args: BASE_IMAGE=${{ env.AGENT }}:source-${{ env.TAG }}@${{ steps.source_agent.outputs.digest }}
           labels: |
             org.opencontainers.image.source=https://github.com/chris-sanders/gascity
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
@@ -130,6 +153,7 @@ jobs:
             io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
             io.gascity.codex.version=${{ env.CODEX_VERSION }}
             io.gascity.codex.tarball.sha512=${{ env.CODEX_TARBALL_SHA512 }}
+            io.gascity.packaging=source-owned-runtime-plus-stage14-additive
       - name: Build and publish controller
         id: controller
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
@@ -145,6 +169,7 @@ jobs:
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
             io.gascity.source.class=${{ env.SOURCE_CLASS }}
             io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
+            io.gascity.packaging=source-owned-controller-plus-stage14-agent
       - name: Probe immutable images as non-root
         env:
           BASE_DIGEST: ${{ steps.base.outputs.digest }}
@@ -188,9 +213,11 @@ jobs:
           AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
           CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
         run: |
-          jq -n --arg source_class "$SOURCE_CLASS" --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg control_ref "$GITHUB_REF_NAME" --arg control_sha "$GITHUB_SHA" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_class:$source_class,source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),workflow_control_ref:$control_ref,workflow_control_sha:$control_sha,platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
+          jq -n --slurpfile dependency source-dependency-evidence.json --arg source_class "$SOURCE_CLASS" --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg control_ref "$GITHUB_REF_NAME" --arg control_sha "$GITHUB_SHA" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_class:$source_class,source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),workflow_control_ref:$control_ref,workflow_control_sha:$control_sha,platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},source_dependency_contract:$dependency[0],probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gascity-images-${{ inputs.run_nonce || github.run_id }}
-          path: image-evidence.json
+          path: |
+            image-evidence.json
+            source-dependency-evidence.json
           if-no-files-found: error
