@@ -184,6 +184,11 @@ jobs:
           CGO_ENABLED=0 go build -o gc ./cmd/gc
           cp -f "$bin_dir/bd" bd
           cp -f "$bin_dir/br" br
+          source contrib/k8s/codex-runtime/version.env
+          test "$(wc -l < contrib/k8s/codex-runtime/version.env)" -eq 1
+          [[ "$CODEX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          chmod 0755 contrib/k8s/install-codex-standalone.sh contrib/k8s/test-codex-runtime.sh
+          echo "CODEX_VERSION=$CODEX_VERSION" >> "$GITHUB_ENV"
 
       - name: Build local images
         run: |
@@ -194,18 +199,15 @@ jobs:
             --build-arg DOLT_VERSION="$DOLT_VERSION" \
             -t "gc-agent-base:${IMAGE_TAG}" \
             .
-          docker tag "gc-agent-base:${IMAGE_TAG}" gc-agent-base:latest
-
           docker build \
             -f contrib/k8s/Dockerfile.agent \
-            --build-arg BASE_IMAGE=gc-agent-base:latest \
+            --build-arg BASE_IMAGE="gc-agent-base:${IMAGE_TAG}" \
             -t "gc-agent:${IMAGE_TAG}" \
             .
-          docker tag "gc-agent:${IMAGE_TAG}" gc-agent:latest
 
           docker build \
             -f contrib/k8s/Dockerfile.controller \
-            --build-arg BASE=gc-agent:latest \
+            --build-arg BASE="gc-agent:${IMAGE_TAG}" \
             -t "gc-controller:${IMAGE_TAG}" \
             .
 
@@ -213,6 +215,8 @@ jobs:
             -f contrib/k8s/Dockerfile.mail \
             -t "gc-mcp-mail:${IMAGE_TAG}" \
             .
+
+          contrib/k8s/test-codex-runtime.sh "gc-agent:${IMAGE_TAG}"
 
       - name: Generate image SARIF and SBOMs
         run: |

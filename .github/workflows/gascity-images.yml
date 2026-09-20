@@ -50,24 +50,21 @@ jobs:
           echo "BASE=ghcr.io/chris-sanders/gascity-runtime-base" >> "$GITHUB_ENV"
           echo "AGENT=ghcr.io/chris-sanders/gascity-runtime-agent" >> "$GITHUB_ENV"
           echo "CONTROLLER=ghcr.io/chris-sanders/gascity-runtime-controller" >> "$GITHUB_ENV"
-      - name: Resolve locked Codex runtime
+      - name: Resolve exact standalone Codex runtime
         shell: bash
         run: |
           set -euo pipefail
-          node <<'NODE'
-          const fs = require('fs');
-          const lock = JSON.parse(fs.readFileSync('contrib/k8s/codex-runtime/package-lock.json', 'utf8'));
-          const root = lock.packages?.['']?.dependencies?.['@openai/codex'];
-          const codex = lock.packages?.['node_modules/@openai/codex']?.version;
-          const linux = lock.packages?.['node_modules/@openai/codex-linux-x64']?.version;
-          if (root !== '0.155.1' || codex !== '0.155.1' || linux !== '0.155.1-linux-x64') {
-            throw new Error(`unexpected Codex lock: root=${root} codex=${codex} linux=${linux}`);
-          }
-          if (codex.includes('-alpha') || codex.includes('-beta') || codex.includes('-rc')) {
-            throw new Error(`unstable Codex lock: ${codex}`);
-          }
-          fs.appendFileSync(process.env.GITHUB_ENV, `CODEX_VERSION=${codex}\n`);
-          NODE
+          source contrib/k8s/codex-runtime/version.env
+          test "$(wc -l < contrib/k8s/codex-runtime/version.env)" -eq 1
+          [[ "$CODEX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          chmod 0755 contrib/k8s/install-codex-standalone.sh contrib/k8s/test-codex-runtime.sh
+          standalone_dir="$RUNNER_TEMP/gascity-codex-standalone"
+          contrib/k8s/install-codex-standalone.sh \
+            --version "$CODEX_VERSION" \
+            --target x86_64-unknown-linux-musl \
+            --destination "$standalone_dir"
+          test "$("$standalone_dir/bin/codex" --version)" = "codex-cli $CODEX_VERSION"
+          echo "CODEX_VERSION=$CODEX_VERSION" >> "$GITHUB_ENV"
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with: {go-version-file: go.mod, cache: true}
       - name: Prove source-level runtime contracts
@@ -144,6 +141,7 @@ jobs:
           test "$(docker run --rm --entrypoint codex "$agent" --version)" = "codex-cli $CODEX_VERSION"
           docker run --rm --entrypoint codex "$agent" exec --sandbox read-only --ask-for-approval untrusted --help >/dev/null
           docker run --rm --entrypoint /bin/sh "$agent" -c 'test "$(id -u)" = 1000; test "$(id -g)" = 1000; test ! -e "$HOME/.codex/auth.json"; test -w /workspace'
+          contrib/k8s/test-codex-runtime.sh "$agent"
       - name: Prove anonymous exact-digest manifest access
         env:
           BASE_DIGEST: ${{ steps.base.outputs.digest }}
@@ -171,7 +169,7 @@ jobs:
           AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
           CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
         run: |
-          jq -n --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
+          jq -n --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,codex_standalone:true,codex_app_server_api_key:true,no_node_npm:true,non_root:true}}' | tee image-evidence.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gascity-images-${{ inputs.run_nonce || github.run_id }}

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import tempfile
 
 
 NPM_PACKAGE_BY_PROVIDER = {
-    "codex": ("@openai/codex", "CODEX_CLI_VERSION", None),
     "gemini": ("@google/gemini-cli", "GEMINI_CLI_VERSION", "0.40.0"),
     "mimocode": ("@mimo-ai/cli", "MIMOCODE_CLI_VERSION", "0.1.0"),
     "opencode": ("opencode-ai", "OPENCODE_CLI_VERSION", "1.14.33"),
@@ -29,17 +29,62 @@ CLAUDE_CODE_VERSION = "2.1.123"
 KIMI_CLI_VERSION = "1.42.0"
 PI_OLLAMA_CLOUD_VERSION = "0.4.1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+CODEX_VERSION_FILE = REPO_ROOT / "contrib" / "k8s" / "codex-runtime" / "version.env"
+CODEX_STANDALONE_INSTALLER = REPO_ROOT / "contrib" / "k8s" / "install-codex-standalone.sh"
+CODEX_TARGET = "x86_64-unknown-linux-musl"
 
 
 def codex_default_version() -> str:
-    manifest = REPO_ROOT / "contrib" / "k8s" / "codex-runtime" / "package.json"
     try:
-        value = json.loads(manifest.read_text(encoding="utf-8")).get("dependencies", {}).get("@openai/codex")
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"could not read canonical Codex runtime manifest: {manifest}") from exc
-    if not isinstance(value, str) or not value or value.startswith(("^", "~")):
-        raise SystemExit(f"canonical Codex runtime manifest has no exact @openai/codex version: {manifest}")
+        lines = CODEX_VERSION_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise SystemExit(f"could not read canonical Codex version file: {CODEX_VERSION_FILE}") from exc
+    if len(lines) != 1 or not re.fullmatch(r"CODEX_VERSION=[0-9]+\.[0-9]+\.[0-9]+", lines[0]):
+        raise SystemExit(f"canonical Codex version file is not exactly one stable version input: {CODEX_VERSION_FILE}")
+    value = lines[0].split("=", 1)[1]
     return value
+
+
+def install_codex_standalone(version: str, force: bool) -> int:
+    root = Path(os.environ.get("CODEX_STANDALONE_ROOT", Path.home() / ".local" / "share" / "gascity-codex"))
+    destination = root / version
+    native = destination / "bin" / "codex"
+    bin_dir = Path(os.environ.get("CODEX_STANDALONE_BIN_DIR", Path.home() / ".local" / "bin"))
+    link = bin_dir / "codex"
+
+    if not force and native.is_file() and os.access(native, os.X_OK):
+        if link.is_symlink() and link.resolve() == native.resolve():
+            print(f"codex standalone {version} already installed at {destination}; skipping install")
+            return 0
+    root.parent.mkdir(parents=True, exist_ok=True)
+    temporary_parent = Path(tempfile.mkdtemp(prefix=f".{version}.", dir=root.parent))
+    temporary = temporary_parent / "package"
+    try:
+        subprocess.run(
+            [
+                str(CODEX_STANDALONE_INSTALLER),
+                "--version", version,
+                "--target", CODEX_TARGET,
+                "--destination", str(temporary),
+            ],
+            check=True,
+        )
+        if destination.exists():
+            shutil.rmtree(destination)
+        os.replace(temporary, destination)
+    finally:
+        shutil.rmtree(temporary_parent, ignore_errors=True)
+
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if link.exists() or link.is_symlink():
+        if not force and not link.is_symlink():
+            raise SystemExit(f"{link} already exists; use --force to replace it with the standalone Codex binary")
+        link.unlink()
+    link.symlink_to(native)
+    if shutil.which("codex") is None:
+        raise SystemExit(f"{link} is not on PATH; add {bin_dir} before running Codex worker inference")
+    print(f"installed codex standalone {version} to {destination}")
+    return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,8 +130,11 @@ def main() -> int:
     if args.command != "install":
         raise SystemExit(f"unsupported command: {args.command}")
     provider = args.profile.split("/", 1)[0].strip().lower()
-    if provider not in {"claude", "cursor", "kimi", "antigravity", "zcode", *NPM_PACKAGE_BY_PROVIDER}:
+    if provider not in {"claude", "codex", "cursor", "kimi", "antigravity", "zcode", *NPM_PACKAGE_BY_PROVIDER}:
         raise SystemExit(f"unsupported worker-inference profile: {args.profile!r}")
+    if provider == "codex":
+        version = os.environ.get("CODEX_CLI_VERSION", codex_default_version())
+        return install_codex_standalone(version, args.force)
     if provider == "cursor":
         binary = BINARY_BY_PROVIDER[provider]
         if not shutil.which(binary):

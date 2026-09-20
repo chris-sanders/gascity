@@ -24,11 +24,10 @@
       "groupName": "python requirements"
     },
     {
-      "matchManagers": ["npm"],
-      "matchFileNames": ["contrib/k8s/codex-runtime/package.json"],
-      "matchPackageNames": ["@openai/codex"],
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["openai/codex"],
       "groupName": "Codex runtime",
-      "rangeStrategy": "pin",
+      "automerge": false,
       "ignoreUnstable": true
     },
     {
@@ -37,6 +36,18 @@
     }
   ],
   "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "/^contrib\\/k8s\\/codex-runtime\\/version\\.env$/"
+      ],
+      "matchStrings": [
+        "CODEX_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "openai/codex",
+      "extractVersionTemplate": "^rust-v(?<version>\\d+\\.\\d+\\.\\d+)$"
+    },
     {
       "customType": "regex",
       "fileMatch": [

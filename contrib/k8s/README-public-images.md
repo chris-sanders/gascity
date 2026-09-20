@@ -12,8 +12,10 @@ The workflow publishes credential-free images at:
 * `ghcr.io/chris-sanders/gascity-runtime-agent`
 * `ghcr.io/chris-sanders/gascity-runtime-controller`
 
-The agent pins Codex CLI `0.155.1` through the lockfile in
-`contrib/k8s/codex-runtime/`. Runtime credentials belong in deployment-local
+The agent consumes the exact OpenAI standalone Codex release named by
+`contrib/k8s/codex-runtime/version.env`. The build verifies both release
+metadata digests and `codex-package_SHA256SUMS`, then ships the complete
+standalone package layout. Runtime credentials belong in deployment-local
 Secrets and must never be added here.
 
 The Kubernetes provider accepts deployment-neutral Secret projections through

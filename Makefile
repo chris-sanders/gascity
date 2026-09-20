@@ -1028,24 +1028,24 @@ spec-ci: install-oapi-codegen
 docker-base: check-docker
 	. ./deps.env && docker build -f contrib/k8s/Dockerfile.base \
 		--build-arg DOLT_VERSION=$$DOLT_VERSION \
-		-t gc-agent-base:latest .
+		-t gc-agent-base:local .
 
 ## docker-agent: build base agent image (~5s on top of base). For prebaked images use: gc build-image
 docker-agent: check-docker
-	docker build -f contrib/k8s/Dockerfile.agent -t gc-agent:latest .
+	docker build -f contrib/k8s/Dockerfile.agent --build-arg BASE_IMAGE=gc-agent-base:local -t gc-agent:local .
 	@if kubectl config current-context 2>/dev/null | grep -q '^kind-'; then \
 		cluster=$$(kubectl config current-context | sed 's/^kind-//'); \
-		echo "Loading gc-agent:latest into kind cluster '$$cluster'..."; \
-		kind load docker-image gc-agent:latest --name "$$cluster"; \
+		echo "Loading gc-agent:local into kind cluster '$$cluster'..."; \
+		kind load docker-image gc-agent:local --name "$$cluster"; \
 	fi
 
 ## docker-controller: build controller image for K8s deployment (~10s on top of agent)
 docker-controller: check-docker
-	docker build -f contrib/k8s/Dockerfile.controller -t gc-controller:latest .
+	docker build -f contrib/k8s/Dockerfile.controller --build-arg BASE=gc-agent:local -t gc-controller:local .
 	@if kubectl config current-context 2>/dev/null | grep -q '^kind-'; then \
 		cluster=$$(kubectl config current-context | sed 's/^kind-//'); \
-		echo "Loading gc-controller:latest into kind cluster '$$cluster'..."; \
-		kind load docker-image gc-controller:latest --name "$$cluster"; \
+		echo "Loading gc-controller:local into kind cluster '$$cluster'..."; \
+		kind load docker-image gc-controller:local --name "$$cluster"; \
 	fi
 
 ## k8s-secret: create K8s secret with Claude credentials

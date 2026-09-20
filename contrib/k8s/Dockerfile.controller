@@ -5,13 +5,13 @@
 #
 # Build:
 #   docker build -f contrib/k8s/Dockerfile.controller \
-#     -t gc-controller:latest .
+#     -t gc-controller:local .
 #
 # The gc-agent image must be built first:
-#   docker build -f contrib/k8s/Dockerfile.agent -t gc-agent:latest .
+#   docker build -f contrib/k8s/Dockerfile.agent -t gc-agent:local .
 
 # Local build-layer image produced by Dockerfile.agent, not a registry pull.
-ARG BASE=gc-agent:latest
+ARG BASE=gc-agent:local
 FROM ${BASE}
 
 # Controller installs to /usr/local/bin — need root.
