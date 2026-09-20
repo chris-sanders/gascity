@@ -33,8 +33,6 @@ jobs:
       UPSTREAM_BASE_SHA: 6ba434271c5f76bc150f694ebeef9d713be16b3a
       SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
       PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
-      CODEX_VERSION: 0.153.4
-      CODEX_TARBALL_SHA512: c7511cc01958dc039b33555350734cd80cc0250b32ade19d6a0a45faa162622fce6b7d15064b6fbc6d02ead2ed0b3a96ea18d93569066505a679593b32e24a5a
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -52,6 +50,24 @@ jobs:
           echo "BASE=ghcr.io/chris-sanders/gascity-runtime-base" >> "$GITHUB_ENV"
           echo "AGENT=ghcr.io/chris-sanders/gascity-runtime-agent" >> "$GITHUB_ENV"
           echo "CONTROLLER=ghcr.io/chris-sanders/gascity-runtime-controller" >> "$GITHUB_ENV"
+      - name: Resolve locked Codex runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const lock = JSON.parse(fs.readFileSync('contrib/k8s/codex-runtime/package-lock.json', 'utf8'));
+          const root = lock.packages?.['']?.dependencies?.['@openai/codex'];
+          const codex = lock.packages?.['node_modules/@openai/codex']?.version;
+          const linux = lock.packages?.['node_modules/@openai/codex-linux-x64']?.version;
+          if (root !== '0.155.1' || codex !== '0.155.1' || linux !== '0.155.1-linux-x64') {
+            throw new Error(`unexpected Codex lock: root=${root} codex=${codex} linux=${linux}`);
+          }
+          if (codex.includes('-alpha') || codex.includes('-beta') || codex.includes('-rc')) {
+            throw new Error(`unstable Codex lock: ${codex}`);
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, `CODEX_VERSION=${codex}\n`);
+          NODE
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with: {go-version-file: go.mod, cache: true}
       - name: Prove source-level runtime contracts
@@ -98,7 +114,6 @@ jobs:
             org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
             io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
             io.gascity.codex.version=${{ env.CODEX_VERSION }}
-            io.gascity.codex.tarball.sha512=${{ env.CODEX_TARBALL_SHA512 }}
       - name: Build and publish controller
         id: controller
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0

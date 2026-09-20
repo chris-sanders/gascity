@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compatibility boundary for the frozen built-in provider and Codex 0.153.4.
+# Compatibility boundary for the frozen built-in provider and Codex 0.155.1.
 set -euo pipefail
 native=/usr/local/libexec/gascity-codex-native
 if [[ "${CODEX_COMPAT_TESTING:-}" == 1 ]]; then

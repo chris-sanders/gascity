@@ -24,6 +24,14 @@
       "groupName": "python requirements"
     },
     {
+      "matchManagers": ["npm"],
+      "matchFileNames": ["contrib/k8s/codex-runtime/package.json"],
+      "matchPackageNames": ["@openai/codex"],
+      "groupName": "Codex runtime",
+      "rangeStrategy": "pin",
+      "ignoreUnstable": true
+    },
+    {
       "matchManagers": ["custom.regex"],
       "groupName": "pinned build tools"
     }
@@ -117,17 +125,6 @@
       ],
       "datasourceTemplate": "docker",
       "depNameTemplate": "alpine"
-    },
-    {
-      "customType": "regex",
-      "fileMatch": [
-        "/^scripts/worker_inference_setup\\.py$/"
-      ],
-      "matchStrings": [
-        "\"@openai/codex\",\\s*\"CODEX_CLI_VERSION\",\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
-      ],
-      "datasourceTemplate": "npm",
-      "depNameTemplate": "@openai/codex"
     },
     {
       "customType": "regex",

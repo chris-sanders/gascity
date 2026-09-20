@@ -12,8 +12,9 @@ The workflow publishes credential-free images at:
 * `ghcr.io/chris-sanders/gascity-runtime-agent`
 * `ghcr.io/chris-sanders/gascity-runtime-controller`
 
-The agent pins Codex CLI `0.153.4` and its npm archive SHA-512. Runtime
-credentials belong in deployment-local Secrets and must never be added here.
+The agent pins Codex CLI `0.155.1` through the lockfile in
+`contrib/k8s/codex-runtime/`. Runtime credentials belong in deployment-local
+Secrets and must never be added here.
 
 The Kubernetes provider accepts deployment-neutral Secret projections through
 `GC_K8S_SECRET_ENV` and `GC_K8S_SECRET_MOUNTS`. Each is a JSON array: an env

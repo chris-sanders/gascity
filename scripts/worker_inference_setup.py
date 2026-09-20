@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import os
 from pathlib import Path
 import shutil
@@ -8,7 +9,7 @@ import subprocess
 
 
 NPM_PACKAGE_BY_PROVIDER = {
-    "codex": ("@openai/codex", "CODEX_CLI_VERSION", "0.125.0"),
+    "codex": ("@openai/codex", "CODEX_CLI_VERSION", None),
     "gemini": ("@google/gemini-cli", "GEMINI_CLI_VERSION", "0.40.0"),
     "mimocode": ("@mimo-ai/cli", "MIMOCODE_CLI_VERSION", "0.1.0"),
     "opencode": ("opencode-ai", "OPENCODE_CLI_VERSION", "1.14.33"),
@@ -27,6 +28,18 @@ ZCODE_ADAPTER_RELPATH = ("internal", "worker", "adapters", "zcode", "zcode-repl"
 CLAUDE_CODE_VERSION = "2.1.123"
 KIMI_CLI_VERSION = "1.42.0"
 PI_OLLAMA_CLOUD_VERSION = "0.4.1"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def codex_default_version() -> str:
+    manifest = REPO_ROOT / "contrib" / "k8s" / "codex-runtime" / "package.json"
+    try:
+        value = json.loads(manifest.read_text(encoding="utf-8")).get("dependencies", {}).get("@openai/codex")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"could not read canonical Codex runtime manifest: {manifest}") from exc
+    if not isinstance(value, str) or not value or value.startswith(("^", "~")):
+        raise SystemExit(f"canonical Codex runtime manifest has no exact @openai/codex version: {manifest}")
+    return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,14 +111,15 @@ def main() -> int:
 
     if provider == "claude":
         version = os.environ.get("CLAUDE_CODE_VERSION", CLAUDE_CODE_VERSION)
-        repo_root = Path(__file__).resolve().parents[1]
-        installer = repo_root / ".github" / "scripts" / "install-claude-native.sh"
+        installer = REPO_ROOT / ".github" / "scripts" / "install-claude-native.sh"
         subprocess.run([str(installer), version], check=True)
     elif provider == "kimi":
         version = os.environ.get("KIMI_CLI_VERSION", KIMI_CLI_VERSION)
         subprocess.run(["uv", "tool", "install", "--python", "3.13", f"kimi-cli=={version}"], check=True)
     else:
         package, env_var, default_version = NPM_PACKAGE_BY_PROVIDER[provider]
+        if provider == "codex":
+            default_version = codex_default_version()
         version = os.environ.get(env_var, default_version)
         if not already_present or args.force:
             subprocess.run(["npm", "install", "-g", f"{package}@{version}"], check=True)
