@@ -39,7 +39,7 @@
     {
       "customType": "regex",
       "fileMatch": [
-        "/^contrib\\/k8s\\/codex-runtime\\/version\\.env$/"
+        "(^|/)contrib/k8s/codex-runtime/version\\.env$"
       ],
       "matchStrings": [
         "CODEX_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
