@@ -74,7 +74,7 @@ func TestCodexStandalonePackagingIsSingleSourceAndReusable(t *testing.T) {
 	}
 
 	renovate := readFile(t, root, "renovate.json")
-	for _, want := range []string{"codex-runtime\\\\/version", "github-releases", "openai/codex", "rust-v(?<version>"} {
+	for _, want := range []string{"codex-runtime/version", "github-releases", "openai/codex", "rust-v(?<version>"} {
 		if !strings.Contains(renovate, want) {
 			t.Errorf("Renovate Codex manager missing %q", want)
 		}
