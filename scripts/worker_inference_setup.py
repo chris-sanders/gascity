@@ -45,24 +45,26 @@ def codex_default_version() -> str:
     return value
 
 
-def install_codex_standalone(version: str, force: bool) -> int:
+def install_codex_standalone(version: str, force: bool, installer: Path | None = None) -> int:
     root = Path(os.environ.get("CODEX_STANDALONE_ROOT", Path.home() / ".local" / "share" / "gascity-codex"))
     destination = root / version
     native = destination / "bin" / "codex"
     bin_dir = Path(os.environ.get("CODEX_STANDALONE_BIN_DIR", Path.home() / ".local" / "bin"))
     link = bin_dir / "codex"
+    installer = installer or CODEX_STANDALONE_INSTALLER
 
     if not force and native.is_file() and os.access(native, os.X_OK):
         if link.is_symlink() and link.resolve() == native.resolve():
             print(f"codex standalone {version} already installed at {destination}; skipping install")
             return 0
     root.parent.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     temporary_parent = Path(tempfile.mkdtemp(prefix=f".{version}.", dir=root.parent))
     temporary = temporary_parent / "package"
     try:
         subprocess.run(
             [
-                str(CODEX_STANDALONE_INSTALLER),
+                str(installer),
                 "--version", version,
                 "--target", CODEX_TARGET,
                 "--destination", str(temporary),

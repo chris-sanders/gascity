@@ -2,16 +2,35 @@ package scripts_test
 
 import (
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
 
-func TestCodexStandalonePackagingIsSingleSourceAndReusable(t *testing.T) {
-	root := repoRoot(t)
-	version := readFile(t, root, "contrib/k8s/codex-runtime/version.env")
-	if strings.TrimSpace(version) != "CODEX_VERSION=0.155.1" {
-		t.Fatalf("version.env must contain the reviewed stable version as its only input, got %q", version)
+var codexFunctionalInputs = []string{
+	"contrib/k8s/Dockerfile.agent",
+	"contrib/k8s/install-codex-standalone.sh",
+	"contrib/k8s/test-codex-runtime.sh",
+	".github/workflows/gascity-images.yml",
+	".github/workflows/container-scan.yml",
+	"scripts/worker_inference_setup.py",
+	"renovate.json",
+}
+
+func codexVersion(t *testing.T, root string) string {
+	t.Helper()
+	content := readFile(t, root, "contrib/k8s/codex-runtime/version.env")
+	match := regexp.MustCompile(`^CODEX_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$`).FindStringSubmatch(strings.TrimSpace(content))
+	if len(match) != 2 {
+		t.Fatalf("version.env must contain exactly one stable CODEX_VERSION assignment, got %q", content)
 	}
+	return match[1]
+}
+
+func validateCodexSingleSource(t *testing.T, root string) {
+	t.Helper()
+	version := codexVersion(t, root)
 
 	for _, path := range []string{
 		"contrib/k8s/codex-runtime/package.json",
@@ -19,6 +38,12 @@ func TestCodexStandalonePackagingIsSingleSourceAndReusable(t *testing.T) {
 	} {
 		if _, err := os.Stat(root + "/" + path); !os.IsNotExist(err) {
 			t.Errorf("Codex npm artifact %s still exists", path)
+		}
+	}
+
+	for _, path := range codexFunctionalInputs {
+		if strings.Contains(readFile(t, root, path), version) {
+			t.Errorf("functional input %s contains the canonical Codex version %s", path, version)
 		}
 	}
 
@@ -57,7 +82,7 @@ func TestCodexStandalonePackagingIsSingleSourceAndReusable(t *testing.T) {
 			t.Errorf("Dockerfile.agent missing standalone contract %q", want)
 		}
 	}
-	for _, forbidden := range []string{"FROM node:", "npm ci", "package-lock", "CODEX_MANAGED_PACKAGE_ROOT", "0.155.1"} {
+	for _, forbidden := range []string{"FROM node:", "npm ci", "package-lock", "CODEX_MANAGED_PACKAGE_ROOT"} {
 		if strings.Contains(dockerfile, forbidden) {
 			t.Errorf("Dockerfile.agent retains forbidden Codex packaging input %q", forbidden)
 		}
@@ -88,8 +113,31 @@ func TestCodexStandalonePackagingIsSingleSourceAndReusable(t *testing.T) {
 		if !strings.Contains(workflow, "codex-runtime/version.env") || !strings.Contains(workflow, "test-codex-runtime.sh") {
 			t.Errorf("%s does not read version.env and reuse the real-binary contract", workflowPath)
 		}
-		if strings.Contains(workflow, "0.155.1") || strings.Contains(workflow, "package-lock") || strings.Contains(workflow, "@openai/codex") {
+		if strings.Contains(workflow, "package-lock") || strings.Contains(workflow, "@openai/codex") {
 			t.Errorf("%s contains a duplicate Codex npm/current-version authority", workflowPath)
 		}
 	}
+}
+
+func TestCodexStandalonePackagingIsSingleSourceAndReusable(t *testing.T) {
+	root := repoRoot(t)
+	validateCodexSingleSource(t, root)
+
+	// A Renovate update must be equivalent to changing only version.env. Run the
+	// same contract against a temporary fixture with a different stable value.
+	fixture := t.TempDir()
+	for _, path := range append(codexFunctionalInputs, "contrib/k8s/codex-runtime/version.env") {
+		content := readFile(t, root, path)
+		destination := filepath.Join(fixture, path)
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+			t.Fatalf("create fixture directory for %s: %v", path, err)
+		}
+		if path == "contrib/k8s/codex-runtime/version.env" {
+			content = "CODEX_VERSION=9.8.7\n"
+		}
+		if err := os.WriteFile(destination, []byte(content), 0o644); err != nil {
+			t.Fatalf("write fixture %s: %v", path, err)
+		}
+	}
+	validateCodexSingleSource(t, fixture)
 }

@@ -66,73 +66,119 @@ github_release_root="${CODEX_GITHUB_RELEASE_ROOT:-https://github.com/openai/code
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
-metadata="$tmp_dir/release.json"
-checksums="$tmp_dir/$checksums_name"
-package_archive="$tmp_dir/$package_name"
+openai_metadata="$tmp_dir/openai-release.json"
+github_metadata="$tmp_dir/github-release.json"
 
-metadata_source="openai"
-if ! curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 \
-  "${openai_release_root}/${release_version}/release.json" -o "$metadata"; then
-  metadata_source="github"
+fetch_github_metadata() {
+  local output="$1"
   curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "${github_api_root}/${expected_tag}" -o "$metadata"
-fi
+    "${github_api_root}/${expected_tag}" -o "$output"
+}
 
-metadata_tag="$(jq -r '.tag_name // empty' "$metadata")"
-# The OpenAI mirror currently serves release.json without tag_name. Its exact
-# version-addressed endpoint is still checked against GitHub's exact release
-# tag so the tag invariant remains explicit without trusting a floating ref.
-if [[ -z "$metadata_tag" && "$metadata_source" == "openai" ]]; then
-  metadata_tag="$(curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 \
-    -H 'Accept: application/vnd.github+json' \
-    -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "${github_api_root}/${expected_tag}" | jq -er '.tag_name')"
-fi
-[[ "$metadata_tag" == "$expected_tag" ]] || {
-  echo "Codex release metadata tag ${metadata_tag:-<missing>} does not equal ${expected_tag}" >&2
-  exit 1
+exact_release_tag() {
+  local metadata_path="$1" metadata_tag
+  metadata_tag="$(jq -r '.tag_name // empty' "$metadata_path")"
+  [[ "$metadata_tag" == "$expected_tag" ]] || {
+    echo "Codex release metadata tag ${metadata_tag:-<missing>} does not equal ${expected_tag}" >&2
+    return 1
+  }
 }
 
 asset_digest() {
-  local name="$1" value
+  local metadata_path="$1" name="$2" value
   value="$(jq -er --arg name "$name" \
-    '.assets[] | select(.name == $name) | .digest' "$metadata")"
+    '.assets[]? | select(.name == $name) | .digest // empty' "$metadata_path" 2>/dev/null)" || {
+    echo "Codex release metadata has no SHA-256 digest for ${name}" >&2
+    return 1
+  }
   [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]] || {
     echo "Codex release metadata has no SHA-256 digest for ${name}" >&2
-    exit 1
+    return 1
   }
   printf '%s\n' "${value#sha256:}"
 }
 
 download_and_verify() {
   local name="$1" digest="$2" url="$3" output="$4" actual
-  curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 "$url" -o "$output"
+  if ! curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 "$url" -o "$output"; then
+    echo "Codex ${name} download failed from ${url}" >&2
+    return 1
+  fi
   actual="$(sha256sum "$output" | awk '{print $1}')"
   [[ "$actual" == "$digest" ]] || {
     echo "Codex ${name} SHA-256 mismatch: got ${actual}, want ${digest}" >&2
-    exit 1
+    return 1
   }
 }
 
-package_digest="$(asset_digest "$package_name")"
-checksums_digest="$(asset_digest "$checksums_name")"
-if [[ "$metadata_source" == "openai" ]]; then
-  asset_root="${openai_release_root}/${release_version}"
-else
-  asset_root="${github_release_root}/${expected_tag}"
-fi
-download_and_verify "$checksums_name" "$checksums_digest" \
-  "${asset_root}/${checksums_name}" "$checksums"
-download_and_verify "$package_name" "$package_digest" \
-  "${asset_root}/${package_name}" "$package_archive"
+verify_release_assets() {
+  local metadata_path="$1" asset_root="$2" transaction_dir="$3"
+  local checksums="$transaction_dir/$checksums_name"
+  local package_archive="$transaction_dir/$package_name"
+  local package_digest checksums_digest
 
-# The release's own package manifest is a second independent checksum source.
-grep -F -x "${package_digest}  ${package_name}" "$checksums" >/dev/null || {
-  echo "Codex package digest is absent from ${checksums_name}" >&2
-  exit 1
+  package_digest="$(asset_digest "$metadata_path" "$package_name")" || return 1
+  checksums_digest="$(asset_digest "$metadata_path" "$checksums_name")" || return 1
+  download_and_verify "$checksums_name" "$checksums_digest" \
+    "${asset_root}/${checksums_name}" "$checksums" || return 1
+  download_and_verify "$package_name" "$package_digest" \
+    "${asset_root}/${package_name}" "$package_archive" || return 1
+
+  # The release's own package manifest is a second independent checksum source.
+  awk -v digest="$package_digest" -v name="$package_name" \
+    '$1 == digest && ($2 == name || $2 == "*" name) { found = 1 } END { exit !found }' \
+    "$checksums" || {
+      echo "Codex package digest is absent from ${checksums_name}" >&2
+      return 1
+    }
 }
+
+metadata_source=""
+transaction_dir=""
+if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 \
+  "${openai_release_root}/${release_version}/release.json" -o "$openai_metadata"; then
+  # The OpenAI mirror may omit tag_name. In that case, validate the
+  # version-addressed metadata against the exact GitHub release tag, but do
+  # not borrow any GitHub asset digest or asset bytes for this transaction.
+  openai_tag="$(jq -r '.tag_name // empty' "$openai_metadata")"
+  if [[ -n "$openai_tag" ]]; then
+    exact_release_tag "$openai_metadata" || openai_tag="invalid"
+  elif fetch_github_metadata "$github_metadata" && exact_release_tag "$github_metadata"; then
+    :
+  else
+    echo "Codex OpenAI metadata could not be tied to exact tag ${expected_tag}" >&2
+    openai_tag="invalid"
+  fi
+  if [[ "$openai_tag" != "invalid" ]]; then
+    transaction_dir="$tmp_dir/openai-assets"
+    mkdir -p "$transaction_dir"
+    if verify_release_assets "$openai_metadata" \
+      "${openai_release_root}/${release_version}" "$transaction_dir"; then
+      metadata_source="openai"
+    fi
+  fi
+fi
+
+if [[ -z "$metadata_source" ]]; then
+  # A metadata success followed by any OpenAI asset download or verification
+  # failure enters this one coherent exact-tag GitHub transaction. Its
+  # metadata, digests, and bytes cannot be mixed with the OpenAI attempt.
+  fetch_github_metadata "$github_metadata" || {
+    echo "Codex exact GitHub release metadata could not be fetched" >&2
+    exit 1
+  }
+  exact_release_tag "$github_metadata" || exit 1
+  transaction_dir="$tmp_dir/github-assets"
+  mkdir -p "$transaction_dir"
+  verify_release_assets "$github_metadata" \
+    "${github_release_root}/${expected_tag}" "$transaction_dir" || exit 1
+  metadata_source="github"
+fi
+
+checksums="$transaction_dir/$checksums_name"
+package_archive="$transaction_dir/$package_name"
 
 mkdir -p "$destination"
 tar --extract --gzip --file "$package_archive" --directory "$destination" \
