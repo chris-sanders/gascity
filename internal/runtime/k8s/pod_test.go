@@ -302,3 +302,104 @@ func TestBuildPod_InitContainerOnlyWaitsForStaging(t *testing.T) {
 		t.Errorf("init container should wait for staging; got: %s", cmd)
 	}
 }
+
+func TestBuildPod_CodexWorkerAuthIsProjectedAndSymlinked(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	p.codexAuthSecret = "codex-worker-auth"
+
+	pod, err := buildPod("test-session", runtime.Config{Command: "/bin/bash"}, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+
+	container := pod.Spec.Containers[0]
+	args := strings.Join(container.Args, " ")
+	if !strings.Contains(args, "ln -s \""+codexWorkerAuthFile+"\" \"$CODEX_HOME/auth.json\"") {
+		t.Errorf("entrypoint should symlink the projected worker auth; got: %s", args)
+	}
+	if !strings.Contains(args, "Gas City worker auth is missing") {
+		t.Errorf("entrypoint should fail clearly when worker auth is absent; got: %s", args)
+	}
+	if strings.Contains(args, "cp "+codexWorkerAuthFile) || strings.Contains(args, "cp -r "+codexWorkerAuthFile) {
+		t.Errorf("entrypoint must not copy worker auth into CODEX_HOME; got: %s", args)
+	}
+
+	var codexHomeEnv *corev1.EnvVar
+	for i := range container.Env {
+		if container.Env[i].Name == "CODEX_HOME" {
+			codexHomeEnv = &container.Env[i]
+			break
+		}
+	}
+	if codexHomeEnv == nil || codexHomeEnv.Value != "/home/gcagent/.codex" {
+		t.Fatalf("CODEX_HOME = %#v, want /home/gcagent/.codex", codexHomeEnv)
+	}
+
+	var authMount, homeMount *corev1.VolumeMount
+	for i := range container.VolumeMounts {
+		switch container.VolumeMounts[i].Name {
+		case "codex-worker-auth":
+			authMount = &container.VolumeMounts[i]
+		case "codex-home":
+			homeMount = &container.VolumeMounts[i]
+		}
+	}
+	if authMount == nil || authMount.MountPath != codexWorkerAuthDir || !authMount.ReadOnly {
+		t.Fatalf("worker auth mount = %#v, want read-only directory %s", authMount, codexWorkerAuthDir)
+	}
+	if homeMount == nil || homeMount.MountPath != "/home/gcagent/.codex" {
+		t.Fatalf("CODEX_HOME mount = %#v, want writable /home/gcagent/.codex", homeMount)
+	}
+	for _, mount := range container.VolumeMounts {
+		if mount.SubPath != "" || mount.SubPathExpr != "" {
+			t.Errorf("worker pod must not use subPath mounts: %#v", mount)
+		}
+	}
+
+	var authVolume, homeVolume *corev1.Volume
+	for i := range pod.Spec.Volumes {
+		switch pod.Spec.Volumes[i].Name {
+		case "codex-worker-auth":
+			authVolume = &pod.Spec.Volumes[i]
+		case "codex-home":
+			homeVolume = &pod.Spec.Volumes[i]
+		}
+	}
+	if authVolume == nil || authVolume.VolumeSource.Secret == nil || authVolume.VolumeSource.Secret.SecretName != "codex-worker-auth" {
+		t.Fatalf("worker auth volume = %#v, want Secret codex-worker-auth", authVolume)
+	}
+	if len(authVolume.VolumeSource.Secret.Items) != 1 || authVolume.VolumeSource.Secret.Items[0].Key != "auth.json" || authVolume.VolumeSource.Secret.Items[0].Path != "auth.json" || authVolume.VolumeSource.Secret.Items[0].Mode == nil || *authVolume.VolumeSource.Secret.Items[0].Mode != 0400 {
+		t.Fatalf("worker auth Secret items = %#v, want auth.json mode 0400", authVolume.VolumeSource.Secret.Items)
+	}
+	if homeVolume == nil || homeVolume.EmptyDir == nil {
+		t.Fatalf("CODEX_HOME volume = %#v, want EmptyDir", homeVolume)
+	}
+	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != 1000 {
+		t.Fatalf("pod fsGroup = %#v, want 1000 for writable CODEX_HOME", pod.Spec.SecurityContext)
+	}
+}
+
+func TestBuildPod_CodexWorkerAuthUsesDynamicUserHome(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	p.codexAuthSecret = "codex-worker-auth"
+	cfg := runtime.Config{Command: "/bin/bash", Env: map[string]string{"LINUX_USERNAME": "worker"}}
+
+	pod, err := buildPod("test-session", cfg, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	container := pod.Spec.Containers[0]
+	args := strings.Join(container.Args, " ")
+	if !strings.Contains(args, `chown "worker:worker" "/home/worker/.codex"`) {
+		t.Errorf("dynamic-user entrypoint should chown CODEX_HOME before su; got: %s", args)
+	}
+	if !strings.Contains(args, `ln -s "/var/run/secrets/gascity/codex-worker-auth/auth.json" "$CODEX_HOME/auth.json"`) {
+		t.Errorf("dynamic-user entrypoint should symlink worker auth; got: %s", args)
+	}
+	for _, env := range container.Env {
+		if env.Name == "CODEX_HOME" && env.Value == "/home/worker/.codex" {
+			return
+		}
+	}
+	t.Fatal("dynamic-user CODEX_HOME should be /home/worker/.codex")
+}
