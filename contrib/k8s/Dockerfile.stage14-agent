@@ -12,7 +12,7 @@ USER root
 # Public, credential-free Codex integration. The compatibility wrapper keeps
 # the frozen provider argv valid for the pinned native CLI.
 ARG CODEX_VERSION=0.155.1
-ARG CODEX_TARBALL_SHA512=6adbf71c5d26b9ba81d09fd7910d89a29a8acd727effb690b5307632427d32badaba3308cfccdb0822f294b90ddcfce95464c9cf340537fc03d68abca093c92
+ARG CODEX_TARBALL_SHA512=6adbf71c5d26b9ba81d09fd7910d89a29a8acd727effb690b5307632427d32badaba3308cfccdb0822f294b90ddcfce95464c9cf340537fc03d68abca093c92a
 ARG CODEX_PLATFORM_PACKAGE=linux-x64
 ARG CODEX_TARGET_TRIPLE=x86_64-unknown-linux-musl
 COPY contrib/k8s/codex-compat.sh /tmp/codex-compat.sh

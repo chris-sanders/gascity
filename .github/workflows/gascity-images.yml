@@ -43,7 +43,7 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
       CODEX_VERSION: 0.155.1
-      CODEX_TARBALL_SHA512: 6adbf71c5d26b9ba81d09fd7910d89a29a8acd727effb690b5307632427d32badaba3308cfccdb0822f294b90ddcfce95464c9cf340537fc03d68abca093c92
+      CODEX_TARBALL_SHA512: 6adbf71c5d26b9ba81d09fd7910d89a29a8acd727effb690b5307632427d32badaba3308cfccdb0822f294b90ddcfce95464c9cf340537fc03d68abca093c92a
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
