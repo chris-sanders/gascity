@@ -22,6 +22,9 @@ const (
 	podManagedDoltHost = "dolt.gc.svc.cluster.local"
 	podManagedDoltPort = "3307"
 
+	codexWorkerAuthDir  = "/var/run/secrets/gascity/codex-worker-auth"
+	codexWorkerAuthFile = codexWorkerAuthDir + "/auth.json"
+
 	// podWorkspaceRoot is the pod-side projection of the city root. It is the
 	// only directory guaranteed to exist when the container starts — it is the
 	// "ws" EmptyDir mount point for staged pods and the image WORKDIR for
@@ -241,6 +244,10 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	// as root (see securityContext below), creates the user, sets up workspace
 	// ownership, then drops privileges via su for the tmux session.
 	linuxUsername := cfg.Env["LINUX_USERNAME"]
+	codexHome := "/home/gcagent/.codex"
+	if linuxUsername != "" {
+		codexHome = "/home/" + linuxUsername + "/.codex"
+	}
 	var userSetup string
 	if linuxUsername != "" {
 		userSetup = fmt.Sprintf(
@@ -254,7 +261,26 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			linuxUsername,
 		)
 	}
-	credCopy := `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; git config --global --add safe.directory '*' 2>/dev/null; `
+	credSetup := `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; git config --global --add safe.directory '*' 2>/dev/null; `
+	if p.codexAuthSecret != "" {
+		// The worker Secret is deliberately mounted as a live directory. The
+		// symlink is created in a separate writable CODEX_HOME so kubelet can
+		// update the projected file without touching the worker's other state.
+		chownCodexHome := ""
+		if linuxUsername != "" {
+			chownCodexHome = fmt.Sprintf(`chown "%s:%s" "%s" 2>/dev/null || exit 1; `,
+				linuxUsername, linuxUsername, codexHome)
+		}
+		credSetup = fmt.Sprintf(
+			`export CODEX_HOME="%s"; mkdir -p "$CODEX_HOME"; %s`+
+				`if [ ! -s "%s" ]; then echo "Gas City worker auth is missing: %s" >&2; exit 1; fi; `+
+				`rm -f "$CODEX_HOME/auth.json"; ln -s "%s" "$CODEX_HOME/auth.json"; `+
+				`mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; `+
+				`git config --global --add safe.directory '*' 2>/dev/null; `,
+			codexHome, chownCodexHome, codexWorkerAuthFile, codexWorkerAuthFile,
+			codexWorkerAuthFile,
+		)
+	}
 	wsWait := ""
 	if !p.prebaked {
 		wsWait = `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
@@ -280,13 +306,13 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		tmuxCmd = fmt.Sprintf(
 			"%s%s%s%s%sCMD=$(echo '%s' | base64 -d) && "+
 				`su - %s -c "cd %s && tmux new-session -d -s %s \"$CMD\" && sleep infinity"`,
-			userSetup, credCopy, wsWait, enterWorkDir, preStartCmds, cmdB64,
+			userSetup, credSetup, wsWait, enterWorkDir, preStartCmds, cmdB64,
 			linuxUsername, podWorkDir, tmuxSession,
 		)
 	} else {
 		tmuxCmd = fmt.Sprintf(
 			"%s%s%s%sCMD=$(echo '%s' | base64 -d) && tmux new-session -d -s %s \"$CMD\" && sleep infinity",
-			credCopy, wsWait, enterWorkDir, preStartCmds, cmdB64, tmuxSession,
+			credSetup, wsWait, enterWorkDir, preStartCmds, cmdB64, tmuxSession,
 		)
 	}
 
@@ -294,6 +320,15 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	env, err := buildPodEnv(cfg.Env, podWorkDir, p.managedServiceHost, p.managedServicePort)
 	if err != nil {
 		return nil, err
+	}
+	if p.codexAuthSecret != "" {
+		filtered := env[:0]
+		for _, item := range env {
+			if item.Name != "CODEX_HOME" {
+				filtered = append(filtered, item)
+			}
+		}
+		env = append(filtered, corev1.EnvVar{Name: "CODEX_HOME", Value: codexHome})
 	}
 
 	// Build volume mounts for the main container.
@@ -321,6 +356,30 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			},
 		},
 	})
+	if p.codexAuthSecret != "" {
+		workerAuthMode := int32(0400)
+		mainVolMounts = append(mainVolMounts,
+			corev1.VolumeMount{
+				Name: "codex-worker-auth", MountPath: codexWorkerAuthDir, ReadOnly: true,
+			},
+			corev1.VolumeMount{
+				Name: "codex-home", MountPath: codexHome,
+			},
+		)
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: "codex-worker-auth",
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName: p.codexAuthSecret,
+					Items:      []corev1.KeyToPath{{Key: "auth.json", Path: "auth.json", Mode: &workerAuthMode}},
+				}},
+			},
+			corev1.Volume{
+				Name:         "codex-home",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			},
+		)
+	}
 
 	// If GC_CITY differs from work_dir, add a city volume (not needed when prebaked).
 	if !p.prebaked && ctrlCity != "" && ctrlCity != cfg.WorkDir {
@@ -387,6 +446,14 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		pod.Spec.Affinity = p.affinity.DeepCopy()
 	}
 	pod.Spec.PriorityClassName = p.priorityClassName
+	if p.codexAuthSecret != "" {
+		// The base agent image uses the first regular UID/GID (1000) for its
+		// baked-in gcagent user. fsGroup makes the EmptyDir CODEX_HOME writable
+		// on the default non-root path; the dynamic-user path chowns it after
+		// creating that user.
+		fsGroup := int64(1000)
+		pod.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: &fsGroup}
+	}
 
 	// Add init container when staging is needed (skip when prebaked).
 	if !p.prebaked && needsStaging(cfg, ctrlCity) {
