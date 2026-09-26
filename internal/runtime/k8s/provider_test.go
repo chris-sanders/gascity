@@ -1779,8 +1779,11 @@ func TestInitBeadsInPodVerifiesScopedProjectIdentity(t *testing.T) {
 		t.Fatal("no sh -c exec call found")
 	}
 
+	if !strings.Contains(script, base64.StdEncoding.EncodeToString([]byte(".beads/identity.toml"))) {
+		t.Errorf("script did not derive the canonical project identity path from the shared contract: %s", script)
+	}
 	for _, want := range []string{
-		`grep -Fqx "id = \"$PROJECT_ID\"" .beads/identity.toml`,
+		`grep -Fqx "id = \"$PROJECT_ID\"" "$IDENTITY_FILE"`,
 		`m.get("dolt_database", "")).strip() == sys.argv[2]`,
 		`m.get("project_id", "")).strip() == sys.argv[3]`,
 		`[ "$GOT_PREFIX" = "$PREFIX" ]`,

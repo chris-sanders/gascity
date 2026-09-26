@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	execerr "k8s.io/client-go/util/exec"
 
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
@@ -994,24 +996,29 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 		return nil
 	}
 	storeRoot := projectedPodStoreRoot(cfg, workDir)
+	identityRelativePath, err := filepath.Rel("/scope", contract.ProjectIdentityPath("/scope"))
+	if err != nil {
+		return fmt.Errorf("resolving canonical project identity path: %w", err)
+	}
 	projectIDB64 := base64.StdEncoding.EncodeToString([]byte(identity.ProjectID))
 	prefixB64 := base64.StdEncoding.EncodeToString([]byte(identity.Prefix))
 	databaseB64 := base64.StdEncoding.EncodeToString([]byte(identity.Database))
 	doltHostB64 := base64.StdEncoding.EncodeToString([]byte(identity.Host))
 	doltPortB64 := base64.StdEncoding.EncodeToString([]byte(identity.Port))
 	storeRootB64 := base64.StdEncoding.EncodeToString([]byte(storeRoot))
+	identityPathB64 := base64.StdEncoding.EncodeToString([]byte(identityRelativePath))
 	initCmd := fmt.Sprintf(
 		`WD=$(echo '%s' | base64 -d) && PROJECT_ID=$(echo '%s' | base64 -d) && PREFIX=$(echo '%s' | base64 -d) && `+
 			`DATABASE=$(echo '%s' | base64 -d) && DOLT_HOST=$(echo '%s' | base64 -d) && DOLT_PORT=$(echo '%s' | base64 -d) && `+
-			`cd "$WD" || exit 1; `+
-			`if [ ! -e .beads/metadata.json ] && [ ! -e .beads/identity.toml ] && [ ! -e .beads/config.yaml ]; then `+
+			`IDENTITY_FILE=$(echo '%s' | base64 -d) && cd "$WD" || exit 1; `+
+			`if [ ! -e .beads/metadata.json ] && [ ! -e "$IDENTITY_FILE" ] && [ ! -e .beads/config.yaml ]; then `+
 			`mkdir -p .beads && yes | BEADS_DIR="$WD/.beads" GC_DOLT_HOST="$DOLT_HOST" GC_DOLT_PORT="$DOLT_PORT" `+
 			`GC_DOLT_DATABASE="$DATABASE" GC_BEADS_PROJECT_ID="$PROJECT_ID" `+
 			`bd init --server --server-host "$DOLT_HOST" --server-port "$DOLT_PORT" --database "$DATABASE" `+
 			`-p "$PREFIX" --non-interactive --skip-hooks --skip-agents || exit 1; fi; `+
-			`test -f .beads/metadata.json && test -f .beads/identity.toml && test -f .beads/config.yaml || `+
+			`test -f .beads/metadata.json && test -f "$IDENTITY_FILE" && test -f .beads/config.yaml || `+
 			`{ echo 'hosted Dolt scoped beads files are incomplete' >&2; exit 1; }; `+
-			`grep -Fqx "id = \"$PROJECT_ID\"" .beads/identity.toml || `+
+			`grep -Fqx "id = \"$PROJECT_ID\"" "$IDENTITY_FILE" || `+
 			`{ echo 'hosted Dolt project identity does not match session scope' >&2; exit 1; }; `+
 			`python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); `+
 			`assert str(m.get("dolt_database", "")).strip() == sys.argv[2]; `+
@@ -1020,7 +1027,7 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 			`{ echo 'hosted Dolt database or project identity does not match session scope' >&2; exit 1; }; `+
 			`GOT_PREFIX=$(BEADS_DIR="$WD/.beads" bd config get issue_prefix 2>/dev/null) || exit 1; `+
 			`[ "$GOT_PREFIX" = "$PREFIX" ] || { echo 'hosted Dolt beads prefix does not match session scope' >&2; exit 1; }`,
-		storeRootB64, projectIDB64, prefixB64, databaseB64, doltHostB64, doltPortB64,
+		storeRootB64, projectIDB64, prefixB64, databaseB64, doltHostB64, doltPortB64, identityPathB64,
 	)
 	_, err = ops.execInPod(ctx, podName, "agent", []string{"sh", "-c", initCmd}, nil)
 	return err
