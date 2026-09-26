@@ -1459,7 +1459,7 @@ func runController(
 		// async POST /v0/city, so leave the initializer nil and let the
 		// handler return 501 for create/unregister routes.
 		cityResolver := &singleCityStateResolver{state: cs}
-		apiMux := api.NewSupervisorMux(cityResolver, nil, readOnly, "controller", commit, time.Now())
+		apiMux := api.NewSupervisorMux(cityResolver, nil, readOnly, "controller", commit, time.Now()).WithStandaloneCityHookAlias(cityName)
 		apiMux.WithAnyHostAllowed()
 		censusPlane := newRunCensusPlane(apiMux, cityResolver)
 		censusPlane.Start(ctx)
