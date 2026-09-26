@@ -102,6 +102,65 @@ func TestBuildPod_NoSchedulingFields_NoBehaviorChange(t *testing.T) {
 	}
 }
 
+func TestBuildPodSatisfiesRestrictedPodSecurityAndKeepsWorkspaceAndCodexVolumes(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	p.codexAuthSecret = "codex-worker-auth"
+	cfg := perBeadWorkDirConfig()
+	pod, err := buildPod("restricted-session", cfg, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	if pod.Spec.SecurityContext == nil {
+		t.Fatal("pod SecurityContext is nil")
+	}
+	if pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
+		t.Errorf("pod RunAsNonRoot = %v, want true", pod.Spec.SecurityContext.RunAsNonRoot)
+	}
+	if pod.Spec.SecurityContext.SeccompProfile == nil || pod.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Errorf("pod SeccompProfile = %#v, want RuntimeDefault", pod.Spec.SecurityContext.SeccompProfile)
+	}
+	if pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != restrictedPodGID {
+		t.Errorf("pod FSGroup = %v, want %d for writable workspace/CODEX_HOME", pod.Spec.SecurityContext.FSGroup, restrictedPodGID)
+	}
+	containers := append([]corev1.Container(nil), pod.Spec.Containers...)
+	containers = append(containers, pod.Spec.InitContainers...)
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("staged pod init container count = %d, want 1", len(pod.Spec.InitContainers))
+	}
+	for _, container := range containers {
+		sc := container.SecurityContext
+		if sc == nil {
+			t.Fatalf("container %q SecurityContext is nil", container.Name)
+		}
+		if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			t.Errorf("container %q AllowPrivilegeEscalation = %v, want false", container.Name, sc.AllowPrivilegeEscalation)
+		}
+		if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
+			t.Errorf("container %q RunAsNonRoot = %v, want true", container.Name, sc.RunAsNonRoot)
+		}
+		if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+			t.Errorf("container %q SeccompProfile = %#v, want RuntimeDefault", container.Name, sc.SeccompProfile)
+		}
+		if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != corev1.Capability("ALL") {
+			t.Errorf("container %q capabilities = %#v, want drop ALL", container.Name, sc.Capabilities)
+		}
+	}
+	volumes := map[string]corev1.Volume{}
+	for _, volume := range pod.Spec.Volumes {
+		volumes[volume.Name] = volume
+	}
+	if volumes["ws"].EmptyDir == nil {
+		t.Fatal("staged writable workspace ws EmptyDir missing")
+	}
+	if volumes["codex-worker-auth"].Secret == nil || volumes["codex-home"].EmptyDir == nil {
+		t.Fatalf("Codex auth projection/writable home missing: %#v", volumes)
+	}
+	mainArgs := strings.Join(pod.Spec.Containers[0].Args, " ")
+	if !strings.Contains(mainArgs, "tmux new-session") || !strings.Contains(mainArgs, codexWorkerAuthFile) {
+		t.Fatalf("restricted agent lost tmux or Codex auth startup: %s", mainArgs)
+	}
+}
+
 func TestBuildPod_ClonesSchedulingFields(t *testing.T) {
 	seconds := int64(30)
 	p := newProviderWithOps(newFakeK8sOps())
@@ -216,24 +275,16 @@ func TestBuildPod_EntrypointCreatesAndEntersWorkDir(t *testing.T) {
 	}
 }
 
-// TestBuildPod_EntrypointCreatesWorkDirAsDynamicUser pins the same contract on
-// the LINUX_USERNAME path, where root creates and chowns the directory before
-// dropping privileges and the tmux session cds into it.
-func TestBuildPod_EntrypointCreatesWorkDirAsDynamicUser(t *testing.T) {
-	p := newProviderWithOps(newFakeK8sOps())
-	cfg := perBeadWorkDirConfig()
-	cfg.Env["LINUX_USERNAME"] = "gcagent"
-
-	pod, err := buildPod("test-session", cfg, p)
-	if err != nil {
-		t.Fatalf("buildPod: %v", err)
-	}
-	args := strings.Join(pod.Spec.Containers[0].Args, " ")
-	if !strings.Contains(args, "mkdir -p \""+perBeadPodWorkDir+"\"") {
-		t.Errorf("entrypoint should mkdir the per-bead WorkingDir as root; got: %s", args)
-	}
-	if !strings.Contains(args, "cd "+perBeadPodWorkDir) {
-		t.Errorf("tmux session should start in the per-bead WorkingDir; got: %s", args)
+func TestBuildPodRejectsDynamicLinuxUsernameUnderRestrictedPolicy(t *testing.T) {
+	for _, username := range []string{"gcagent", "worker"} {
+		t.Run(username, func(t *testing.T) {
+			p := newProviderWithOps(newFakeK8sOps())
+			cfg := perBeadWorkDirConfig()
+			cfg.Env["LINUX_USERNAME"] = username
+			if _, err := buildPod("test-session", cfg, p); err == nil || !strings.Contains(err.Error(), "LINUX_USERNAME is incompatible with Restricted PodSecurity") {
+				t.Fatalf("buildPod error = %v, want Restricted PodSecurity rejection", err)
+			}
+		})
 	}
 }
 
@@ -244,40 +295,29 @@ func TestBuildPod_EntrypointCreatesWorkDirAsDynamicUser(t *testing.T) {
 // because pre_start used to run in the container's WorkingDir — which was the
 // per-bead dir — and commands there may use relative paths.
 func TestBuildPod_EntersWorkDirAfterStagingAndBeforePreStart(t *testing.T) {
-	for _, username := range []string{"", "gcagent"} {
-		name := "no-dynamic-user"
-		if username != "" {
-			name = "dynamic-user"
-		}
-		t.Run(name, func(t *testing.T) {
-			p := newProviderWithOps(newFakeK8sOps())
-			cfg := perBeadWorkDirConfig()
-			cfg.PreStart = []string{"echo pre-start-marker"}
-			if username != "" {
-				cfg.Env["LINUX_USERNAME"] = username
-			}
-			pod, err := buildPod("test-session", cfg, p)
-			if err != nil {
-				t.Fatalf("buildPod: %v", err)
-			}
-			args := strings.Join(pod.Spec.Containers[0].Args, " ")
+	p := newProviderWithOps(newFakeK8sOps())
+	cfg := perBeadWorkDirConfig()
+	cfg.PreStart = []string{"echo pre-start-marker"}
+	pod, err := buildPod("test-session", cfg, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	args := strings.Join(pod.Spec.Containers[0].Args, " ")
 
-			stagingWait := strings.Index(args, ".gc-workspace-ready")
-			enter := strings.Index(args, "cd "+shellquote.Quote(perBeadPodWorkDir))
-			// pre_start commands are base64-encoded into the entrypoint.
-			preStart := strings.Index(args, base64.StdEncoding.EncodeToString([]byte("echo pre-start-marker")))
+	stagingWait := strings.Index(args, ".gc-workspace-ready")
+	enter := strings.Index(args, "cd "+shellquote.Quote(perBeadPodWorkDir))
+	// pre_start commands are base64-encoded into the entrypoint.
+	preStart := strings.Index(args, base64.StdEncoding.EncodeToString([]byte("echo pre-start-marker")))
 
-			if stagingWait < 0 || enter < 0 || preStart < 0 {
-				t.Fatalf("entrypoint missing a stage (wait=%d enter=%d preStart=%d): %s",
-					stagingWait, enter, preStart, args)
-			}
-			if enter < stagingWait {
-				t.Errorf("entering the work dir must come after the staging wait; got: %s", args)
-			}
-			if preStart < enter {
-				t.Errorf("pre_start must run after entering the work dir; got: %s", args)
-			}
-		})
+	if stagingWait < 0 || enter < 0 || preStart < 0 {
+		t.Fatalf("entrypoint missing a stage (wait=%d enter=%d preStart=%d): %s",
+			stagingWait, enter, preStart, args)
+	}
+	if enter < stagingWait {
+		t.Errorf("entering the work dir must come after the staging wait; got: %s", args)
+	}
+	if preStart < enter {
+		t.Errorf("pre_start must run after entering the work dir; got: %s", args)
 	}
 }
 
@@ -379,27 +419,12 @@ func TestBuildPod_CodexWorkerAuthIsProjectedAndSymlinked(t *testing.T) {
 	}
 }
 
-func TestBuildPod_CodexWorkerAuthUsesDynamicUserHome(t *testing.T) {
+func TestBuildPod_CodexWorkerAuthRejectsDynamicUser(t *testing.T) {
 	p := newProviderWithOps(newFakeK8sOps())
 	p.codexAuthSecret = "codex-worker-auth"
 	cfg := runtime.Config{Command: "/bin/bash", Env: map[string]string{"LINUX_USERNAME": "worker"}}
 
-	pod, err := buildPod("test-session", cfg, p)
-	if err != nil {
-		t.Fatalf("buildPod: %v", err)
+	if _, err := buildPod("test-session", cfg, p); err == nil || !strings.Contains(err.Error(), "LINUX_USERNAME is incompatible with Restricted PodSecurity") {
+		t.Fatalf("buildPod error = %v, want Restricted PodSecurity rejection", err)
 	}
-	container := pod.Spec.Containers[0]
-	args := strings.Join(container.Args, " ")
-	if !strings.Contains(args, `chown "worker:worker" "/home/worker/.codex"`) {
-		t.Errorf("dynamic-user entrypoint should chown CODEX_HOME before su; got: %s", args)
-	}
-	if !strings.Contains(args, `ln -s "/var/run/secrets/gascity/codex-worker-auth/auth.json" "$CODEX_HOME/auth.json"`) {
-		t.Errorf("dynamic-user entrypoint should symlink worker auth; got: %s", args)
-	}
-	for _, env := range container.Env {
-		if env.Name == "CODEX_HOME" && env.Value == "/home/worker/.codex" {
-			return
-		}
-	}
-	t.Fatal("dynamic-user CODEX_HOME should be /home/worker/.codex")
 }
