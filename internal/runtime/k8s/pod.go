@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -186,6 +187,12 @@ func projectedPodDoltEnv(cfgEnv map[string]string, managedHost, managedPort stri
 	switch {
 	case host == "" && port == "":
 		return map[string]string{}, nil
+	case host == "":
+		// GC strips the controller's loopback host for managed Dolt while
+		// retaining its runtime port. A session pod uses the provider's
+		// configured in-cluster alias as the complete endpoint.
+		host = managedHost
+		port = managedPort
 	case host != "" && port == "":
 		return nil, fmt.Errorf("requires both GC_DOLT_HOST and GC_DOLT_PORT when GC_DOLT_HOST is set")
 	case controllerLocalDoltHost(host):
@@ -198,6 +205,41 @@ func projectedPodDoltEnv(cfgEnv map[string]string, managedHost, managedPort stri
 		"GC_DOLT_PORT":           port,
 		"BEADS_DOLT_SERVER_HOST": host,
 		"BEADS_DOLT_SERVER_PORT": port,
+	}
+	return projected, nil
+}
+
+// validateProjectedHostedStoreIdentity fails pod construction before any
+// Kubernetes resources are created when a hosted endpoint lacks the exact
+// identity for its scope. prefix is empty for the agent's store and
+// "GC_K8S_CITY_" for the separate City identity used by gc init.
+func validateProjectedHostedStoreIdentity(cfgEnv map[string]string, prefix, managedHost, managedPort string) (map[string]string, error) {
+	hostKey, portKey := "GC_DOLT_HOST", "GC_DOLT_PORT"
+	projectKey, issuePrefixKey, databaseKey, rootKey := "GC_BEADS_PROJECT_ID", "GC_BEADS_PREFIX", "GC_DOLT_DATABASE", "GC_STORE_ROOT"
+	if prefix != "" {
+		hostKey, portKey = prefix+"DOLT_HOST", prefix+"DOLT_PORT"
+		projectKey, issuePrefixKey, databaseKey, rootKey = prefix+"BEADS_PROJECT_ID", prefix+"BEADS_PREFIX", prefix+"DOLT_DATABASE", prefix+"STORE_ROOT"
+	}
+	projected, err := projectedPodDoltEnv(map[string]string{
+		"GC_DOLT_HOST": cfgEnv[hostKey],
+		"GC_DOLT_PORT": cfgEnv[portKey],
+	}, managedHost, managedPort)
+	if err != nil {
+		return nil, err
+	}
+	if len(projected) == 0 {
+		return projected, nil
+	}
+	for _, key := range []string{projectKey, issuePrefixKey, databaseKey, rootKey} {
+		if strings.TrimSpace(cfgEnv[key]) == "" {
+			return nil, fmt.Errorf("hosted Dolt session is missing scoped store identity %s", key)
+		}
+	}
+	if strings.TrimSpace(projected["GC_DOLT_HOST"]) == "" || strings.TrimSpace(projected["GC_DOLT_PORT"]) == "" {
+		return nil, fmt.Errorf("hosted Dolt session is missing a complete projected endpoint")
+	}
+	if _, err := strconv.Atoi(projected["GC_DOLT_PORT"]); err != nil {
+		return nil, fmt.Errorf("invalid projected GC_DOLT_PORT %q: %w", projected["GC_DOLT_PORT"], err)
 	}
 	return projected, nil
 }
@@ -246,6 +288,15 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	// as root (see securityContext below), creates the user, sets up workspace
 	// ownership, then drops privileges via su for the tmux session.
 	linuxUsername := cfg.Env["LINUX_USERNAME"]
+	storeIdentity, err := resolvePodHostedDoltIdentity(cfg.Env, "", p.managedServiceHost, p.managedServicePort)
+	if err != nil {
+		return nil, err
+	}
+	if !p.prebaked {
+		if _, err := resolvePodHostedDoltIdentity(cfg.Env, "GC_K8S_CITY_", p.managedServiceHost, p.managedServicePort); err != nil {
+			return nil, fmt.Errorf("City store identity: %w", err)
+		}
+	}
 	var userSetup string
 	if linuxUsername != "" {
 		userSetup = fmt.Sprintf(
@@ -261,7 +312,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	}
 	credCopy := `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; git config --global --add safe.directory '*' 2>/dev/null; `
 	wsWait := ""
-	if !p.prebaked {
+	if !p.prebaked || storeIdentity != nil {
 		wsWait = `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
 	}
 
@@ -465,15 +516,22 @@ func buildPodEnvWithSecretEnv(cfgEnv map[string]string, podWorkDir, managedServi
 	// Start with cfg.Env, removing controller-only vars.
 	// Auth creds (GC_DOLT_USER, GC_DOLT_PASSWORD, BEADS_DOLT_*_USER/PASSWORD) intentionally pass through.
 	skip := map[string]bool{
-		"GC_BEADS":               true,
-		"GC_SESSION":             true,
-		"GC_EVENTS":              true,
-		"GC_K8S_DOLT_HOST":       true,
-		"GC_K8S_DOLT_PORT":       true,
-		"GC_DOLT_HOST":           true,
-		"GC_DOLT_PORT":           true,
-		"BEADS_DOLT_SERVER_HOST": true,
-		"BEADS_DOLT_SERVER_PORT": true,
+		"GC_BEADS":                   true,
+		"GC_SESSION":                 true,
+		"GC_EVENTS":                  true,
+		"GC_K8S_DOLT_HOST":           true,
+		"GC_K8S_DOLT_PORT":           true,
+		"GC_DOLT_HOST":               true,
+		"GC_DOLT_PORT":               true,
+		"BEADS_DOLT_SERVER_HOST":     true,
+		"BEADS_DOLT_SERVER_PORT":     true,
+		"BEADS_DOLT_SERVER_DATABASE": true,
+		"GC_DOLT_DATABASE":           true,
+	}
+	for key := range cfgEnv {
+		if strings.HasPrefix(key, "GC_K8S_CITY_") {
+			skip[key] = true
+		}
 	}
 
 	ctrlCity := controllerCityPath(cfgEnv)
@@ -513,6 +571,12 @@ func buildPodEnvWithSecretEnv(cfgEnv map[string]string, podWorkDir, managedServi
 	sort.Strings(projectedKeys)
 	for _, key := range projectedKeys {
 		env = append(env, corev1.EnvVar{Name: key, Value: projectedDolt[key]})
+	}
+	if database := strings.TrimSpace(cfgEnv["GC_DOLT_DATABASE"]); database != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "GC_DOLT_DATABASE", Value: database},
+			corev1.EnvVar{Name: "BEADS_DOLT_SERVER_DATABASE", Value: database},
+		)
 	}
 
 	// Add tmux session env so agent's tmux provider uses the same session.
