@@ -160,10 +160,12 @@ func TestK8SSessionStoreIdentityFailsClosedOnMissingOrInconsistentIdentity(t *te
 		name     string
 		identity string
 		metadata string
+		backend  string
 		wantErr  string
 	}{
-		{name: "missing identity", identity: "", metadata: "project", wantErr: "missing .beads/identity.toml"},
-		{name: "mismatch", identity: "scope-id", metadata: "other-id", wantErr: "inconsistent project identity"},
+		{name: "missing identity", identity: "", metadata: "project", backend: "dolt", wantErr: "missing its canonical project identity"},
+		{name: "mismatch", identity: "scope-id", metadata: "other-id", backend: "dolt", wantErr: "inconsistent project identity"},
+		{name: "missing backend", identity: "scope-id", metadata: "scope-id", wantErr: "no Dolt store metadata"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cityPath := t.TempDir()
@@ -176,7 +178,7 @@ func TestK8SSessionStoreIdentityFailsClosedOnMissingOrInconsistentIdentity(t *te
 					t.Fatal(err)
 				}
 			}
-			metadata := fmt.Sprintf(`{"database":"dolt","backend":"dolt","dolt_database":"bd_project","project_id":%q}`, tc.metadata)
+			metadata := fmt.Sprintf(`{"database":"dolt","backend":%q,"dolt_database":"bd_project","project_id":%q}`, tc.backend, tc.metadata)
 			if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0o644); err != nil {
 				t.Fatal(err)
 			}
