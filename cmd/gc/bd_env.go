@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -504,6 +505,104 @@ func canonicalScopeDoltTarget(cityPath, scopeRoot string) (contract.DoltConnecti
 		return contract.DoltConnectionTarget{}, true, err
 	}
 	return target, true, nil
+}
+
+// k8sSessionStoreIdentityEnv derives the identity carried by one Kubernetes
+// session from that session's canonical store scope. It is intentionally
+// called per agent after the scope-specific Dolt projection, never from the
+// controller's process environment. Empty endpoints mean the session is not
+// using hosted Dolt; a projected endpoint requires a complete, internally
+// consistent identity.
+func k8sSessionStoreIdentityEnv(cityPath, scopeRoot string, cfg *config.City, backendEnv map[string]string) (map[string]string, error) {
+	keys := map[string]string{
+		"GC_BEADS_PROJECT_ID": "",
+		"GC_BEADS_PREFIX":     "",
+		"GC_DOLT_DATABASE":    "",
+		"GC_STORE_ROOT":       scopeRoot,
+		"GC_STORE_SCOPE":      "rig",
+		"GC_BEADS_SCOPE_ROOT": scopeRoot,
+	}
+	if samePath(cityPath, scopeRoot) {
+		keys["GC_STORE_SCOPE"] = "city"
+	}
+	host := strings.TrimSpace(backendEnv["GC_DOLT_HOST"])
+	port := strings.TrimSpace(backendEnv["GC_DOLT_PORT"])
+	if host == "" {
+		host = strings.TrimSpace(backendEnv["BEADS_DOLT_SERVER_HOST"])
+	}
+	if port == "" {
+		port = strings.TrimSpace(backendEnv["BEADS_DOLT_SERVER_PORT"])
+	}
+	if host == "" && port == "" {
+		return keys, nil
+	}
+	if host != "" && port == "" {
+		return nil, fmt.Errorf("hosted Dolt scope %q has GC_DOLT_HOST without GC_DOLT_PORT", scopeRoot)
+	}
+
+	metadataPath := scopeMetadataJSONPath(scopeRoot)
+	metadata, metadataOK, err := contract.LoadMetadataState(fsys.OSFS{}, metadataPath)
+	if err != nil {
+		return nil, fmt.Errorf("hosted Dolt scope %q metadata: %w", scopeRoot, err)
+	}
+	if !metadataOK || (metadata.Backend != "" && metadata.Backend != "dolt") {
+		return nil, fmt.Errorf("hosted Dolt endpoint for scope %q has no Dolt store metadata", scopeRoot)
+	}
+	projectID, projectOK, err := contract.ReadProjectIdentity(fsys.OSFS{}, scopeRoot)
+	if err != nil {
+		return nil, fmt.Errorf("hosted Dolt scope %q project identity: %w", scopeRoot, err)
+	}
+	if !projectOK {
+		return nil, fmt.Errorf("hosted Dolt scope %q is missing .beads/identity.toml project identity", scopeRoot)
+	}
+	if metadataID, ok, err := readMetadataProjectID(metadataPath); err != nil {
+		return nil, fmt.Errorf("hosted Dolt scope %q metadata project identity: %w", scopeRoot, err)
+	} else if ok && metadataID != projectID {
+		return nil, fmt.Errorf("hosted Dolt scope %q has inconsistent project identity: identity.toml=%q metadata.json=%q", scopeRoot, projectID, metadataID)
+	}
+	prefix := issuePrefixForScope(scopeRoot, cityPath, cfg)
+	if strings.TrimSpace(prefix) == "" {
+		return nil, fmt.Errorf("hosted Dolt scope %q is missing its beads issue prefix", scopeRoot)
+	}
+	database, databaseOK, err := contract.ReadDoltDatabase(fsys.OSFS{}, metadataPath)
+	if err != nil {
+		return nil, fmt.Errorf("hosted Dolt scope %q database identity: %w", scopeRoot, err)
+	}
+	if !databaseOK {
+		return nil, fmt.Errorf("hosted Dolt scope %q is missing .beads/metadata.json dolt_database", scopeRoot)
+	}
+	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityPath, scopeRoot)
+	if err != nil {
+		return nil, fmt.Errorf("hosted Dolt scope %q connection target: %w", scopeRoot, err)
+	}
+	if strings.TrimSpace(target.Database) == "" || target.Database != database {
+		return nil, fmt.Errorf("hosted Dolt scope %q has inconsistent database identity: metadata=%q target=%q", scopeRoot, database, target.Database)
+	}
+	if strings.TrimSpace(target.Socket) != "" {
+		return nil, fmt.Errorf("hosted Dolt scope %q uses a socket binding that Kubernetes sessions cannot project", scopeRoot)
+	}
+	if port == "" {
+		return nil, fmt.Errorf("hosted Dolt scope %q is missing its endpoint port", scopeRoot)
+	}
+	keys["GC_BEADS_PROJECT_ID"] = projectID
+	keys["GC_BEADS_PREFIX"] = prefix
+	keys["GC_DOLT_DATABASE"] = database
+	return keys, nil
+}
+
+func readMetadataProjectID(metadataPath string) (string, bool, error) {
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return "", false, err
+	}
+	var metadata struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return "", false, err
+	}
+	projectID := strings.TrimSpace(metadata.ProjectID)
+	return projectID, projectID != "", nil
 }
 
 // canonicalScopeDoltProjectionAuthoritative reports whether canonical
