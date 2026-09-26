@@ -9,10 +9,11 @@ import (
 )
 
 // TestSupervisorNonHumaSurfacesAreSanctioned pins the set of raw (non-Huma)
-// handler registrations on the supervisor mux to the three carved-out surfaces
+// handler registrations on the supervisor mux to the carved-out surfaces
 // documented in engdocs/architecture/api-control-plane.md §3.9: the /svc/*
-// workspace-service proxy, the embedded dashboard SPA at "/", and the host-side
-// dashboard "/api/" plane. A new humaMux.Handle/HandleFunc registration fails
+// workspace-service proxy, city-scoped and single-city /hook/* webhook
+// receivers, the embedded dashboard SPA at "/", and the host-side dashboard
+// "/api/" plane. A new humaMux.Handle/HandleFunc registration fails
 // this test until it is added here AND documented as a sanctioned exception, so
 // an untyped wire surface cannot slip in under internal/api silently —
 // TestOpenAPISpecInSync only covers Huma-registered operations and would not
@@ -28,6 +29,7 @@ func TestSupervisorNonHumaSurfacesAreSanctioned(t *testing.T) {
 	sanctioned := map[string]bool{
 		"/v0/city/{cityName}/svc/":  true, // workspace-service pass-through
 		"/v0/city/{cityName}/hook/": true, // webhook receiver (E3) — raw body for HMAC/ed25519
+		"/hook/":                    true, // single-city standalone webhook receiver
 		"/":                         true, // embedded dashboard SPA (WithStaticHandler)
 		"/api/":                     true, // host-side dashboard plane (WithAPIPlane)
 	}

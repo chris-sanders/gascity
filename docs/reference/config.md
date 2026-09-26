@@ -42,7 +42,7 @@ City is the top-level configuration for a Gas City instance.
 | `doctor` | DoctorConfig |  |  | Doctor configures gc doctor thresholds and policy toggles (worktree size warnings, nested-worktree auto-prune). |
 | `maintenance` | MaintenanceConfig |  |  | Maintenance configures periodic store-maintenance loops. |
 | `service` | []Service |  |  | Services declares workspace-owned HTTP services mounted on the controller edge under /svc/&#123;name&#125;. |
-| `webhook` | []Webhook |  |  | Webhooks declares inbound HTTP receivers mounted on the supervisor edge under /hook/&#123;name&#125;. Composed like Services (pack concatenation + SourceDir provenance + the default-closed public pack-guard). |
+| `webhook` | []Webhook |  |  | Webhooks declares inbound HTTP receivers mounted on the supervisor edge. The machine-wide supervisor uses /v0/city/&#123;city&#125;/hook/&#123;name&#125;; a standalone controller can explicitly expose /hook/&#123;name&#125; for its single city. Composed like Services (pack concatenation + SourceDir provenance + the default-closed public pack-guard). |
 | `webhooks` | WebhookPolicyConfig |  |  | WebhookPolicy holds city-level webhook governance (the [webhooks] table, notably allow_public grants). Authored only in the root city.toml; never merged from packs or fragments so a pack cannot grant itself exposure. |
 | `github` | GitHubConfig |  |  | GitHub configures GitHub-facing repository monitors. |
 | `extmsg` | ExtMsgConfig |  |  | ExtMsg configures the external-messaging fabric (default routes for inbound conversations with no binding). |
@@ -936,7 +936,7 @@ UsageConfig holds usage-fact sink settings.
 
 ## Webhook
 
-Webhook declares a city- or rig-scoped inbound HTTP receiver mounted under /v0/city/{city}/hook/{name}.
+Webhook declares a city- or rig-scoped inbound HTTP receiver mounted under /v0/city/{city}/hook/{name} by the machine-wide supervisor or under /hook/{name} by a standalone controller that explicitly enables the single-city path.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|

@@ -1446,6 +1446,10 @@ func runController(
 		// handler return 501 for create/unregister routes.
 		cityResolver := &singleCityStateResolver{state: cs}
 		apiMux := api.NewSupervisorMux(cityResolver, nil, readOnly, "controller", commit, time.Now())
+		if err := apiMux.WithSingleCityWebhookPath(); err != nil {
+			fmt.Fprintf(stderr, "api: public webhook route: %v\n", err) //nolint:errcheck
+			return 1
+		}
 		apiMux.WithAnyHostAllowed()
 		censusPlane := newRunCensusPlane(apiMux, cityResolver)
 		censusPlane.Start(ctx)

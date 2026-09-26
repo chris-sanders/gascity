@@ -1577,7 +1577,7 @@
       "required": [
         "name"
       ],
-      "description": "Webhook declares a city- or rig-scoped inbound HTTP receiver mounted under /v0/city/{city}/hook/{name}."
+      "description": "Webhook declares a city- or rig-scoped inbound HTTP receiver mounted under /v0/city/{city}/hook/{name} by the machine-wide supervisor or under /hook/{name} by a standalone controller that explicitly enables the single-city path."
     },
     "WebhookRule": {
       "properties": {

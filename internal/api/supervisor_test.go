@@ -96,6 +96,68 @@ func newTestSupervisorMuxWithBuildID(t *testing.T, cities map[string]*fakeState,
 	return NewSupervisorMux(resolver, nil, false, "test", buildID, time.Now())
 }
 
+func TestSingleCityPublicWebhookPathUsesPerCityVerifier(t *testing.T) {
+	t.Setenv("GC_WEBHOOK_GITEA_SECRET", "gitea-path-test-secret")
+
+	hook := config.Webhook{
+		Name:        "gitea-forge",
+		Publication: config.ServicePublicationConfig{Visibility: "public"},
+		Verify: config.WebhookVerify{
+			Scheme:          "hmac-sha256",
+			SecretEnv:       "GC_WEBHOOK_GITEA_SECRET",
+			SignatureHeader: "X-Gitea-Signature",
+			EventHeader:     "X-Gitea-Event-Type",
+			DedupHeader:     "X-Gitea-Delivery",
+		},
+	}
+	disp := firedDispatcher()
+	state := newWebhookState(t, hook, prReviewOrder(), disp)
+	state.cityName = "default"
+	mux := NewSupervisorMux(&stateCityResolver{state: state}, nil, false, "test", "", time.Now())
+	h := wrapTestSupervisorMiddleware(mux)
+
+	before := httptest.NewRecorder()
+	h.ServeHTTP(before, httptest.NewRequest(http.MethodPost, "/hook/gitea-forge", strings.NewReader(`{}`)))
+	if before.Code != http.StatusNotFound {
+		t.Fatalf("bare webhook path before opt-in = %d, want 404", before.Code)
+	}
+
+	if err := mux.WithSingleCityWebhookPath(); err != nil {
+		t.Fatalf("enable single-city public webhook path: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/hook/gitea-forge", strings.NewReader(`{}`))
+	req.RemoteAddr = "203.0.113.10:9000"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Gitea-Signature", "00")
+	req.Header.Set("X-Gitea-Event-Type", "issue_label")
+	req.Header.Set("X-Gitea-Delivery", "public-path-invalid-signature")
+	after := httptest.NewRecorder()
+	h.ServeHTTP(after, req)
+	if after.Code != http.StatusUnauthorized {
+		t.Fatalf("bare webhook path with invalid signature = %d, want 401 (body %s)", after.Code, after.Body.String())
+	}
+	if got := disp.count(); got != 0 {
+		t.Fatalf("invalid signature dispatched %d orders, want 0", got)
+	}
+}
+
+func TestSingleCityPublicWebhookPathRejectsMultiCitySupervisor(t *testing.T) {
+	alpha := newFakeState(t)
+	alpha.cityName = "alpha"
+	beta := newFakeState(t)
+	beta.cityName = "beta"
+	mux := newTestSupervisorMux(t, map[string]*fakeState{"alpha": alpha, "beta": beta})
+	if err := mux.WithSingleCityWebhookPath(); err == nil {
+		t.Fatal("enabling the root webhook path for a multi-city supervisor succeeded")
+	}
+	h := wrapTestSupervisorMiddleware(mux)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/hook/gitea-forge", strings.NewReader(`{}`)))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("multi-city bare webhook path = %d, want 404", rec.Code)
+	}
+}
+
 func TestSupervisorCitiesList(t *testing.T) {
 	s1 := newFakeState(t)
 	s1.cityName = "alpha"

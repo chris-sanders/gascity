@@ -57,10 +57,12 @@ var secretEnvWebhookSchemes = map[string]bool{
 const OperatorWebhookSecretEnvPrefix = "GC_WEBHOOK_"
 
 // Webhook declares a city- or rig-scoped inbound HTTP receiver mounted under
-// /v0/city/{city}/hook/{name}. It mirrors the [[service]] declaration shape:
-// generic publication intent plus pack provenance, so the same edge routing
-// and pack-guard rules apply. The verifier and dispatch mechanics live in
-// later phases (E3/E4/E5/E6); this type carries the config surface only.
+// /v0/city/{city}/hook/{name} by the machine-wide supervisor or under
+// /hook/{name} by a standalone controller that explicitly enables the
+// single-city path. It mirrors the [[service]] declaration shape: generic
+// publication intent plus pack provenance, so the same edge routing and
+// pack-guard rules apply. The verifier and dispatch mechanics live in later
+// phases (E3/E4/E5/E6); this type carries the config surface only.
 type Webhook struct {
 	// Name is the unique webhook identifier and mount segment.
 	Name string `toml:"name" jsonschema:"required"`

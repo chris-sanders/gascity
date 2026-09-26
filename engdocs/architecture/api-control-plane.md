@@ -480,9 +480,13 @@ typed-wire principle. Every other path is a typed Huma operation.
   processes that own their own HTTP contracts. If `/svc/*` ever
   becomes typed, it gets its own migration.
 - **`/hook/*` (the webhook receiver, E3)** — a raw pass-through for
-  inbound provider webhooks (`/v0/city/{cityName}/hook/{name}`). It is
-  non-typed because the HMAC/ed25519 verifiers sign the exact raw body,
-  so the receiver must read the unparsed bytes rather than a
+  inbound provider webhooks. The machine-wide supervisor uses
+  `/v0/city/{cityName}/hook/{name}`. A standalone controller may explicitly
+  enable `/hook/{name}` only when it owns exactly one city; both paths forward
+  to the same per-city receiver, and a multi-city supervisor does not mount
+  the bare path. The bare path exposes only the webhook subtree, not a control
+  API alias. It is non-typed because the HMAC/ed25519 verifiers sign the exact
+  raw body, so the receiver must read the unparsed bytes rather than a
   Huma-decoded struct. Unlike `/svc/*` it is **not** exempt from the
   mux-level write-auth grant (`cityScopedObjectMutation` keeps `/hook/`
   gated — the H2 reversal): signature verification is an additional gate

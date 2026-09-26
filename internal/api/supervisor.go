@@ -100,11 +100,13 @@ type cachedCityServer struct {
 //   - Per-city (registerCityRoutes): every operation at
 //     /v0/city/{cityName}/..., resolved at request time via bindCity.
 //
-// The non-Huma registrations on humaMux are the three sanctioned non-typed
-// surfaces (api-control-plane.md §3.9): serveCitySvcProxy at
-// "/v0/city/{cityName}/svc/" (workspace-service pass-through), and — when the
-// dashboard is attached — the embedded SPA at "/" and the host-side dashboard
-// plane at "/api/". Everything else is a typed Huma operation.
+// The non-Huma registrations on humaMux are the sanctioned non-typed surfaces
+// (api-control-plane.md §3.9): serveCitySvcProxy at
+// "/v0/city/{cityName}/svc/", serveCityHookProxy at
+// "/v0/city/{cityName}/hook/", and the opt-in bare "/hook/" receiver for a
+// standalone one-city controller. When the dashboard is attached, its SPA at
+// "/" and host-side plane at "/api/" are also non-Huma surfaces. Everything
+// else is a typed Huma operation.
 type SupervisorMux struct {
 	resolver        CityResolver
 	initializer     cityInitializer
@@ -188,6 +190,22 @@ func NewSupervisorMux(resolver CityResolver, initializer cityInitializer, readOn
 	humaMux.HandleFunc("/v0/city/{cityName}/hook/", sm.serveCityHookProxy)
 	sm.server = &http.Server{Handler: sm.Handler()}
 	return sm
+}
+
+// WithSingleCityWebhookPath mounts the narrow public /hook/<receiver> surface
+// for a standalone controller that owns exactly one city. The machine-wide
+// supervisor keeps its city-scoped /v0/city/<name>/hook path so a webhook must
+// identify its destination when multiple cities are managed.
+func (sm *SupervisorMux) WithSingleCityWebhookPath() error {
+	cities := sm.resolver.ListCities()
+	if len(cities) != 1 || strings.TrimSpace(cities[0].Name) == "" {
+		return errors.New("public /hook path requires exactly one named city")
+	}
+	cityName := cities[0].Name
+	sm.humaMux.HandleFunc("/hook/", func(w http.ResponseWriter, r *http.Request) {
+		sm.serveCityRequest(w, r, cityName, r.URL.Path)
+	})
+	return nil
 }
 
 // serveCitySvcProxy forwards /v0/city/{cityName}/svc/... to the per-city
@@ -420,9 +438,11 @@ func (sm *SupervisorMux) Shutdown(ctx context.Context) error {
 // ServeHTTP delegates every request to humaMux. Every typed
 // operation — supervisor-scope and city-scoped — is registered on the
 // supervisor's single Huma API. The non-Huma registrations are the
-// sanctioned §3.9 surfaces: serveCitySvcProxy at "/v0/city/{cityName}/svc/"
-// and, when the dashboard is attached, the SPA at "/" and the host-side
-// plane at "/api/". Go 1.22+ mux specificity routes
+// sanctioned §3.9 surfaces: serveCitySvcProxy at "/v0/city/{cityName}/svc/",
+// serveCityHookProxy at "/v0/city/{cityName}/hook/", the opt-in bare
+// "/hook/" receiver for a standalone one-city controller, and — when the
+// dashboard is attached — the SPA at "/" and the host-side plane at "/api/".
+// Go 1.22+ mux specificity routes
 // /v0/city/{cityName}/<typed-op> requests to the matching Huma
 // operation rather than a prefix handler.
 func (sm *SupervisorMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {

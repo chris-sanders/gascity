@@ -293,9 +293,11 @@ type City struct {
 	// Services declares workspace-owned HTTP services mounted on the
 	// controller edge under /svc/{name}.
 	Services []Service `toml:"service,omitempty"`
-	// Webhooks declares inbound HTTP receivers mounted on the supervisor edge
-	// under /hook/{name}. Composed like Services (pack concatenation + SourceDir
-	// provenance + the default-closed public pack-guard).
+	// Webhooks declares inbound HTTP receivers mounted on the supervisor edge.
+	// The machine-wide supervisor uses /v0/city/{city}/hook/{name}; a standalone
+	// controller can explicitly expose /hook/{name} for its single city.
+	// Composed like Services (pack concatenation + SourceDir provenance + the
+	// default-closed public pack-guard).
 	Webhooks []Webhook `toml:"webhook,omitempty"`
 	// WebhookPolicy holds city-level webhook governance (the [webhooks] table,
 	// notably allow_public grants). Authored only in the root city.toml; never
