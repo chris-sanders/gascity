@@ -31,6 +31,9 @@ const (
 	// "ws" EmptyDir mount point for staged pods and the image WORKDIR for
 	// prebaked ones — so it is what the pod spec's WorkingDir may safely name.
 	podWorkspaceRoot = "/workspace"
+
+	restrictedPodUID = int64(1000)
+	restrictedPodGID = int64(1000)
 )
 
 func controllerCityPath(cfgEnv map[string]string) string {
@@ -286,6 +289,9 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	// as root (see securityContext below), creates the user, sets up workspace
 	// ownership, then drops privileges via su for the tmux session.
 	linuxUsername := cfg.Env["LINUX_USERNAME"]
+	if strings.TrimSpace(linuxUsername) != "" {
+		return nil, fmt.Errorf("Kubernetes sessions require the image's non-root gcagent user; LINUX_USERNAME is incompatible with Restricted PodSecurity")
+	}
 	storeIdentity, err := resolvePodHostedDoltIdentity(cfg.Env, "", p.managedServiceHost, p.managedServicePort)
 	if err != nil {
 		return nil, err
@@ -484,7 +490,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 				TTY:             true,
 				Resources:       resources,
 				VolumeMounts:    mainVolMounts,
-				SecurityContext: agentSecurityContext(linuxUsername),
+				SecurityContext: restrictedContainerSecurityContext(),
 			}},
 			Volumes: volumes,
 		},
@@ -497,13 +503,16 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		pod.Spec.Affinity = p.affinity.DeepCopy()
 	}
 	pod.Spec.PriorityClassName = p.priorityClassName
-	if p.codexAuthSecret != "" {
-		// The base agent image uses the first regular UID/GID (1000) for its
-		// baked-in gcagent user. fsGroup makes the EmptyDir CODEX_HOME writable
-		// on the default non-root path; the dynamic-user path chowns it after
-		// creating that user.
-		fsGroup := int64(1000)
-		pod.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: &fsGroup}
+	// fsGroup keeps staged workspace and CODEX_HOME writable by the baked-in
+	// gcagent UID while the pod and every generated container satisfy Restricted.
+	uid, gid, fsGroup, runAsNonRoot := restrictedPodUID, restrictedPodGID, restrictedPodGID, true
+	seccomp := &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+	pod.Spec.SecurityContext = &corev1.PodSecurityContext{
+		RunAsNonRoot:   &runAsNonRoot,
+		RunAsUser:      &uid,
+		RunAsGroup:     &gid,
+		FSGroup:        &fsGroup,
+		SeccompProfile: seccomp,
 	}
 
 	// Add init container when staging is needed (skip when prebaked).
@@ -522,6 +531,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Command:         []string{"sh", "-c", "while [ ! -f /workspace/.gc-ready ]; do sleep 0.5; done"},
 			VolumeMounts:    initVolMounts,
+			SecurityContext: restrictedContainerSecurityContext(),
 		}}
 	}
 
@@ -542,17 +552,19 @@ func cloneTolerations(in []corev1.Toleration) []corev1.Toleration {
 	return out
 }
 
-// agentSecurityContext returns a container security context.
-// When a dynamic linux username is configured, the container starts as root
-// (UID 0) so it can create the user at runtime before dropping privileges.
-// When no dynamic user is set, returns nil (uses Dockerfile default: gcagent).
-func agentSecurityContext(linuxUsername string) *corev1.SecurityContext {
-	if linuxUsername == "" {
-		return nil
-	}
-	var rootUID int64
+// restrictedContainerSecurityContext returns the Restricted PodSecurity
+// fields required on every generated container. The image's baked-in gcagent
+// account is UID/GID 1000; runtime user creation would require root and is
+// rejected by buildPod.
+func restrictedContainerSecurityContext() *corev1.SecurityContext {
+	uid, gid, runAsNonRoot, allowPrivilegeEscalation := restrictedPodUID, restrictedPodGID, true, false
 	return &corev1.SecurityContext{
-		RunAsUser: &rootUID,
+		RunAsNonRoot:             &runAsNonRoot,
+		RunAsUser:                &uid,
+		RunAsGroup:               &gid,
+		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 	}
 }
 
