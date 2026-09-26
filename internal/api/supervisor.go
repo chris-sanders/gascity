@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -116,20 +117,21 @@ type cachedCityServer struct {
 // dashboard is attached — the embedded SPA at "/" and the host-side dashboard
 // plane at "/api/". Everything else is a typed Huma operation.
 type SupervisorMux struct {
-	resolver        CityResolver
-	initializer     cityInitializer
-	readOnly        bool
-	version         string
-	buildID         string
-	startedAt       time.Time
-	allowedOrigins  []string
-	allowedHosts    []string
-	allowAnyHost    bool
-	writeAuth       *citywriteauth.Verifier
-	readAuth        *citywriteauth.Verifier
-	dashboardBase   func() string
-	runCensusSource RunCensusSource
-	server          *http.Server
+	resolver                CityResolver
+	initializer             cityInitializer
+	readOnly                bool
+	version                 string
+	buildID                 string
+	startedAt               time.Time
+	allowedOrigins          []string
+	allowedHosts            []string
+	allowAnyHost            bool
+	writeAuth               *citywriteauth.Verifier
+	readAuth                *citywriteauth.Verifier
+	standaloneCityHookAlias string
+	dashboardBase           func() string
+	runCensusSource         RunCensusSource
+	server                  *http.Server
 
 	// Single Huma API (Phase 3.5 — Topology 1). Owns every typed
 	// operation: supervisor-scope (/v0/cities, /health, /v0/readiness,
@@ -265,11 +267,70 @@ func (sm *SupervisorMux) Handler() http.Handler {
 	if sm.readAuth != nil {
 		root = readAuthMiddleware(sm.readAuth, root)
 	}
+	// Canonicalize the standalone webhook alias outside auth middleware so
+	// auth classification and request digests see the same city-scoped path as
+	// direct callers.
+	if sm.standaloneCityHookAlias != "" {
+		root = standaloneCityHookAlias(sm.standaloneCityHookAlias, root)
+	}
 	audit := requestAuditConfig{
 		recorder:       sm.supervisorEventRecorder(),
 		allowedOrigins: sm.allowedOrigins,
 	}
 	return withLogging(withRecovery(withRequestID(withHostAllowing(sm.allowAnyHost, sm.allowedHosts, audit, withCORSAllowing(sm.allowedOrigins, root)))), audit)
+}
+
+// WithStandaloneCityHookAlias enables the public /hook/<receiver> edge alias
+// only when this mux currently resolves exactly one City. Machine-wide
+// supervisors must not enable this route.
+func (sm *SupervisorMux) WithStandaloneCityHookAlias(cityName string) *SupervisorMux {
+	cityName = strings.TrimSpace(cityName)
+	if cityName == "" || sm.resolver == nil {
+		return sm
+	}
+	cities := sm.resolver.ListCities()
+	if len(cities) != 1 || cities[0].Name != cityName {
+		return sm
+	}
+	sm.standaloneCityHookAlias = cityName
+	sm.server = &http.Server{Handler: sm.Handler()}
+	return sm
+}
+
+// standaloneCityHookAlias rewrites only the public webhook subtree to the
+// existing city-scoped route. It clones the request and URL so headers, body,
+// method, host, query, and context remain intact for auth and HMAC verification.
+func standaloneCityHookAlias(cityName string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		escapedPath := r.URL.EscapedPath()
+		if !strings.HasPrefix(escapedPath, "/hook/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		canonicalEscapedPath := "/v0/city/" + url.PathEscape(cityName) + "/hook" + strings.TrimPrefix(escapedPath, "/hook")
+		canonicalPath, err := url.PathUnescape(canonicalEscapedPath)
+		if err != nil {
+			// EscapedPath returns a valid escaped path for parsed HTTP requests.
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		request := r.Clone(r.Context())
+		requestURL := *r.URL
+		requestURL.Path = canonicalPath
+		requestURL.RawPath = canonicalEscapedPath
+		request.URL = &requestURL
+		request.RequestURI = canonicalEscapedPath
+		if requestURL.RawQuery != "" || requestURL.ForceQuery {
+			request.RequestURI += "?" + requestURL.RawQuery
+		}
+		next.ServeHTTP(w, request)
+	})
 }
 
 // WithAllowedOrigins sets extra CORS origins accepted beyond localhost and
