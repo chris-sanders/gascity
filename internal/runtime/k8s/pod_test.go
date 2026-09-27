@@ -116,11 +116,18 @@ func TestBuildPodSatisfiesRestrictedPodSecurityAndKeepsWorkspaceAndCodexVolumes(
 	if pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
 		t.Errorf("pod RunAsNonRoot = %v, want true", pod.Spec.SecurityContext.RunAsNonRoot)
 	}
+	const wantID int64 = 1001
+	if pod.Spec.SecurityContext.RunAsUser == nil || *pod.Spec.SecurityContext.RunAsUser != wantID {
+		t.Errorf("pod RunAsUser = %v, want %d", pod.Spec.SecurityContext.RunAsUser, wantID)
+	}
+	if pod.Spec.SecurityContext.RunAsGroup == nil || *pod.Spec.SecurityContext.RunAsGroup != wantID {
+		t.Errorf("pod RunAsGroup = %v, want %d", pod.Spec.SecurityContext.RunAsGroup, wantID)
+	}
 	if pod.Spec.SecurityContext.SeccompProfile == nil || pod.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Errorf("pod SeccompProfile = %#v, want RuntimeDefault", pod.Spec.SecurityContext.SeccompProfile)
 	}
-	if pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != restrictedPodGID {
-		t.Errorf("pod FSGroup = %v, want %d for writable workspace/CODEX_HOME", pod.Spec.SecurityContext.FSGroup, restrictedPodGID)
+	if pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != wantID {
+		t.Errorf("pod FSGroup = %v, want %d for writable workspace/CODEX_HOME", pod.Spec.SecurityContext.FSGroup, wantID)
 	}
 	containers := append([]corev1.Container(nil), pod.Spec.Containers...)
 	containers = append(containers, pod.Spec.InitContainers...)
@@ -137,6 +144,12 @@ func TestBuildPodSatisfiesRestrictedPodSecurityAndKeepsWorkspaceAndCodexVolumes(
 		}
 		if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
 			t.Errorf("container %q RunAsNonRoot = %v, want true", container.Name, sc.RunAsNonRoot)
+		}
+		if sc.RunAsUser == nil || *sc.RunAsUser != wantID {
+			t.Errorf("container %q RunAsUser = %v, want %d", container.Name, sc.RunAsUser, wantID)
+		}
+		if sc.RunAsGroup == nil || *sc.RunAsGroup != wantID {
+			t.Errorf("container %q RunAsGroup = %v, want %d", container.Name, sc.RunAsGroup, wantID)
 		}
 		if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 			t.Errorf("container %q SeccompProfile = %#v, want RuntimeDefault", container.Name, sc.SeccompProfile)
@@ -414,8 +427,8 @@ func TestBuildPod_CodexWorkerAuthIsProjectedAndSymlinked(t *testing.T) {
 	if homeVolume == nil || homeVolume.EmptyDir == nil {
 		t.Fatalf("CODEX_HOME volume = %#v, want EmptyDir", homeVolume)
 	}
-	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != 1000 {
-		t.Fatalf("pod fsGroup = %#v, want 1000 for writable CODEX_HOME", pod.Spec.SecurityContext)
+	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != 1001 {
+		t.Fatalf("pod fsGroup = %#v, want 1001 for writable CODEX_HOME", pod.Spec.SecurityContext)
 	}
 }
 

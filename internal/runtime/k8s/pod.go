@@ -32,8 +32,7 @@ const (
 	// prebaked ones — so it is what the pod spec's WorkingDir may safely name.
 	podWorkspaceRoot = "/workspace"
 
-	restrictedPodUID = int64(1000)
-	restrictedPodGID = int64(1000)
+	restrictedPodID = int64(1001)
 )
 
 func controllerCityPath(cfgEnv map[string]string) string {
@@ -505,7 +504,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	pod.Spec.PriorityClassName = p.priorityClassName
 	// fsGroup keeps staged workspace and CODEX_HOME writable by the baked-in
 	// gcagent UID while the pod and every generated container satisfy Restricted.
-	uid, gid, fsGroup, runAsNonRoot := restrictedPodUID, restrictedPodGID, restrictedPodGID, true
+	uid, gid, fsGroup, runAsNonRoot := restrictedPodID, restrictedPodID, restrictedPodID, true
 	seccomp := &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
 	pod.Spec.SecurityContext = &corev1.PodSecurityContext{
 		RunAsNonRoot:   &runAsNonRoot,
@@ -554,10 +553,10 @@ func cloneTolerations(in []corev1.Toleration) []corev1.Toleration {
 
 // restrictedContainerSecurityContext returns the Restricted PodSecurity
 // fields required on every generated container. The image's baked-in gcagent
-// account is UID/GID 1000; runtime user creation would require root and is
+// account is UID/GID 1001; runtime user creation would require root and is
 // rejected by buildPod.
 func restrictedContainerSecurityContext() *corev1.SecurityContext {
-	uid, gid, runAsNonRoot, allowPrivilegeEscalation := restrictedPodUID, restrictedPodGID, true, false
+	uid, gid, runAsNonRoot, allowPrivilegeEscalation := restrictedPodID, restrictedPodID, true, false
 	return &corev1.SecurityContext{
 		RunAsNonRoot:             &runAsNonRoot,
 		RunAsUser:                &uid,
