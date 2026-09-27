@@ -171,6 +171,7 @@ jobs:
             io.gascity.upstream.base=${{ env.UPSTREAM_BASE_SHA }}
             io.gascity.packaging=source-owned-controller-plus-stage14-agent
       - name: Probe immutable images as non-root
+        id: identity
         env:
           BASE_DIGEST: ${{ steps.base.outputs.digest }}
           AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
@@ -185,7 +186,20 @@ jobs:
           docker run --rm --entrypoint kubectl "$controller" version --client=true
           test "$(docker run --rm --entrypoint codex "$agent" --version)" = "codex-cli $CODEX_VERSION"
           docker run --rm --entrypoint codex "$agent" exec --sandbox read-only --ask-for-approval untrusted --help >/dev/null
-          docker run --rm --entrypoint /bin/sh "$agent" -c 'test "$(id -u)" = 1000; test "$(id -g)" = 1000; test ! -e "$HOME/.codex/auth.json"; test -w /workspace'
+          probe_gcagent() {
+            local role="$1" image="$2" identity uid gid home
+            identity="$(docker run --rm --entrypoint /bin/sh "$image" -c 'set -eu; uid="$(id -u gcagent)"; gid="$(id -g gcagent)"; test "$(id -u)" = "$uid"; test "$(id -g)" = "$gid"; printf "%s %s %s\n" "$uid" "$gid" "$HOME"')"
+            read -r uid gid home <<<"$identity"
+            printf 'gcagent identity role=%s uid=%s gid=%s HOME=%s\n' "$role" "$uid" "$gid" "$home"
+            test "$uid" = 1001
+            test "$gid" = 1001
+            test "$home" = /home/gcagent
+            printf '%s_uid=%s\n%s_gid=%s\n%s_home=%s\n' \
+              "$role" "$uid" "$role" "$gid" "$role" "$home" >>"$GITHUB_OUTPUT"
+          }
+          probe_gcagent agent "$agent"
+          probe_gcagent controller "$controller"
+          docker run --rm --entrypoint /bin/sh "$agent" -c 'test ! -e "$HOME/.codex/auth.json"; test -w /workspace'
       - name: Prove anonymous exact-digest manifest access
         env:
           BASE_DIGEST: ${{ steps.base.outputs.digest }}
@@ -212,8 +226,14 @@ jobs:
           BASE_DIGEST: ${{ steps.base.outputs.digest }}
           AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
           CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+          AGENT_UID: ${{ steps.identity.outputs.agent_uid }}
+          AGENT_GID: ${{ steps.identity.outputs.agent_gid }}
+          AGENT_HOME: ${{ steps.identity.outputs.agent_home }}
+          CONTROLLER_UID: ${{ steps.identity.outputs.controller_uid }}
+          CONTROLLER_GID: ${{ steps.identity.outputs.controller_gid }}
+          CONTROLLER_HOME: ${{ steps.identity.outputs.controller_home }}
         run: |
-          jq -n --slurpfile dependency source-dependency-evidence.json --arg source_class "$SOURCE_CLASS" --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg control_ref "$GITHUB_REF_NAME" --arg control_sha "$GITHUB_SHA" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" '{schema_version:1,status:"success",source_class:$source_class,source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),workflow_control_ref:$control_ref,workflow_control_sha:$control_sha,platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},source_dependency_contract:$dependency[0],probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
+          jq -n --slurpfile dependency source-dependency-evidence.json --arg source_class "$SOURCE_CLASS" --arg source_sha "$SOURCE_SHA" --arg upstream_base_sha "$UPSTREAM_BASE_SHA" --arg run_id "$GITHUB_RUN_ID" --arg control_ref "$GITHUB_REF_NAME" --arg control_sha "$GITHUB_SHA" --arg base "$BASE_DIGEST" --arg agent "$AGENT_DIGEST" --arg controller "$CONTROLLER_DIGEST" --arg codex "$CODEX_VERSION" --arg agent_uid "$AGENT_UID" --arg agent_gid "$AGENT_GID" --arg agent_home "$AGENT_HOME" --arg controller_uid "$CONTROLLER_UID" --arg controller_gid "$CONTROLLER_GID" --arg controller_home "$CONTROLLER_HOME" '{schema_version:1,status:"success",source_class:$source_class,source_sha:$source_sha,upstream_base_sha:$upstream_base_sha,workflow_run_id:($run_id|tonumber),workflow_control_ref:$control_ref,workflow_control_sha:$control_sha,platform:"linux/amd64",codex_version:$codex,images:{base:$base,agent:$agent,controller:$controller},gcagent_identity:{agent:{uid:($agent_uid|tonumber),gid:($agent_gid|tonumber),home:$agent_home},controller:{uid:($controller_uid|tonumber),gid:($controller_gid|tonumber),home:$controller_home}},source_dependency_contract:$dependency[0],probes:{gc:true,bd:true,dolt:true,kubectl:true,codex:true,non_root:true}}' | tee image-evidence.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gascity-images-${{ inputs.run_nonce || github.run_id }}
