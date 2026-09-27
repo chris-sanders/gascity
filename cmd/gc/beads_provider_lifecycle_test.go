@@ -6776,6 +6776,121 @@ esac
 	}
 }
 
+func TestGcBeadsBdProviderOwnedDirectExternalInitReconcilesProjectIdentity(t *testing.T) {
+	const projectID = "provider-owned-external-project"
+	const host = "dolt.example.test"
+	const port = "4406"
+
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"provider-owned-external\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	materializeBuiltinPacksForTest(t, cityPath)
+	script := gcBeadsBdScriptPath(cityPath)
+
+	binDir := t.TempDir()
+	fakeBd := filepath.Join(binDir, "bd")
+	bdArgsPath := filepath.Join(binDir, "bd-args")
+	fakeBdScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+[ "${1:-}" = init ] || exit 64
+printf '%%s\n' "$*" > "$GC_TEST_BD_ARGS"
+scope=""
+for arg do scope="$arg"; done
+mkdir -p "$scope/.beads"
+cat > "$scope/.beads/metadata.json" <<'JSON'
+{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq","project_id":%q,"dolt_server_host":"%s","dolt_server_port":"%s"}
+JSON
+exit 0
+`, projectID, host, port)
+	if err := os.WriteFile(fakeBd, []byte(fakeBdScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	remoteIDPath := filepath.Join(cityPath, ".gc", "remote-project-id")
+	if err := os.WriteFile(remoteIDPath, []byte(projectID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeGC := filepath.Join(binDir, "gc")
+	fakeGCScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+subcommand="${1:-} ${2:-}"
+[ "$subcommand" = "dolt-state ensure-project-id" ] || exit 64
+shift 2
+city="" metadata="" host="" port="" user="" database=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --city) city="$2"; shift 2 ;;
+    --metadata) metadata="$2"; shift 2 ;;
+    --host) host="$2"; shift 2 ;;
+    --port) port="$2"; shift 2 ;;
+    --user) user="$2"; shift 2 ;;
+    --database) database="$2"; shift 2 ;;
+    *) exit 64 ;;
+  esac
+done
+[ "$host" = %q ] && [ "$port" = %q ] && [ "$user" = root ] && [ "$database" = hq ] || exit 65
+python3 - "$city" "$metadata" "$GC_TEST_REMOTE_ID_FILE" <<'PY'
+import json, pathlib, sys
+city, metadata, remote = map(pathlib.Path, sys.argv[1:])
+l2 = json.loads(metadata.read_text())['project_id']
+l3 = remote.read_text().strip()
+if l2 != l3:
+    raise SystemExit(f"refusing mismatched fixture identities: L2={l2!r} L3={l3!r}")
+(city / '.beads' / 'identity.toml').write_text(f'[project]\nid = "{l2}"\n')
+PY
+`, host, port)
+	if err := os.WriteFile(fakeGC, []byte(fakeGCScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(script, "init", cityPath, "gc", "hq")
+	cmd.Env = sanitizedBaseEnv(append(gcBeadsBdTestHomeEnv(t),
+		"GC_CITY_PATH="+cityPath,
+		"GC_BIN="+fakeGC,
+		"BD_BIN="+fakeBd,
+		"BEADS_DIR="+filepath.Join(cityPath, ".beads"),
+		"GC_BEADS_PROVIDER_OWNED=1",
+		"GC_BEADS_TRANSPORT=direct",
+		"GC_BEADS_TARGET=external",
+		"GC_DOLT_HOST="+host,
+		"GC_DOLT_PORT="+port,
+		"GC_DOLT_USER=root",
+		"GC_TEST_BD_ARGS="+bdArgsPath,
+		"GC_TEST_REMOTE_ID_FILE="+remoteIDPath,
+		"PATH="+os.Getenv("PATH"),
+	)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("provider-owned direct/external init failed: %v\n%s", err, out)
+	}
+	bdArgs, err := os.ReadFile(bdArgsPath)
+	if err != nil {
+		t.Fatalf("read provider-owned bd init arguments: %v", err)
+	}
+	wantBdArgs := "init --init-if-missing --quiet --server --external --server-host " + host + " --server-port " + port + " -p gc --skip-hooks --skip-agents --database hq " + cityPath
+	if got := strings.TrimSpace(string(bdArgs)); got != wantBdArgs {
+		t.Fatalf("provider-owned bd init args = %q, want %q", got, wantBdArgs)
+	}
+
+	metadataPath := filepath.Join(cityPath, ".beads", "metadata.json")
+	l2, err := readManagedMetadataProjectID(metadataPath)
+	if err != nil || l2 != projectID {
+		t.Fatalf("metadata project identity after init = (%q, %v), want %q", l2, err, projectID)
+	}
+	l1, l1OK, err := contract.ReadProjectIdentity(fsys.OSFS{}, cityPath)
+	if err != nil || !l1OK || l1 != projectID {
+		t.Fatalf("canonical project identity after init = (%q, %v, %v), want %q", l1, l1OK, err, projectID)
+	}
+	remoteAfter, err := os.ReadFile(remoteIDPath)
+	if err != nil || strings.TrimSpace(string(remoteAfter)) != projectID {
+		t.Fatalf("remote project identity after init = (%q, %v), want unchanged %q", strings.TrimSpace(string(remoteAfter)), err, projectID)
+	}
+}
+
 func TestGcBeadsBdInitUsesProjectIDHelperWithoutRepoIDMigration(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
