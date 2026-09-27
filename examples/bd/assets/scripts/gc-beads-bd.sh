@@ -3664,6 +3664,8 @@ op_provider_owned_init() {
     # registerProviderOwnedScopeCustomTypes) alongside the canonical config it
     # writes for the same scope.
     GC_BEADS_PROVIDER_INIT=1 run_provider_owned_bd "$dir" "$@"
+    DOLT_PORT="${GC_DOLT_PORT:-$DOLT_PORT}"
+    ensure_project_identity "$dir"
 }
 
 # provider_owned_retire_local_dolt retires the local Dolt lifecycle bd owns for

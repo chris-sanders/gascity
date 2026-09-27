@@ -5527,6 +5527,9 @@ func TestInitFromSkip(t *testing.T) {
 		{filepath.Join(".gc", "prompts", "mayor.md"), false, true},
 		{".beads", true, true},
 		{filepath.Join(".beads", "metadata.json"), false, true},
+		{filepath.Join("rigs", "fixture-a", ".beads"), true, true},
+		{filepath.Join("rigs", "fixture-a", ".beads", "formulas", "stale.formula.toml"), false, true},
+		{filepath.Join("rigs", "fixture-a", "ordinary-project-file"), false, false},
 		{"gastown_test.go", false, true},
 		{filepath.Join("sub", "foo_test.go"), false, true},
 		{"city.toml", false, false},
@@ -5570,6 +5573,49 @@ func TestDoInitFromDirExcludesProviderOwnedBeadsState(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cityPath, ".beads")); !os.IsNotExist(err) {
 		t.Fatalf("provider-owned .beads state was copied, stat err = %v", err)
+	}
+}
+
+func TestDoInitFromDirExcludesNestedRigBeadsState(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	configureIsolatedRuntimeEnv(t)
+
+	parent := t.TempDir()
+	srcDir := filepath.Join(parent, "template")
+	ordinaryFile := filepath.Join(srcDir, "rigs", "fixture-a", "ordinary-project-file")
+	staleFormula := filepath.Join(srcDir, "rigs", "fixture-a", ".beads", "formulas", "stale.formula.toml")
+	if err := os.MkdirAll(filepath.Dir(ordinaryFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(staleFormula), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "city.toml"), []byte("[workspace]\nname = \"template\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ordinaryFile, []byte("keep this rig project file\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staleFormula, []byte("stale rig runtime state\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cityPath := filepath.Join(parent, "city")
+	var stdout, stderr bytes.Buffer
+	if code := doInitFromDir(srcDir, cityPath, &stdout, &stderr); code != 0 {
+		t.Fatalf("doInitFromDir = %d; stderr: %s", code, stderr.String())
+	}
+
+	gotOrdinary, err := os.ReadFile(filepath.Join(cityPath, "rigs", "fixture-a", "ordinary-project-file"))
+	if err != nil {
+		t.Fatalf("ordinary nested rig file was not copied: %v", err)
+	}
+	if string(gotOrdinary) != "keep this rig project file\n" {
+		t.Fatalf("ordinary nested rig file = %q, want its original contents", gotOrdinary)
+	}
+	if _, err := os.Stat(filepath.Join(cityPath, "rigs", "fixture-a", ".beads")); !os.IsNotExist(err) {
+		t.Fatalf("nested rig .beads state was copied, stat err = %v", err)
 	}
 }
 
