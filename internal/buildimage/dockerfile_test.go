@@ -1,9 +1,40 @@
 package buildimage
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestKubernetesImagesUseBakedGcagent(t *testing.T) {
+	readDockerfile := func(name string) string {
+		t.Helper()
+		path := filepath.Join("..", "..", "contrib", "k8s", name)
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		return string(content)
+	}
+
+	base := readDockerfile("Dockerfile.base")
+	for _, want := range []string{
+		"RUN useradd -m -s /bin/bash gcagent",
+		"ENV HOME=/home/gcagent",
+		"USER gcagent",
+	} {
+		if !strings.Contains(base, want) {
+			t.Errorf("contrib/k8s/Dockerfile.base missing baked gcagent contract %q", want)
+		}
+	}
+
+	for _, name := range []string{"Dockerfile.agent", "Dockerfile.controller"} {
+		if !strings.Contains(readDockerfile(name), "USER gcagent") {
+			t.Errorf("contrib/k8s/%s does not select the baked gcagent user", name)
+		}
+	}
+}
 
 func TestGenerateDockerfile(t *testing.T) {
 	content := string(GenerateDockerfile("gc-agent:latest"))
