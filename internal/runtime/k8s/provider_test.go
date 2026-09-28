@@ -2315,7 +2315,7 @@ func TestBuildPodServiceAccount(t *testing.T) {
 func TestInitCityInPodSkipsDolt(t *testing.T) {
 	fake := newFakeK8sOps()
 
-	err := initCityInPod(context.Background(), fake, "gc-mayor", "/city", nil)
+	err := initCityInPod(context.Background(), fake, "gc-mayor", "/city", "", nil)
 	if err != nil {
 		t.Fatalf("initCityInPod: %v", err)
 	}
@@ -2379,7 +2379,7 @@ func TestInitCityInPodUsesCityHostedDoltIdentity(t *testing.T) {
 		Host:      "hq.dolt.example",
 		Port:      "4406",
 	}
-	if err := initCityInPod(context.Background(), fake, "gc-mayor", "/city", identity); err != nil {
+	if err := initCityInPod(context.Background(), fake, "gc-mayor", "/city", "", identity); err != nil {
 		t.Fatalf("initCityInPod: %v", err)
 	}
 	for _, call := range fake.calls {
