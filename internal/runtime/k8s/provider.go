@@ -263,7 +263,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 				cleanup("City store identity invalid")
 				return fmt.Errorf("resolving City store identity for session %q: %w", name, err)
 			}
-			if err := initCityInPod(ctx, p.ops, podName, ctrlCity, cityIdentity); err != nil {
+			if err := initCityInPod(ctx, p.ops, podName, ctrlCity, cfg.WorkDir, cityIdentity); err != nil {
 				cleanup("City initialization failed")
 				return fmt.Errorf("initializing City in pod for session %q: %w", name, err)
 			}
@@ -963,9 +963,13 @@ func resolvePodHostedDoltIdentity(env map[string]string, prefix, managedHost, ma
 }
 
 // initCityInPod copies the city directory and runs gc init inside the pod.
-func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string, identity *podHostedDoltIdentity) error {
+// A non-city workdir may already have been staged by stageFiles. In that case
+// leave the exact controller-relative workdir out of the city template so the
+// pod does not import the same Git worktree a second time.
+func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity, stagedWorkDir string, identity *podHostedDoltIdentity) error {
+	workDirRel, _ := relativeCityWorkDir(ctrlCity, stagedWorkDir)
 	// Copy city dir (excluding .gc/) into the pod.
-	if err := copyDirToPod(ctx, ops, podName, "agent", ctrlCity, "/tmp/city-src"); err != nil {
+	if err := copyDirToPodSkipping(ctx, ops, podName, "agent", ctrlCity, "/tmp/city-src", workDirRel); err != nil {
 		return err
 	}
 	// Run gc init --from with GC_DOLT=skip so gc init does not attempt to

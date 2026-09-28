@@ -78,6 +78,105 @@ func TestTarFileStripsOwnership(t *testing.T) {
 	}
 }
 
+func TestInitCityInPodSkipsSeparatelyStagedNestedWorkDir(t *testing.T) {
+	cityRoot := t.TempDir()
+	workDir := filepath.Join(cityRoot, "rigs", "fixture-a")
+	if err := os.MkdirAll(filepath.Join(workDir, ".git", "objects"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", workDir, err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityRoot, "rigs", "other"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(other rig): %v", err)
+	}
+	files := map[string]string{
+		filepath.Join(cityRoot, "city.toml"):                              "city configuration",
+		filepath.Join(workDir, ".git", "objects", "pack-file"):            "git object",
+		filepath.Join(workDir, "ordinary.txt"):                            "active worktree file",
+		filepath.Join(cityRoot, "rigs", "other", "ordinary-project-file"): "other rig content",
+	}
+	for path, contents := range files {
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+
+	ops := newCapturingStageOps()
+	if err := stageFiles(context.Background(), ops, "gc-worker", runtime.Config{WorkDir: workDir}, cityRoot, io.Discard); err != nil {
+		t.Fatalf("stageFiles: %v", err)
+	}
+	if err := initCityInPod(context.Background(), ops, "gc-worker", cityRoot, workDir, nil); err != nil {
+		t.Fatalf("initCityInPod: %v", err)
+	}
+
+	// The dedicated staging path remains the sole source of the active workdir,
+	// including its Git metadata.
+	if got := ops.files["/workspace/rigs/fixture-a/.git/objects/pack-file"]; got != "git object" {
+		t.Fatalf("staged Git object = %q, want dedicated workdir copy", got)
+	}
+	if got := ops.files["/workspace/rigs/fixture-a/ordinary.txt"]; got != "active worktree file" {
+		t.Fatalf("staged workdir file = %q, want dedicated workdir copy", got)
+	}
+
+	// The City template still contains ordinary City content but not the
+	// separately staged workdir subtree.
+	for _, path := range []string{
+		"/tmp/city-src/city.toml",
+		"/tmp/city-src/rigs/other/ordinary-project-file",
+	} {
+		if _, ok := ops.files[path]; !ok {
+			t.Fatalf("City template missing ordinary content %q", path)
+		}
+	}
+	for _, path := range []string{
+		"/tmp/city-src/rigs/fixture-a/.git/objects/pack-file",
+		"/tmp/city-src/rigs/fixture-a/ordinary.txt",
+	} {
+		if _, ok := ops.files[path]; ok {
+			t.Fatalf("City template unexpectedly recopied active workdir %q", path)
+		}
+	}
+}
+
+func TestInitCityInPodKeepsCityRootWorkDirInTemplate(t *testing.T) {
+	cityRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityRoot, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cityRoot, ".git", "config"), []byte("git config"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	ops := newCapturingStageOps()
+	if err := initCityInPod(context.Background(), ops, "gc-worker", cityRoot, cityRoot, nil); err != nil {
+		t.Fatalf("initCityInPod: %v", err)
+	}
+	if got := ops.files["/tmp/city-src/.git/config"]; got != "git config" {
+		t.Fatalf("City-root workdir template file = %q, want unchanged copy", got)
+	}
+}
+
+func TestRelativeCityWorkDir(t *testing.T) {
+	cityRoot := filepath.Join(string(filepath.Separator), "city")
+	tests := []struct {
+		name   string
+		work   string
+		want   string
+		inside bool
+	}{
+		{name: "nested", work: filepath.Join(cityRoot, "rigs", "fixture-a"), want: "rigs/fixture-a", inside: true},
+		{name: "city root", work: cityRoot},
+		{name: "sibling with shared prefix", work: cityRoot + "-backup"},
+		{name: "outside", work: filepath.Join(string(filepath.Separator), "workspace")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, inside := relativeCityWorkDir(cityRoot, tt.work)
+			if got != tt.want || inside != tt.inside {
+				t.Fatalf("relativeCityWorkDir(%q, %q) = %q, %v; want %q, %v", cityRoot, tt.work, got, inside, tt.want, tt.inside)
+			}
+		})
+	}
+}
+
 func TestStageFilesStagesKiroPackOverlayAtWorkspaceRoot(t *testing.T) {
 	workDir := t.TempDir()
 	projectInstructions := filepath.Join(workDir, "AGENTS.md")
