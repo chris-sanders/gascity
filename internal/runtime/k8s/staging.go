@@ -14,6 +14,28 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
+// relativeCityWorkDir returns the workdir path relative to the controller
+// City when the workdir is a strict descendant of that City. The boolean is
+// false for a City-root workdir or a path outside the City, both of which must
+// not cause the City template copy to omit anything.
+func relativeCityWorkDir(ctrlCity, workDir string) (string, bool) {
+	ctrlCity = strings.TrimSpace(ctrlCity)
+	workDir = strings.TrimSpace(workDir)
+	if ctrlCity == "" || workDir == "" {
+		return "", false
+	}
+	ctrlCity = filepath.Clean(ctrlCity)
+	workDir = filepath.Clean(workDir)
+	if ctrlCity == workDir {
+		return "", false
+	}
+	rel, err := filepath.Rel(ctrlCity, workDir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
 // stageFiles copies overlay, copy_files, and rig workdir into the pod
 // via the init container, then signals it to exit.
 func stageFiles(ctx context.Context, ops k8sOps, podName string, cfg runtime.Config, ctrlCity string, warn io.Writer) error {
@@ -193,6 +215,14 @@ func waitForExecReady(ctx context.Context, ops k8sOps, podName string, timeout t
 
 // copyDirToPod copies a local directory into the pod via tar-based exec.
 func copyDirToPod(ctx context.Context, ops k8sOps, podName, container, srcDir, dstDir string) error {
+	return copyDirToPodSkipping(ctx, ops, podName, container, srcDir, dstDir, "")
+}
+
+// copyDirToPodSkipping copies a local directory into the pod while excluding
+// one controller-relative subtree from the tar archive. It is used only for
+// the Kubernetes City template copy, where a separately staged active workdir
+// must remain owned by its dedicated staging path.
+func copyDirToPodSkipping(ctx context.Context, ops k8sOps, podName, container, srcDir, dstDir, skipRel string) error {
 	info, err := os.Stat(srcDir)
 	if err != nil || !info.IsDir() {
 		return nil // skip silently if not a directory
@@ -204,7 +234,7 @@ func copyDirToPod(ctx context.Context, ops k8sOps, podName, container, srcDir, d
 
 	// Build tar archive of the source directory.
 	var buf bytes.Buffer
-	if err := tarDir(srcDir, &buf); err != nil {
+	if err := tarDirSkipping(srcDir, &buf, skipRel); err != nil {
 		return fmt.Errorf("creating tar of %s: %w", srcDir, err)
 	}
 
@@ -241,8 +271,19 @@ func copyToPod(ctx context.Context, ops k8sOps, podName, container, src, dst str
 
 // tarDir creates a tar archive of a directory's contents.
 func tarDir(dir string, w io.Writer) error {
+	return tarDirSkipping(dir, w, "")
+}
+
+// tarDirSkipping creates a tar archive of a directory's contents, excluding
+// the exact relative directory skipRel and everything below it. An empty
+// skipRel preserves the original complete-directory behavior.
+func tarDirSkipping(dir string, w io.Writer, skipRel string) error {
 	tw := tar.NewWriter(w)
 	defer func() { _ = tw.Close() }()
+	skipRel = filepath.ToSlash(filepath.Clean(skipRel))
+	if skipRel == "." || skipRel == ".." || strings.HasPrefix(skipRel, "../") {
+		skipRel = ""
+	}
 
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -255,6 +296,15 @@ func tarDir(dir string, w io.Writer) error {
 		}
 		if rel == "." {
 			return nil
+		}
+		if skipRel != "" {
+			relSlash := filepath.ToSlash(rel)
+			if relSlash == skipRel || strings.HasPrefix(relSlash, skipRel+"/") {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 		}
 
 		// Dereference symlinks: use the resolved path for both stat and open
