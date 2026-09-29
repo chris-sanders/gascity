@@ -373,7 +373,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	}
 
 	// Build environment, remapping K8s-specific vars.
-	env, err := buildPodEnv(cfg.Env, podWorkDir, p.managedServiceHost, p.managedServicePort)
+	env, err := buildPodEnvWithSecretRefs(cfg.Env, p.secretEnvRefs, podWorkDir, p.managedServiceHost, p.managedServicePort)
 	if err != nil {
 		return nil, err
 	}
@@ -571,6 +571,10 @@ func restrictedContainerSecurityContext() *corev1.SecurityContext {
 // Removes controller-only vars, strips deprecated K8s compatibility inputs,
 // and remaps pod-visible ones.
 func buildPodEnv(cfgEnv map[string]string, podWorkDir, managedServiceHost, managedServicePort string) ([]corev1.EnvVar, error) {
+	return buildPodEnvWithSecretRefs(cfgEnv, nil, podWorkDir, managedServiceHost, managedServicePort)
+}
+
+func buildPodEnvWithSecretRefs(cfgEnv map[string]string, secretEnvRefs []secretEnvRef, podWorkDir, managedServiceHost, managedServicePort string) ([]corev1.EnvVar, error) {
 	// Start with cfg.Env, removing controller-only vars.
 	// Auth creds (GC_DOLT_USER, GC_DOLT_PASSWORD, BEADS_DOLT_*_USER/PASSWORD) intentionally pass through.
 	skip := map[string]bool{
@@ -649,17 +653,45 @@ func buildPodEnv(cfgEnv map[string]string, podWorkDir, managedServiceHost, manag
 		env = append(env, corev1.EnvVar{Name: "CLAUDE_CONFIG_DIR", Value: "/home/gcagent/.claude"})
 	}
 
-	// Inject GITHUB_TOKEN from optional K8s secret for git push in pods.
-	env = append(env, corev1.EnvVar{
-		Name: "GITHUB_TOKEN",
-		ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: "git-credentials"},
-				Key:                  "token",
-				Optional:             boolPtr(true),
+	configuredSecretEnvNames := make(map[string]struct{}, len(secretEnvRefs))
+	for _, ref := range secretEnvRefs {
+		configuredSecretEnvNames[ref.Name] = struct{}{}
+	}
+	if len(configuredSecretEnvNames) > 0 {
+		filtered := env[:0]
+		for _, item := range env {
+			if _, projected := configuredSecretEnvNames[item.Name]; projected {
+				continue
+			}
+			filtered = append(filtered, item)
+		}
+		env = filtered
+	}
+	for _, ref := range secretEnvRefs {
+		env = append(env, corev1.EnvVar{
+			Name: ref.Name,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: ref.Secret},
+					Key:                  ref.Key,
+					Optional:             boolPtr(ref.Optional),
+				},
 			},
-		},
-	})
+		})
+	}
+	if _, configured := configuredSecretEnvNames["GITHUB_TOKEN"]; !configured {
+		// Preserve the accepted optional legacy projection for upstream users.
+		env = append(env, corev1.EnvVar{
+			Name: "GITHUB_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "git-credentials"},
+					Key:                  "token",
+					Optional:             boolPtr(true),
+				},
+			},
+		})
+	}
 
 	return env, nil
 }

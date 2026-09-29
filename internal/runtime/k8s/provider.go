@@ -52,6 +52,7 @@ type Provider struct {
 	affinity           *corev1.Affinity    // GC_K8S_AFFINITY (JSON)
 	priorityClassName  string              // GC_K8S_PRIORITY_CLASS_NAME
 	codexAuthSecret    string              // GC_K8S_CODEX_AUTH_SECRET: worker auth Secret
+	secretEnvRefs      []secretEnvRef      // GC_K8S_SECRET_ENV: worker SecretKeyRef env
 	postStartSettle    time.Duration       // settle time before post-start liveness check
 	stderr             io.Writer           // warning output (default os.Stderr)
 }
@@ -74,6 +75,8 @@ type schedulingFields struct {
 //   - GC_K8S_CODEX_AUTH_SECRET — optional Secret containing worker auth.json.
 //     It is projected as a read-only directory and symlinked into a writable
 //     CODEX_HOME; it is never copied into worker state.
+//   - GC_K8S_SECRET_ENV — JSON array of SecretKeyRef environment references
+//     projected into worker Pods; Secret values are resolved by kubelet.
 //
 // The in-cluster Dolt service alias defaults to the provider defaults
 // (dolt.gc.svc.cluster.local:3307). Pods receive projected GC_DOLT_* env;
@@ -86,6 +89,10 @@ func NewProvider() (*Provider, error) {
 	namespace := envOrDefault("GC_K8S_NAMESPACE", "gc")
 	image := os.Getenv("GC_K8S_IMAGE")
 	k8sContext := os.Getenv("GC_K8S_CONTEXT")
+	secretEnvRefs, err := parseSecretEnvProjection(os.Getenv("GC_K8S_SECRET_ENV"))
+	if err != nil {
+		return nil, err
+	}
 
 	restConfig, err := buildRESTConfig(k8sContext)
 	if err != nil {
@@ -131,6 +138,7 @@ func NewProvider() (*Provider, error) {
 		affinity:           scheduling.affinity,
 		priorityClassName:  scheduling.priorityClassName,
 		codexAuthSecret:    strings.TrimSpace(os.Getenv("GC_K8S_CODEX_AUTH_SECRET")),
+		secretEnvRefs:      secretEnvRefs,
 	}, nil
 }
 

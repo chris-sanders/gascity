@@ -3356,7 +3356,7 @@ dolt.auto-start: false
 // `gc order run` exec order fails after echoing the controller's projected
 // GitHub token, the token is redacted from the error and combined output
 // printed to stderr. The exec env now projects GH_TOKEN/GITHUB_TOKEN into the
-// child (see projectGitHubTokenExecEnv), so the manual failure path must scrub
+// child (see projectForgeTokenExecEnv), so the manual failure path must scrub
 // them just like the controller dispatch path does.
 func TestOrderRunExecFailureRedactsProjectedGitHubToken(t *testing.T) {
 	disableManagedDoltRecoveryForTest(t)
@@ -3403,7 +3403,7 @@ prefix = "ct"
 // `gc order run` exec order succeeds after echoing the controller's projected
 // GitHub token, the token is redacted from the combined output printed to
 // stdout. The exec env projects GH_TOKEN/GITHUB_TOKEN into the child (see
-// projectGitHubTokenExecEnv), so the success path must scrub them just like the
+// projectForgeTokenExecEnv), so the success path must scrub them just like the
 // failure path does — a passing order that prints the token would otherwise
 // leak it verbatim.
 func TestOrderRunExecSuccessRedactsProjectedGitHubToken(t *testing.T) {
@@ -3441,6 +3441,74 @@ prefix = "ct"
 	}
 	if !strings.Contains(stdout.String(), "[redacted]") {
 		t.Fatalf("stdout = %q, want redaction marker for the echoed token", stdout.String())
+	}
+}
+
+func TestOrderRunExecFailureRedactsProjectedGiteaToken(t *testing.T) {
+	disableManagedDoltRecoveryForTest(t)
+	const secret = "gitea_projectedControllerToken0123456789"
+	t.Setenv("GITEA_TOKEN", secret)
+
+	cityDir := t.TempDir()
+	writeFile(t, filepath.Join(cityDir, "city.toml"), `[workspace]
+name = "test-city"
+prefix = "ct"
+`)
+	cfg, err := loadCityConfig(cityDir)
+	if err != nil {
+		t.Fatalf("loadCityConfig: %v", err)
+	}
+	a := orders.Order{
+		Name:     "leaky",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     `printf '%s\n' "$GITEA_TOKEN"; exit 1`,
+	}
+
+	var stdout, stderr bytes.Buffer
+	result := doOrderRunExecResult(a, cityDir, cfg, nil, &stdout, &stderr)
+	if result.code == 0 {
+		t.Fatalf("doOrderRunExecResult = 0, want exec failure; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), secret) {
+		t.Fatalf("stderr leaked projected Gitea token: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "[redacted]") {
+		t.Fatalf("stderr = %q, want redaction marker", stderr.String())
+	}
+}
+
+func TestOrderRunExecSuccessRedactsProjectedGiteaToken(t *testing.T) {
+	disableManagedDoltRecoveryForTest(t)
+	const secret = "gitea_projectedControllerToken0123456789"
+	t.Setenv("GITEA_TOKEN", secret)
+
+	cityDir := t.TempDir()
+	writeFile(t, filepath.Join(cityDir, "city.toml"), `[workspace]
+name = "test-city"
+prefix = "ct"
+`)
+	cfg, err := loadCityConfig(cityDir)
+	if err != nil {
+		t.Fatalf("loadCityConfig: %v", err)
+	}
+	a := orders.Order{
+		Name:     "leaky",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     `printf '%s\n' "$GITEA_TOKEN"`,
+	}
+
+	var stdout, stderr bytes.Buffer
+	result := doOrderRunExecResult(a, cityDir, cfg, nil, &stdout, &stderr)
+	if result.code != 0 {
+		t.Fatalf("doOrderRunExecResult = %d, want exec success; stdout=%q stderr=%q", result.code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), secret) {
+		t.Fatalf("stdout leaked projected Gitea token: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "[redacted]") {
+		t.Fatalf("stdout = %q, want redaction marker", stdout.String())
 	}
 }
 
