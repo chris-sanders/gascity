@@ -43,6 +43,7 @@ go_test(
         "name_test.go",
         "pod_test.go",
         "provider_stale_probe_test.go",
+        "provider_local_state_test.go",
         "provider_test.go",
         "seams_test.go",
         "secret_env_test.go",

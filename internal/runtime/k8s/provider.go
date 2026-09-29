@@ -275,6 +275,11 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 				cleanup("City initialization failed")
 				return fmt.Errorf("initializing City in pod for session %q: %w", name, err)
 			}
+			if err := projectK8sLocalStateInPod(ctx, p.ops, podName, ctrlCity); err != nil {
+				cleanup("City local-state projection failed")
+				return fmt.Errorf("projecting City local state for session %q: %w", name, err)
+			}
+			cleanupCitySourceInPod(ctx, p.ops, podName)
 		}
 
 	}
@@ -990,10 +995,22 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity, stagedWor
 	if err != nil {
 		return err
 	}
-	// Clean up.
+	return nil
+}
+
+func projectK8sLocalStateInPod(ctx context.Context, ops k8sOps, podName, controllerCityRoot string) error {
+	_, err := ops.execInPod(ctx, podName, "agent", []string{
+		"gc", "internal", "project-k8s-local-state",
+		"--source-root", "/tmp/city-src",
+		"--controller-city-root", controllerCityRoot,
+		"--dest-root", "/workspace",
+	}, nil)
+	return err
+}
+
+func cleanupCitySourceInPod(ctx context.Context, ops k8sOps, podName string) {
 	_, _ = ops.execInPod(ctx, podName, "agent",
 		[]string{"rm", "-rf", "/tmp/city-src"}, nil)
-	return nil
 }
 
 // initBeadsInPod verifies or initializes the exact hosted-Dolt identity for

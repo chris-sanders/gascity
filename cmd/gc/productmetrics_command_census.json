@@ -2139,6 +2139,21 @@
       "exclusion": "hidden-private"
     },
     {
+      "path": "gc internal project-k8s-local-state",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": true,
+      "effective_hidden": true,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "excluded",
+      "mode": "hidden-private",
+      "notice_policy": "ineligible",
+      "classification": "excluded",
+      "owner": "excluded",
+      "exclusion": "hidden-private"
+    },
+    {
       "path": "gc internal project-mcp",
       "aliases": [],
       "conditional_modes": [],
