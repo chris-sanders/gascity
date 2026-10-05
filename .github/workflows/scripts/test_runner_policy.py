@@ -19,6 +19,27 @@ class RunnerPolicyTests(unittest.TestCase):
 
             self.assertEqual(runner_policy.load_allowlist(path), {"julianknutsen", "csells"})
 
+    def test_missing_allowlist_uses_github_for_unlisted_pull_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_path = Path(tmp) / "missing-allowlist.txt"
+            self.assertFalse(missing_path.exists())
+
+            allowlist = runner_policy.load_allowlist(missing_path)
+            self.assertEqual(allowlist, set())
+
+            use_blacksmith, reason, runners = runner_policy.select_runners(
+                "pull_request",
+                "external-contributor",
+                allowlist,
+                force_blacksmith=False,
+            )
+
+        self.assertFalse(use_blacksmith)
+        self.assertIn("not on the Blacksmith allowlist", reason)
+        self.assertIn("using GitHub-hosted runners", reason)
+        self.assertEqual(runners["runner_32vcpu"], "ubuntu-latest")
+        self.assertEqual(runners["runner_macos"], "macos-15")
+
     def test_pull_request_from_allowlisted_author_uses_blacksmith(self) -> None:
         use_blacksmith, reason, runners = runner_policy.select_runners(
             "pull_request",
