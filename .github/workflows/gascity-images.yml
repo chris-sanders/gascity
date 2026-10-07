@@ -42,8 +42,8 @@ jobs:
       UPSTREAM_BASE_SHA: ${{ inputs.upstream_base_sha }}
       SOURCE_SHA: ${{ inputs.source_sha }}
       PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
-      CODEX_VERSION: 0.155.1
-      CODEX_TARBALL_SHA512: 6adbf71c5d26b9ba81d09fd7910d89a29a8acd727effb690b5307632427d32badaba3308cfccdb0822f294b90ddcfce95464c9cf340537fc03d68abca093c92a
+      CODEX_VERSION: 0.160.1
+      CODEX_TARBALL_SHA512: b080e1a95f9bb1928a55a545558e6207ea40cf23b3d97466dc7d4a5c2b122701a3e69f7caa7ad3d05c1ea351df7bb5a7c93a7c99f04d75b57351e3be98762e80
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
