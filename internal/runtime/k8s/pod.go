@@ -72,17 +72,27 @@ func projectedPodWorkDir(cfg runtime.Config) string {
 	return podWorkDir
 }
 
-// agentCommandB64 resolves the agent command, remaps controller-side city path
-// references to the pod-side /workspace, and returns its base64 form. Shared by
-// buildPod (the pod entrypoint) and Relaunch (respawn over execInPod) so the
-// entrypoint launch and a relaunch produce a byte-identical command.
+// agentCommandB64 resolves the agent command and its configured startup prompt,
+// remaps controller-side city path references to the pod-side /workspace, and
+// returns its base64 form. PromptSuffix is already shell-quoted by the shared
+// prompt-delivery resolver; it is empty for nudge-mode and oversized fallback.
+// Shared by buildPod (the pod entrypoint) and Relaunch (respawn over execInPod)
+// so the entrypoint launch and a relaunch produce a byte-identical command.
 func agentCommandB64(cfg runtime.Config) string {
 	cmd := cfg.Command
 	if cmd == "" {
 		cmd = "/bin/bash"
 	}
+	if cfg.PromptSuffix != "" {
+		if cfg.PromptFlag != "" {
+			cmd += " " + cfg.PromptFlag + " " + cfg.PromptSuffix
+		} else {
+			cmd += " " + cfg.PromptSuffix
+		}
+	}
 	// The controller expands {{.ConfigDir}} templates using its own city path
-	// (e.g. /city/packs/...) but pods have files at /workspace/....
+	// (e.g. /city/packs/...) but pods have files at /workspace/.... Apply this
+	// after adding the prompt so path references in either part are remapped.
 	if ctrlCity := controllerCityPath(cfg.Env); ctrlCity != "" {
 		cmd = strings.ReplaceAll(cmd, ctrlCity, "/workspace")
 	}
