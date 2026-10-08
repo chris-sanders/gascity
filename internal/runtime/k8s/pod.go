@@ -124,9 +124,10 @@ func agentCommandShellArgs(script string, cfg runtime.Config) []string {
 }
 
 // buildAgentLaunchCommand builds the static shell transport shared by Start and
-// Relaunch. Dynamic-user launches stream the decoded command through stdin to a
-// static su -c script; only the decoded variable is passed to tmux, quoted as a
-// single argument. tmuxCommand is a fixed command selected by the caller.
+// Relaunch. Dynamic-user launches stream the encoded command through stdin to a
+// static su -c script; the inner script decodes it before passing the command
+// to tmux as one quoted argument. tmuxCommand is a fixed command selected by
+// the caller.
 func buildAgentLaunchCommand(cfg runtime.Config, tmuxCommand string, keepAlive bool) string {
 	keepAliveSuffix := ""
 	if keepAlive {
@@ -139,7 +140,7 @@ func buildAgentLaunchCommand(cfg runtime.Config, tmuxCommand string, keepAlive b
 			shellquote.Quote(projectedPodWorkDir(cfg)), tmuxCommand, keepAliveSuffix,
 		)
 		return fmt.Sprintf(
-			`printf '%%s' "$@" | base64 -d | su - %s -c %s`,
+			`printf '%%s' "$@" | su - %s -c %s`,
 			shellquote.Quote(user), shellquote.Quote(userScript),
 		)
 	}
