@@ -1,0 +1,7 @@
+[pack]
+name = "step26-reviewer"
+schema = 2
+version = "0.1.0"
+
+[agent_defaults]
+provider = "codex"

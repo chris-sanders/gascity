@@ -1,0 +1,9 @@
+scope = "city"
+provider = "codex"
+description = "One-shot read-only source review for Gas City Step 26"
+work_dir = ".gc/worktrees/step26-review"
+tmux_alias = "step26-review"
+max_active_sessions = 1
+pre_start = [
+  "mkdir -p \"$CODEX_HOME\" && { grep -Fq \"[projects.\\\"$GC_DIR\\\"]\" \"$CODEX_HOME/config.toml\" 2>/dev/null || printf '[projects.\"%s\"]\\ntrust_level = \"trusted\"\\n' \"$GC_DIR\" >> \"$CODEX_HOME/config.toml\"; }"
+]
