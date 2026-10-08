@@ -26,6 +26,31 @@ func decodedAgentArgv(t *testing.T, cfg runtime.Config) []string {
 	return shellquote.Split(decodedAgentCommand(t, cfg))
 }
 
+func decodedAgentCommandChunks(t *testing.T, args []string, firstChunk int, cfg runtime.Config) []string {
+	t.Helper()
+	if len(args) <= firstChunk {
+		t.Fatal("agent command was not passed as chunks")
+	}
+	chunks := args[firstChunk:]
+	if len(chunks) == 0 {
+		t.Fatal("agent command was not passed as chunks")
+	}
+	for i, chunk := range chunks {
+		if len(chunk) > 32*1024 {
+			t.Fatalf("agent command chunk %d is %d bytes, want at most 32 KiB", i, len(chunk))
+		}
+	}
+	encoded := strings.Join(chunks, "")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("decode agent command chunks: %v", err)
+	}
+	if got, want := string(decoded), decodedAgentCommand(t, cfg); got != want {
+		t.Fatalf("reconstructed command differs: got %d bytes, want %d", len(got), len(want))
+	}
+	return chunks
+}
+
 func TestAgentCommandIncludesPromptAsPositionalArg(t *testing.T) {
 	prompt := `Start with spaces, "quotes", and $HOME intact.`
 	cfg := runtime.Config{
@@ -130,7 +155,9 @@ func TestStartAndRelaunchUseSamePromptCommand(t *testing.T) {
 	if pod == nil {
 		t.Fatal("Start did not create the agent pod")
 	}
-	startCommand := pod.Spec.Containers[0].Args[0]
+	startArgs := pod.Spec.Containers[0].Args
+	startCommand := startArgs[0]
+	startChunks := decodedAgentCommandChunks(t, startArgs, 2, cfg)
 
 	if err := p.Relaunch(context.Background(), name, cfg); err != nil {
 		t.Fatalf("Relaunch: %v", err)
@@ -139,13 +166,108 @@ func TestStartAndRelaunchUseSamePromptCommand(t *testing.T) {
 	if respawn == nil {
 		t.Fatal("Relaunch did not issue respawn-pane")
 	}
-	relaunchCommand := respawn[len(respawn)-1]
-
-	encoded := "echo '" + agentCommandB64(cfg) + "' | base64 -d"
-	if !strings.Contains(startCommand, encoded) {
-		t.Fatalf("Start command does not contain reconstructed prompt command: %s", startCommand)
+	relaunchCommand := respawn[2]
+	relaunchChunks := decodedAgentCommandChunks(t, respawn, 4, cfg)
+	if !reflect.DeepEqual(startChunks, relaunchChunks) {
+		t.Fatal("Start and Relaunch passed different command chunks")
 	}
-	if !strings.Contains(relaunchCommand, encoded) {
-		t.Fatalf("Relaunch command does not contain the same reconstructed prompt command: %s", relaunchCommand)
+	for name, script := range map[string]string{"Start": startCommand, "Relaunch": relaunchCommand} {
+		if strings.Contains(script, agentCommandB64(cfg)) {
+			t.Errorf("%s embedded the base64 command in its shell script", name)
+		}
+		if !strings.Contains(script, `printf '%s' "$@" | base64 -d`) {
+			t.Errorf("%s does not reconstruct the command from positional chunks", name)
+		}
+	}
+}
+
+func TestAgentCommandChunksStayBelowLinuxArgumentLimit(t *testing.T) {
+	prompt := strings.Repeat("p", 99*1024)
+	cfg := runtime.Config{
+		Command:      "codex --quiet",
+		PromptSuffix: shellquote.Quote(prompt),
+	}
+	encoded := agentCommandB64(cfg)
+	if len(encoded) <= 128*1024 {
+		t.Fatalf("fixture base64 command is %d bytes, want over 128 KiB", len(encoded))
+	}
+
+	pod, err := buildPod("large-prompt", cfg, newProviderWithOps(newFakeK8sOps()))
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	chunks := decodedAgentCommandChunks(t, pod.Spec.Containers[0].Args, 2, cfg)
+	if len(chunks) < 2 {
+		t.Fatalf("large command used %d chunks, want multiple", len(chunks))
+	}
+	if got := strings.Join(chunks, ""); got != encoded {
+		t.Fatalf("joined chunks differ from encoded command: got %d bytes, want %d", len(got), len(encoded))
+	}
+}
+
+func TestDynamicUserPromptMetacharactersStayInChunkPayload(t *testing.T) {
+	prompt := "single ' quote; double \" quote; $HOME; $(printf substituted); `printf backtick`; semicolon; backslash \\; newline\nsecond line"
+	cfg := runtime.Config{
+		Command:      "codex --quiet",
+		PromptSuffix: shellquote.Quote(prompt),
+		WorkDir:      "/city/rigs/prompt agent",
+		Env: map[string]string{
+			"GC_AGENT":       "prompt-agent",
+			"GC_CITY":        "/city",
+			"LINUX_USERNAME": "gcagent",
+		},
+	}
+	wantArgv := []string{"codex", "--quiet", prompt}
+	if got := decodedAgentArgv(t, cfg); !reflect.DeepEqual(got, wantArgv) {
+		t.Fatalf("decoded agent argv = %#v, want hostile prompt as one literal arg", got)
+	}
+
+	pod, err := buildPod("prompt-agent", cfg, newProviderWithOps(newFakeK8sOps()))
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	startArgs := pod.Spec.Containers[0].Args
+	startScript := startArgs[0]
+	decodedAgentCommandChunks(t, startArgs, 2, cfg)
+
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "prompt-agent", SanitizeName("prompt-agent"))
+	hasSessionAlive(fake, SanitizeName("prompt-agent"))
+	if err := p.Relaunch(context.Background(), "prompt-agent", cfg); err != nil {
+		t.Fatalf("Relaunch: %v", err)
+	}
+	relaunchArgs := findExecCmd(fake, "respawn-pane")
+	if relaunchArgs == nil {
+		t.Fatal("Relaunch did not issue respawn-pane")
+	}
+	relaunchScript := relaunchArgs[2]
+	decodedAgentCommandChunks(t, relaunchArgs, 4, cfg)
+
+	for name, script := range map[string]string{"Start": startScript, "Relaunch": relaunchScript} {
+		if strings.Contains(script, prompt) || strings.Contains(script, agentCommandB64(cfg)) {
+			t.Errorf("%s interpolated prompt data into its shell script", name)
+		}
+		marker := `printf '%s' "$@" | base64 -d | su - ` + shellquote.Quote("gcagent") + ` -c `
+		if !strings.Contains(script, marker) {
+			t.Errorf("%s does not pipe the encoded chunks into a static su command", name)
+			continue
+		}
+		suCommand := script[strings.Index(script, marker)+len(`printf '%s' "$@" | base64 -d | `):]
+		suArgs := shellquote.Split(suCommand)
+		if len(suArgs) < 5 {
+			t.Errorf("%s su command = %#v, want a static -c script", name, suArgs)
+			continue
+		}
+		userScript := suArgs[4]
+		if !strings.Contains(userScript, "CMD=$(base64 -d)") {
+			t.Errorf("%s inner su script does not decode the command from stdin", name)
+		}
+		if !strings.Contains(userScript, `cd `+shellquote.Quote(projectedPodWorkDir(cfg))+` &&`) {
+			t.Errorf("%s inner su script does not shell-quote the projected work directory", name)
+		}
+		if !strings.Contains(userScript, `"$CMD"`) {
+			t.Errorf("%s does not pass the decoded command as one quoted tmux argument", name)
+		}
 	}
 }
