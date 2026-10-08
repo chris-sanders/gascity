@@ -289,11 +289,14 @@ func TestBuildPod_EntrypointCreatesAndEntersWorkDir(t *testing.T) {
 }
 
 func TestBuildPodRejectsDynamicLinuxUsernameUnderRestrictedPolicy(t *testing.T) {
-	for _, username := range []string{"gcagent", "worker"} {
-		t.Run(username, func(t *testing.T) {
+	for _, fixture := range []struct {
+		name string
+		user string
+	}{{name: "gcagent", user: "gcagent"}, {name: "worker", user: "worker"}, {name: "whitespace", user: " "}} {
+		t.Run(fixture.name, func(t *testing.T) {
 			p := newProviderWithOps(newFakeK8sOps())
 			cfg := perBeadWorkDirConfig()
-			cfg.Env["LINUX_USERNAME"] = username
+			cfg.Env["LINUX_USERNAME"] = fixture.user
 			if _, err := buildPod("test-session", cfg, p); err == nil || !strings.Contains(err.Error(), "LINUX_USERNAME is incompatible with Restricted PodSecurity") {
 				t.Fatalf("buildPod error = %v, want Restricted PodSecurity rejection", err)
 			}
