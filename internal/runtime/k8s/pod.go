@@ -32,6 +32,12 @@ const (
 	// prebaked ones — so it is what the pod spec's WorkingDir may safely name.
 	podWorkspaceRoot = "/workspace"
 
+	// Linux limits the size of one execve argument to 128 KiB. Keep encoded
+	// command chunks well below that limit while allowing the full prompt payload
+	// to retain the existing shared prompt-resolution threshold.
+	agentCommandChunkSize = 32 * 1024
+	agentCommandArg0      = "gc-agent-command"
+
 	restrictedPodID = int64(1001)
 )
 
@@ -99,22 +105,63 @@ func agentCommandB64(cfg runtime.Config) string {
 	return base64.StdEncoding.EncodeToString([]byte(cmd))
 }
 
-// buildRespawnCommand builds the in-pod shell command that respawns the agent in
+func agentCommandChunks(cfg runtime.Config) []string {
+	encoded := agentCommandB64(cfg)
+	chunks := make([]string, 0, (len(encoded)+agentCommandChunkSize-1)/agentCommandChunkSize)
+	for len(encoded) > 0 {
+		chunkLen := agentCommandChunkSize
+		if len(encoded) < chunkLen {
+			chunkLen = len(encoded)
+		}
+		chunks = append(chunks, encoded[:chunkLen])
+		encoded = encoded[chunkLen:]
+	}
+	return chunks
+}
+
+// agentCommandShellArgs puts the command chunks after the shell's $0 argument.
+// The static script can therefore reconstruct the payload from "$@" without
+// embedding a long encoded string or the decoded command in shell source.
+func agentCommandShellArgs(script string, cfg runtime.Config) []string {
+	args := []string{script, agentCommandArg0}
+	return append(args, agentCommandChunks(cfg)...)
+}
+
+// buildAgentLaunchCommand builds the static shell transport shared by Start and
+// Relaunch. Dynamic-user launches stream the decoded command through stdin to a
+// static su -c script; only the decoded variable is passed to tmux, quoted as a
+// single argument. tmuxCommand is a fixed command selected by the caller.
+func buildAgentLaunchCommand(cfg runtime.Config, tmuxCommand string, keepAlive bool) string {
+	keepAliveSuffix := ""
+	if keepAlive {
+		keepAliveSuffix = " && sleep infinity"
+	}
+
+	if user := cfg.Env["LINUX_USERNAME"]; user != "" {
+		userScript := fmt.Sprintf(
+			`CMD=$(base64 -d) && cd %s && %s "$CMD"%s`,
+			shellquote.Quote(projectedPodWorkDir(cfg)), tmuxCommand, keepAliveSuffix,
+		)
+		return fmt.Sprintf(
+			`printf '%%s' "$@" | base64 -d | su - %s -c %s`,
+			shellquote.Quote(user), shellquote.Quote(userScript),
+		)
+	}
+
+	return fmt.Sprintf(
+		`CMD=$(printf '%%s' "$@" | base64 -d) && %s "$CMD"%s`,
+		tmuxCommand, keepAliveSuffix,
+	)
+}
+
+// buildRespawnCommand builds the in-pod shell argv that respawns the agent in
 // the existing tmux "main" session (respawn-pane -k), reusing the warm pod. When
 // LINUX_USERNAME is set the entrypoint runs tmux under `su - <user>`, so the
 // respawn is wrapped in the same su to reach that user's tmux socket.
-func buildRespawnCommand(cfg runtime.Config) string {
-	cmdB64 := agentCommandB64(cfg)
-	if user := cfg.Env["LINUX_USERNAME"]; user != "" {
-		return fmt.Sprintf(
-			`CMD=$(echo '%s' | base64 -d) && su - %s -c "cd %s && tmux respawn-pane -k -t %s \"$CMD\""`,
-			cmdB64, user, projectedPodWorkDir(cfg), tmuxSession,
-		)
-	}
-	return fmt.Sprintf(
-		`CMD=$(echo '%s' | base64 -d) && tmux respawn-pane -k -t %s "$CMD"`,
-		cmdB64, tmuxSession,
-	)
+func buildRespawnCommand(cfg runtime.Config) []string {
+	script := buildAgentLaunchCommand(cfg, fmt.Sprintf("tmux respawn-pane -k -t %s", tmuxSession), false)
+	args := []string{"sh", "-c"}
+	return append(args, agentCommandShellArgs(script, cfg)...)
 }
 
 func projectedPodStoreRoot(cfg runtime.Config, podWorkDir string) string {
@@ -277,10 +324,6 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	podWorkDir := projectedPodWorkDir(cfg)
 	ctrlCity := controllerCityPath(cfg.Env)
 
-	// Build the agent command (base64-encoded to avoid quoting issues) — shared
-	// with the relaunch path so the entrypoint and a respawn launch identically.
-	cmdB64 := agentCommandB64(cfg)
-
 	// Pod entrypoint: wait for workspace ready → pre_start → tmux → keepalive.
 	// Each pre_start command is base64-encoded and decoded at runtime to prevent
 	// shell metacharacter injection from user-supplied commands.
@@ -294,11 +337,11 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		preStartCmds += fmt.Sprintf("echo '%s' | base64 -d | sh; ", b64)
 	}
 
-	// Dynamic user creation: when LINUX_USERNAME is set, the container starts
-	// as root (see securityContext below), creates the user, sets up workspace
-	// ownership, then drops privileges via su for the tmux session.
+	// Keep the configured username available for the explicit Restricted
+	// PodSecurity check below. The transport helper can still cover dynamic-user
+	// command wrapping without asking buildPod to create such a pod.
 	linuxUsername := cfg.Env["LINUX_USERNAME"]
-	if strings.TrimSpace(linuxUsername) != "" {
+	if linuxUsername != "" {
 		return nil, fmt.Errorf("Kubernetes sessions require the image's non-root gcagent user; LINUX_USERNAME is incompatible with Restricted PodSecurity")
 	}
 	storeIdentity, err := resolvePodHostedDoltIdentity(cfg.Env, "", p.managedServiceHost, p.managedServicePort)
@@ -364,23 +407,19 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	enterWorkDir := fmt.Sprintf("mkdir -p %s && cd %s && ",
 		shellquote.Quote(podWorkDir), shellquote.Quote(podWorkDir))
 
-	var tmuxCmd string
+	// The launch script stays static; the command arrives in bounded positional
+	// chunks after its $0 argument and is reconstructed at runtime.
+	entrypointPrefix := credSetup + wsWait + enterWorkDir + preStartCmds
 	if linuxUsername != "" {
-		// Run tmux session as the dynamic user via su. userSetup already created
-		// and chowned podWorkDir as root; enterWorkDir is idempotent and is what
-		// puts pre_start in the right directory.
-		tmuxCmd = fmt.Sprintf(
-			"%s%s%s%s%sCMD=$(echo '%s' | base64 -d) && "+
-				`su - %s -c "cd %s && tmux new-session -d -s %s \"$CMD\" && sleep infinity"`,
-			userSetup, credSetup, wsWait, enterWorkDir, preStartCmds, cmdB64,
-			linuxUsername, podWorkDir, tmuxSession,
-		)
-	} else {
-		tmuxCmd = fmt.Sprintf(
-			"%s%s%s%sCMD=$(echo '%s' | base64 -d) && tmux new-session -d -s %s \"$CMD\" && sleep infinity",
-			credSetup, wsWait, enterWorkDir, preStartCmds, cmdB64, tmuxSession,
-		)
+		// buildPod rejects dynamic users under Restricted PodSecurity. Keep the
+		// helper path transport-compatible for direct unit coverage.
+		entrypointPrefix = userSetup + entrypointPrefix
 	}
+	tmuxCmd := entrypointPrefix + buildAgentLaunchCommand(
+		cfg,
+		fmt.Sprintf("tmux new-session -d -s %s", tmuxSession),
+		true,
+	)
 
 	// Build environment, remapping K8s-specific vars.
 	env, err := buildPodEnv(cfg.Env, podWorkDir, p.managedServiceHost, p.managedServicePort)
@@ -493,7 +532,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 				// itself, as the agent user, so it comes out owned correctly.
 				WorkingDir:      podWorkspaceRoot,
 				Command:         []string{"/bin/sh", "-c"},
-				Args:            []string{tmuxCmd},
+				Args:            agentCommandShellArgs(tmuxCmd, cfg),
 				Env:             env,
 				Stdin:           true,
 				TTY:             true,
