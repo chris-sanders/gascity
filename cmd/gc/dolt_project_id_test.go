@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/beads/proxyendpoint"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
 
@@ -37,6 +38,17 @@ func TestEnsureProjectIDCmdRequiresCityFlag(t *testing.T) {
 }
 
 func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
+	clearProxyEnvironment := func(t *testing.T) {
+		t.Helper()
+		for _, name := range []string{
+			proxyendpoint.RootPathEnv,
+			proxyendpoint.DoltDataDirEnv,
+			proxyendpoint.SharedServerModeEnv,
+			proxyendpoint.SharedServerDirEnv,
+		} {
+			t.Setenv(name, "")
+		}
+	}
 	openLocalPort := func(t *testing.T) (net.Listener, string) {
 		t.Helper()
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -74,8 +86,64 @@ func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	writeSidecar := func(t *testing.T, scope, rootPath string) {
+		t.Helper()
+		data, err := json.Marshal(proxyendpoint.Sidecar{RootPath: rootPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(proxyendpoint.SidecarPath(filepath.Join(scope, ".beads")), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	makeProxyRecord := func(t *testing.T, root string, pid, port int) proxyendpoint.Record {
+		t.Helper()
+		rootID, err := proxyendpoint.RootID(root)
+		if err != nil {
+			t.Fatalf("identify proxy root: %v", err)
+		}
+		return proxyendpoint.Record{
+			PID:         pid,
+			Port:        port,
+			UpstreamID:  "step30-test-upstream",
+			Schema:      proxyendpoint.SchemaV2,
+			Kind:        proxyendpoint.RecordKind,
+			Birth:       proxyendpoint.BirthToken("test-boot", fmt.Sprint(pid)),
+			RootID:      rootID,
+			ControlPort: port + 1,
+		}
+	}
+	writeProxyRecord := func(t *testing.T, root string, record proxyendpoint.Record) {
+		t.Helper()
+		data, err := json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(proxyendpoint.PIDPath(root), data, 0o600); err != nil {
+			t.Fatalf("write proxy endpoint record: %v", err)
+		}
+	}
+	processTable := func(record proxyendpoint.Record, alive bool, argv []string, birth string) proxyendpoint.ProcessTable {
+		return proxyendpoint.ProcessTable{
+			Alive: func(pid int) bool { return alive && pid == record.PID },
+			Argv:  func(int) ([]string, error) { return argv, nil },
+			Birth: func(int) (string, error) { return birth, nil },
+		}
+	}
+	proxyArgv := func(root string) []string {
+		return []string{"bd", proxyendpoint.ChildVerb, proxyendpoint.RootFlag, root, proxyendpoint.IdleTimeoutFlag, "0"}
+	}
+	proxiedScope := func(t *testing.T, rootPath string) (string, string) {
+		t.Helper()
+		scope := t.TempDir()
+		metadataPath := writeMetadata(t, scope, map[string]any{"dolt_mode": "proxied-server"})
+		writeConfig(t, scope, "issue_prefix: gc\n")
+		writeSidecar(t, scope, rootPath)
+		return scope, metadataPath
+	}
 
 	t.Run("direct local reads bd server port", func(t *testing.T) {
+		clearProxyEnvironment(t)
 		scope := t.TempDir()
 		metadataPath := writeMetadata(t, scope, nil)
 		writeConfig(t, scope, "issue_prefix: gc\n")
@@ -88,7 +156,7 @@ func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"), []byte(port+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		target, err := resolveProviderOwnedProjectIdentityTarget(metadataPath, scope, "hq", "provider-user")
+		target, err := resolveProviderOwnedProjectIdentityTargetWithProcessTable(metadataPath, scope, "hq", "provider-user", proxyendpoint.ProcessTable{})
 		if err != nil {
 			t.Fatalf("resolve provider-owned target: %v", err)
 		}
@@ -98,12 +166,13 @@ func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
 	})
 
 	t.Run("direct external socket reads bd binding", func(t *testing.T) {
+		clearProxyEnvironment(t)
 		scope := t.TempDir()
 		metadataPath := writeMetadata(t, scope, map[string]any{
 			"dolt_server_socket": "/run/dolt/provider.sock",
 		})
 		writeConfig(t, scope, "issue_prefix: gc\n")
-		target, err := resolveProviderOwnedProjectIdentityTarget(metadataPath, scope, "hosted", "")
+		target, err := resolveProviderOwnedProjectIdentityTargetWithProcessTable(metadataPath, scope, "hosted", "", proxyendpoint.ProcessTable{})
 		if err != nil {
 			t.Fatalf("resolve provider-owned target: %v", err)
 		}
@@ -113,38 +182,123 @@ func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
 	})
 
 	t.Run("proxied local reads live proxy port", func(t *testing.T) {
-		scope := t.TempDir()
-		metadataPath := writeMetadata(t, scope, map[string]any{"dolt_mode": "proxied-server"})
-		proxyRoot := filepath.Join(t.TempDir(), "proxy-root")
-		if err := os.MkdirAll(proxyRoot, 0o700); err != nil {
+		clearProxyEnvironment(t)
+		scope, metadataPath := proxiedScope(t, "relocated/proxy-root")
+		beadsDir := filepath.Join(scope, ".beads")
+		root := filepath.Join(beadsDir, "relocated", "proxy-root")
+		if err := os.MkdirAll(root, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(scope, ".beads", "proxied_server_client_info.json"), []byte(`{"root_path":"`+proxyRoot+`","port":0,"idle_timeout":-1}`), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		listener, port := openLocalPort(t)
-		defer listener.Close()
-		portNum := 0
-		if _, err := fmt.Sscanf(port, "%d", &portNum); err != nil {
-			t.Fatal(err)
-		}
-		pidfile, err := json.Marshal(map[string]any{
-			"pid": os.Getpid(), "port": portNum, "schema": 2, "kind": "db-proxy", "birth": "test-birth",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(proxyRoot, "proxy.pid"), pidfile, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		target, err := resolveProviderOwnedProjectIdentityTarget(metadataPath, scope, "hq", "")
+		record := makeProxyRecord(t, root, 4242, 45123)
+		writeProxyRecord(t, root, record)
+		target, err := resolveProviderOwnedProjectIdentityTargetWithProcessTable(
+			metadataPath, scope, "hq", "", processTable(record, true, proxyArgv(root), record.Birth),
+		)
 		if err != nil {
 			t.Fatalf("resolve provider-owned target: %v", err)
 		}
-		if target.Host != "127.0.0.1" || target.Port != port || target.Database != "hq" {
-			t.Fatalf("target = %+v, want proxy endpoint 127.0.0.1:%s/hq", target, port)
+		if target.Host != proxyendpoint.Host || target.Port != "45123" || target.Database != "hq" {
+			t.Fatalf("target = %+v, want canonical endpoint %s:45123/hq", target, proxyendpoint.Host)
 		}
 	})
+
+	t.Run("proxied local follows ProviderRoot environment precedence", func(t *testing.T) {
+		clearProxyEnvironment(t)
+		scope, metadataPath := proxiedScope(t, "persisted/proxy-root")
+		beadsDir := filepath.Join(scope, ".beads")
+		persistedRoot := filepath.Join(beadsDir, "persisted", "proxy-root")
+		envRoot := filepath.Join(t.TempDir(), "operator-proxy-root")
+		for _, root := range []string{persistedRoot, envRoot} {
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		persistedRecord := makeProxyRecord(t, persistedRoot, 4243, 45124)
+		writeProxyRecord(t, persistedRoot, persistedRecord)
+		envRecord := makeProxyRecord(t, envRoot, 4244, 45125)
+		writeProxyRecord(t, envRoot, envRecord)
+		t.Setenv(proxyendpoint.RootPathEnv, envRoot)
+		target, err := resolveProviderOwnedProjectIdentityTargetWithProcessTable(
+			metadataPath, scope, "hq", "", processTable(envRecord, true, proxyArgv(envRoot), envRecord.Birth),
+		)
+		if err != nil {
+			t.Fatalf("resolve provider-owned target: %v", err)
+		}
+		if target.Host != proxyendpoint.Host || target.Port != "45125" {
+			t.Fatalf("target = %+v, want environment-selected endpoint %s:45125", target, proxyendpoint.Host)
+		}
+	})
+
+	t.Run("proxied local refuses a copied wrong-root record", func(t *testing.T) {
+		clearProxyEnvironment(t)
+		scope, metadataPath := proxiedScope(t, "proxy-root")
+		root := filepath.Join(scope, ".beads", "proxy-root")
+		foreignRoot := filepath.Join(t.TempDir(), "original-proxy-root")
+		for _, path := range []string{root, foreignRoot} {
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		record := makeProxyRecord(t, foreignRoot, 4245, 45126)
+		writeProxyRecord(t, root, record)
+		aliveCalled := false
+		table := proxyendpoint.ProcessTable{
+			Alive: func(int) bool { aliveCalled = true; return true },
+			Argv:  func(int) ([]string, error) { return proxyArgv(root), nil },
+			Birth: func(int) (string, error) { return record.Birth, nil },
+		}
+		if _, err := resolveProviderOwnedProjectIdentityTargetWithProcessTable(metadataPath, scope, "hq", "", table); err == nil || !strings.Contains(err.Error(), "not_ours") {
+			t.Fatalf("resolve copied proxy record error = %v, want canonical not_ours refusal", err)
+		}
+		if aliveCalled {
+			t.Fatal("process liveness was checked for a copied wrong-root record")
+		}
+	})
+
+	for _, tc := range []struct {
+		name     string
+		alive    bool
+		argv     func(root string) []string
+		birth    func(record proxyendpoint.Record) string
+		wantText string
+	}{
+		{
+			name:     "dead generation",
+			alive:    false,
+			argv:     proxyArgv,
+			birth:    func(record proxyendpoint.Record) string { return record.Birth },
+			wantText: "dead",
+		},
+		{
+			name:     "foreign process",
+			alive:    true,
+			argv:     func(string) []string { return []string{"unrelated-process"} },
+			birth:    func(record proxyendpoint.Record) string { return record.Birth },
+			wantText: "foreign_process",
+		},
+		{
+			name:     "restarted generation",
+			alive:    true,
+			argv:     proxyArgv,
+			birth:    func(proxyendpoint.Record) string { return "different-generation" },
+			wantText: "birth_mismatch",
+		},
+	} {
+		t.Run("proxied local refuses "+tc.name, func(t *testing.T) {
+			clearProxyEnvironment(t)
+			scope, metadataPath := proxiedScope(t, "proxy-root")
+			root := filepath.Join(scope, ".beads", "proxy-root")
+			if err := os.MkdirAll(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			record := makeProxyRecord(t, root, 4246, 45127)
+			writeProxyRecord(t, root, record)
+			table := processTable(record, tc.alive, tc.argv(root), tc.birth(record))
+			if _, err := resolveProviderOwnedProjectIdentityTargetWithProcessTable(metadataPath, scope, "hq", "", table); err == nil || !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("resolve non-live proxy error = %v, want canonical %s refusal", err, tc.wantText)
+			}
+		})
+	}
 }
 
 func writeProjectIDMetadataFile(t *testing.T, scopeRoot string, projectID string) string {

@@ -16,10 +16,10 @@ import (
 
 	gcapi "github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/beads/proxyendpoint"
 	"github.com/gastownhall/gascity/internal/doltpool"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
-	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/spf13/cobra"
 )
 
@@ -199,6 +199,10 @@ func ensureManagedDoltProjectIDAtTarget(metadataPath string, target contract.Dol
 }
 
 func resolveProviderOwnedProjectIdentityTarget(metadataPath, cityPath, database, user string) (contract.DoltConnectionTarget, error) {
+	return resolveProviderOwnedProjectIdentityTargetWithProcessTable(metadataPath, cityPath, database, user, proxyendpoint.DefaultProcessTable())
+}
+
+func resolveProviderOwnedProjectIdentityTargetWithProcessTable(metadataPath, cityPath, database, user string, processTable proxyendpoint.ProcessTable) (contract.DoltConnectionTarget, error) {
 	scopeRoot, err := scopeRootFromMetadataPath(metadataPath)
 	if err != nil {
 		return contract.DoltConnectionTarget{}, err
@@ -207,8 +211,8 @@ func resolveProviderOwnedProjectIdentityTarget(metadataPath, cityPath, database,
 	if err != nil {
 		return contract.DoltConnectionTarget{}, fmt.Errorf("resolve provider-owned Dolt binding: %w", err)
 	}
-	if target.DoltMode == "proxied-server" && target.Socket == "" && target.Port == "" {
-		target, err = resolveLocalProxiedProjectIdentityTarget(scopeRoot, target)
+	if strings.EqualFold(strings.TrimSpace(target.DoltMode), "proxied-server") && target.Socket == "" && target.Port == "" {
+		target, err = resolveLocalProxiedProjectIdentityTarget(scopeRoot, target, processTable)
 		if err != nil {
 			return contract.DoltConnectionTarget{}, err
 		}
@@ -223,61 +227,17 @@ func resolveProviderOwnedProjectIdentityTarget(metadataPath, cityPath, database,
 	return target, nil
 }
 
-func resolveLocalProxiedProjectIdentityTarget(scopeRoot string, target contract.DoltConnectionTarget) (contract.DoltConnectionTarget, error) {
-	beadsDir := filepath.Join(scopeRoot, ".beads")
-	infoPath := filepath.Join(beadsDir, "proxied_server_client_info.json")
-	data, err := os.ReadFile(infoPath)
+func resolveLocalProxiedProjectIdentityTarget(scopeRoot string, target contract.DoltConnectionTarget, processTable proxyendpoint.ProcessTable) (contract.DoltConnectionTarget, error) {
+	root, err := proxyendpoint.ProviderRoot(scopeRoot)
 	if err != nil {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("read provider-owned proxy binding %s: %w", infoPath, err)
+		return contract.DoltConnectionTarget{}, fmt.Errorf("resolve provider-owned proxy root for %s: %w", scopeRoot, err)
 	}
-	var info struct {
-		RootPath string `json:"root_path"`
-		Port     int    `json:"port"`
-		External *struct {
-			Host   string `json:"host"`
-			Port   int    `json:"port"`
-			Socket string `json:"socket"`
-		} `json:"external"`
+	endpoint := proxyendpoint.Inspect(root, processTable)
+	if !endpoint.Verdict.Live() {
+		return contract.DoltConnectionTarget{}, fmt.Errorf("provider-owned proxy endpoint %s is not live (%s): %v", root, endpoint.Verdict, endpoint.Err)
 	}
-	if err := json.Unmarshal(data, &info); err != nil {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("parse provider-owned proxy binding %s: %w", infoPath, err)
-	}
-	if info.External != nil {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("provider-owned proxied external binding for %s has no resolved SQL endpoint", scopeRoot)
-	}
-	root := strings.TrimSpace(info.RootPath)
-	if root == "" {
-		root = filepath.Join(beadsDir, "dolt")
-	} else if !filepath.IsAbs(root) {
-		root = filepath.Join(beadsDir, root)
-	}
-	pidPath := filepath.Join(filepath.Clean(root), "proxy.pid")
-	data, err = os.ReadFile(pidPath)
-	if err != nil {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("read provider-owned proxy endpoint %s: %w", pidPath, err)
-	}
-	var pid struct {
-		PID    int    `json:"pid"`
-		Port   int    `json:"port"`
-		Schema int    `json:"schema"`
-		Kind   string `json:"kind"`
-		Birth  string `json:"birth"`
-	}
-	if err := json.Unmarshal(data, &pid); err != nil {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("parse provider-owned proxy endpoint %s: %w", pidPath, err)
-	}
-	if pid.Schema < 2 || pid.Kind != "db-proxy" || strings.TrimSpace(pid.Birth) == "" || pid.PID <= 0 || pid.Port < 1 || pid.Port > 65535 {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("provider-owned proxy endpoint %s is invalid", pidPath)
-	}
-	if info.Port > 0 && info.Port != pid.Port {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("provider-owned proxy endpoint %s reports port %d, want configured port %d", pidPath, pid.Port, info.Port)
-	}
-	port := strconv.Itoa(pid.Port)
-	if !pidutil.Alive(pid.PID) || !managedDoltTCPReachable("127.0.0.1", port) {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("provider-owned proxy endpoint %s is not live", pidPath)
-	}
-	target.Host = "127.0.0.1"
-	target.Port = port
+	target.Host = proxyendpoint.Host
+	target.Port = strconv.Itoa(endpoint.Record.Port)
 	target.Socket = ""
 	target.External = false
 	return target, nil
