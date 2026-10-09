@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,117 @@ func TestEnsureProjectIDCmdRequiresCityFlag(t *testing.T) {
 	if !strings.Contains(err.Error(), `required flag(s) "city" not set`) {
 		t.Fatalf("ensure-project-id error = %v, want required --city", err)
 	}
+}
+
+func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
+	openLocalPort := func(t *testing.T) (net.Listener, string) {
+		t.Helper()
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return listener, fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port)
+	}
+	writeMetadata := func(t *testing.T, scope string, extra map[string]any) string {
+		t.Helper()
+		metadataPath := writeProjectIDMetadataFile(t, scope, "")
+		data, err := os.ReadFile(metadataPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var metadata map[string]any
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		for key, value := range extra {
+			metadata[key] = value
+		}
+		data, err = json.Marshal(metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(metadataPath, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return metadataPath
+	}
+	writeConfig := func(t *testing.T, scope, config string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(scope, ".beads", "config.yaml"), []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("direct local reads bd server port", func(t *testing.T) {
+		scope := t.TempDir()
+		metadataPath := writeMetadata(t, scope, nil)
+		writeConfig(t, scope, "issue_prefix: gc\n")
+		listener, port := openLocalPort(t)
+		defer listener.Close()
+		beadsDir := filepath.Join(scope, ".beads")
+		if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.pid"), []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"), []byte(port+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		target, err := resolveProviderOwnedProjectIdentityTarget(metadataPath, scope, "hq", "provider-user")
+		if err != nil {
+			t.Fatalf("resolve provider-owned target: %v", err)
+		}
+		if target.Host != "127.0.0.1" || target.Port != port || target.Database != "hq" || target.User != "provider-user" {
+			t.Fatalf("target = %+v, want local bd endpoint 127.0.0.1:%s/hq as provider-user", target, port)
+		}
+	})
+
+	t.Run("direct external socket reads bd binding", func(t *testing.T) {
+		scope := t.TempDir()
+		metadataPath := writeMetadata(t, scope, map[string]any{
+			"dolt_server_socket": "/run/dolt/provider.sock",
+		})
+		writeConfig(t, scope, "issue_prefix: gc\n")
+		target, err := resolveProviderOwnedProjectIdentityTarget(metadataPath, scope, "hosted", "")
+		if err != nil {
+			t.Fatalf("resolve provider-owned target: %v", err)
+		}
+		if target.Socket != "/run/dolt/provider.sock" || target.Database != "hosted" {
+			t.Fatalf("target = %+v, want socket endpoint and hosted database", target)
+		}
+	})
+
+	t.Run("proxied local reads live proxy port", func(t *testing.T) {
+		scope := t.TempDir()
+		metadataPath := writeMetadata(t, scope, map[string]any{"dolt_mode": "proxied-server"})
+		proxyRoot := filepath.Join(t.TempDir(), "proxy-root")
+		if err := os.MkdirAll(proxyRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(scope, ".beads", "proxied_server_client_info.json"), []byte(`{"root_path":"`+proxyRoot+`","port":0,"idle_timeout":-1}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		listener, port := openLocalPort(t)
+		defer listener.Close()
+		portNum := 0
+		if _, err := fmt.Sscanf(port, "%d", &portNum); err != nil {
+			t.Fatal(err)
+		}
+		pidfile, err := json.Marshal(map[string]any{
+			"pid": os.Getpid(), "port": portNum, "schema": 2, "kind": "db-proxy", "birth": "test-birth",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(proxyRoot, "proxy.pid"), pidfile, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		target, err := resolveProviderOwnedProjectIdentityTarget(metadataPath, scope, "hq", "")
+		if err != nil {
+			t.Fatalf("resolve provider-owned target: %v", err)
+		}
+		if target.Host != "127.0.0.1" || target.Port != port || target.Database != "hq" {
+			t.Fatalf("target = %+v, want proxy endpoint 127.0.0.1:%s/hq", target, port)
+		}
+	})
 }
 
 func writeProjectIDMetadataFile(t *testing.T, scopeRoot string, projectID string) string {

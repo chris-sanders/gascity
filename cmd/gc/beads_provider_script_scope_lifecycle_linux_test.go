@@ -561,6 +561,69 @@ esac
 	}
 }
 
+func TestGcBeadsBdProviderOwnedLocalInitDefersEndpointResolutionToGc(t *testing.T) {
+	for _, transport := range []string{"direct", "proxied"} {
+		t.Run(transport, func(t *testing.T) {
+			cityDir := t.TempDir()
+			scopeDir := filepath.Join(cityDir, "rigs", "provider")
+			if err := os.MkdirAll(scopeDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			captureDir := t.TempDir()
+			bdPath := writeNamedTestScript(t, "provider-owned-local-bd.sh", "#!/bin/sh\nset -eu\ncapture_dir="+strconv.Quote(captureDir)+"\n"+`
+printf 'bd init\n' >> "$capture_dir/calls"
+scope=""
+for arg in "$@"; do scope="$arg"; done
+mkdir -p "$scope/.beads"
+mode=server
+if [ "${GC_BEADS_TRANSPORT:-}" = proxied ]; then mode=proxied-server; fi
+printf '{"database":"dolt","backend":"dolt","dolt_mode":"%s","dolt_database":"provider_db"}\n' "$mode" > "$scope/.beads/metadata.json"
+`)
+			gcPath := writeNamedTestScript(t, "provider-owned-local-gc-helper.sh", "#!/bin/sh\nset -eu\ncapture_dir="+strconv.Quote(captureDir)+"\n"+`
+if [ "${1:-} ${2:-}" != "dolt-state ensure-project-id" ]; then
+  echo "unexpected gc helper command: $*" >&2
+  exit 64
+fi
+shift 2
+printf '%s\n' "$@" > "$capture_dir/gc-args"
+`)
+			env := sanitizedBaseEnv(
+				"GC_CITY_PATH="+cityDir,
+				"BEADS_DIR="+filepath.Join(scopeDir, ".beads"),
+				"GC_BIN="+gcPath,
+				"BD_BIN="+bdPath,
+				"GC_BEADS_PROVIDER_OWNED=1",
+				"GC_BEADS_TRANSPORT="+transport,
+				"GC_BEADS_TARGET=local",
+				"GC_BEADS_PROXIED_IDLE_TIMEOUT=0",
+			)
+			out, err := runProviderOwnedScriptOp(t, env, "init", scopeDir, "px", "provider_db")
+			if err != nil {
+				t.Fatalf("provider-owned local init: %v\n%s", err, out)
+			}
+			data, err := os.ReadFile(filepath.Join(captureDir, "gc-args"))
+			if err != nil {
+				t.Fatalf("read gc args: %v", err)
+			}
+			args := strings.Split(strings.TrimSpace(string(data)), "\n")
+			for _, arg := range args {
+				if arg == "--host" || arg == "--port" {
+					t.Fatalf("gc helper received managed endpoint arg %q for provider-owned %s init: %q", arg, transport, args)
+				}
+			}
+			wantArgs := []string{
+				"--city", cityDir,
+				"--metadata", filepath.Join(scopeDir, ".beads", "metadata.json"),
+				"--user", "root",
+				"--database", "provider_db",
+			}
+			if got, want := strings.Join(args, "\n"), strings.Join(wantArgs, "\n"); got != want {
+				t.Fatalf("gc helper args = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // A city (or rig) created anywhere below another bd workspace — inside a repo
 // that uses beads, or under a home directory holding ~/.beads — must get its
 // own store. Before the anchor, bd v1.3.0 ignored the scope's still-empty

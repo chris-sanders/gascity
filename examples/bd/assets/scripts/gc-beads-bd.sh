@@ -772,14 +772,17 @@ ensure_project_identity() {
     if [ -z "$dolt_database" ]; then
         return 0
     fi
-    host=$(connect_host)
-    "$gc_bin" dolt-state ensure-project-id \
-        --city "$GC_CITY_PATH" \
-        --metadata "$meta_file" \
-        --host "$host" \
-        --port "$DOLT_PORT" \
-        --user "$DOLT_USER" \
-        --database "$dolt_database" >/dev/null \
+    set -- --city "$GC_CITY_PATH" --metadata "$meta_file"
+    if [ "${GC_BEADS_TRANSPORT:-}" = "direct" ] &&
+        [ "${GC_BEADS_TARGET:-}" = "external" ] && [ -n "$DOLT_PORT" ]; then
+        # Direct external TCP init already has an explicit endpoint. Local
+        # server and socket-backed init have no managed DOLT_PORT; gc resolves
+        # those from the binding bd just persisted.
+        host=$(connect_host)
+        set -- "$@" --host "$host" --port "$DOLT_PORT"
+    fi
+    set -- "$@" --user "$DOLT_USER" --database "$dolt_database"
+    "$gc_bin" dolt-state ensure-project-id "$@" >/dev/null \
         || die "failed to ensure project identity for $dir"
 }
 
@@ -4724,9 +4727,12 @@ op_provider_owned_init() {
         fi
         return "$status"
     fi
-    # Provider-owned init returns before the managed path resolves DOLT_PORT.
-    # Keep identity reconciliation on the explicit endpoint bd just used.
-    DOLT_PORT="${GC_DOLT_PORT:-$DOLT_PORT}"
+    # The normal managed path allocates DOLT_PORT after provider-owned dispatch.
+    # Preserve only a direct external TCP endpoint here; local and socket
+    # bindings are resolved from the endpoint bd persisted during init.
+    if [ "${GC_BEADS_TRANSPORT:-}" = "direct" ] && [ "${GC_BEADS_TARGET:-}" = "external" ]; then
+        DOLT_PORT="${GC_DOLT_PORT:-$DOLT_PORT}"
+    fi
     ensure_project_identity "$dir"
 }
 
