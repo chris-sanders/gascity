@@ -4724,6 +4724,9 @@ op_provider_owned_init() {
         fi
         return "$status"
     fi
+    # Provider-owned init returns before the managed path resolves DOLT_PORT.
+    # Keep identity reconciliation on the explicit endpoint bd just used.
+    DOLT_PORT="${GC_DOLT_PORT:-$DOLT_PORT}"
     ensure_project_identity "$dir"
 }
 
