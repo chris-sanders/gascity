@@ -4718,10 +4718,13 @@ op_provider_owned_init() {
         anchored=true
     fi
     GC_BEADS_PROVIDER_INIT=1 run_provider_owned_bd "$dir" "$@" || status=$?
-    if [ "$status" -ne 0 ] && [ "$anchored" = true ]; then
-        release_fresh_beads_dir_anchor "$dir"
+    if [ "$status" -ne 0 ]; then
+        if [ "$anchored" = true ]; then
+            release_fresh_beads_dir_anchor "$dir"
+        fi
+        return "$status"
     fi
-    return "$status"
+    ensure_project_identity "$dir"
 }
 
 # anchor_fresh_beads_dir makes BEADS_DIR authoritative for a scope bd has not
