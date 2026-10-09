@@ -580,10 +580,33 @@ children (section 3.5).
 **Dispatch routing intent.** A step's `gc.run_target` metadata is
 compile-time routing intent: at dispatch the router resolves it into
 `gc.routed_to`, the sole persisted routing key, overriding the convoy-wide
-default for that step. Per-dispatch provider options ride `opt_*` step
-metadata (for example `opt_model`), validated against the provider's
-options schema at spawn; `gc.model` is a deprecated spelling that the
-`gc doctor` check `work-option-metadata-migration` migrates to `opt_model`.
+default for that step. Per-dispatch provider options ride `opt_<key>` step
+metadata, where `<key>` is any key of the provider's options schema (for
+example `opt_model`, `opt_effort`). They are validated against that schema,
+and invalid values are skipped per key. They apply when a session is
+launched, from the first of these cases that holds:
+
+1. The session holds a claimed (in-progress) bead in the store its session
+   bead lives in. A claimed bead with `opt_*` metadata supplies the options;
+   if none has any, the launch keeps its default options and the trigger
+   bead is not consulted.
+2. The session's trigger bead (the bead it was spawned for — the routed
+   demand a pool slot starts on) is not claimed yet, and the session holds a
+   claimed bead in any store it can claim from, other than a suspended rig's
+   store, which is not read. The trigger is ignored and the launch keeps its
+   default options.
+3. Otherwise the trigger bead supplies the options while it is still the
+   session's step (not closed, and unassigned or assigned to the session),
+   including when the session has already claimed it. A trigger the session
+   has claimed skips the check of other stores, so a session holding several
+   claims launches with the options of one claimed bead.
+
+An explicit session `template_overrides` value wins per key. Options are
+launch flags: a warm session reused for a later step keeps the flags it
+launched with, and a pool slot keeps the options it launched with even if it
+later claims a different ready bead. `gc.model` is a deprecated spelling that
+the `gc doctor` check `work-option-metadata-migration` migrates to
+`opt_model`.
 
 **Role target aliases.** In the *value* of `gc.run_target`, `gc.<role>` is a
 semantic role alias used by imported role packs. The resolver first treats the
