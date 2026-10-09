@@ -238,14 +238,17 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	}
 
 	ctrlCity := cfg.Env["GC_CITY"]
+	workDirStaged := false
 
 	if !p.prebaked {
 		// Stage files via init container if needed.
 		if needsStaging(cfg, ctrlCity) {
-			if err := stageFiles(ctx, p.ops, podName, cfg, ctrlCity, p.stderr); err != nil {
+			staged, err := stageFiles(ctx, p.ops, podName, cfg, ctrlCity, p.stderr)
+			if err != nil {
 				cleanup("staging failed")
 				return fmt.Errorf("staging files for session %q: %w", name, err)
 			}
+			workDirStaged = staged
 		}
 	}
 
@@ -263,7 +266,8 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 				cleanup("City store identity invalid")
 				return fmt.Errorf("resolving City store identity for session %q: %w", name, err)
 			}
-			if err := initCityInPod(ctx, p.ops, podName, ctrlCity, cityIdentity); err != nil {
+			skipRel := cityTemplateSkipRel(workDirStaged, ctrlCity, cfg.WorkDir)
+			if err := initCityInPod(ctx, p.ops, podName, ctrlCity, skipRel, cityIdentity); err != nil {
 				cleanup("City initialization failed")
 				return fmt.Errorf("initializing City in pod for session %q: %w", name, err)
 			}
@@ -963,7 +967,7 @@ func resolvePodHostedDoltIdentity(env map[string]string, prefix, managedHost, ma
 }
 
 // initCityInPod copies the city directory and runs gc init inside the pod.
-func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string, identity *podHostedDoltIdentity) error {
+func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity, skipRel string, identity *podHostedDoltIdentity) error {
 	// Streaming may leave a partial directory if the source or pod exec fails.
 	// Use a bounded cleanup context even when the caller has been canceled.
 	defer func() {
@@ -973,7 +977,7 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity string, id
 	}()
 
 	// Copy the city directory into the pod, including its current .gc state.
-	if err := copyDirToPod(ctx, ops, podName, "agent", ctrlCity, "/tmp/city-src"); err != nil {
+	if err := copyDirToPodSkipping(ctx, ops, podName, "agent", ctrlCity, "/tmp/city-src", skipRel); err != nil {
 		return err
 	}
 	// Run gc init --from with GC_DOLT=skip so gc init does not attempt to
