@@ -773,11 +773,14 @@ ensure_project_identity() {
         return 0
     fi
     set -- --city "$GC_CITY_PATH" --metadata "$meta_file"
-    if [ "${GC_BEADS_TRANSPORT:-}" = "direct" ] &&
-        [ "${GC_BEADS_TARGET:-}" = "external" ] && [ -n "$DOLT_PORT" ]; then
-        # Direct external TCP init already has an explicit endpoint. Local
-        # server and socket-backed init have no managed DOLT_PORT; gc resolves
-        # those from the binding bd just persisted.
+    if [ "${GC_BEADS_PROVIDER_OWNED:-}" != "1" ] || {
+        [ "${GC_BEADS_TRANSPORT:-}" = "direct" ] &&
+            [ "${GC_BEADS_TARGET:-}" = "external" ] && [ -n "$DOLT_PORT" ];
+    }; then
+        # Managed init already resolved DOLT_PORT from gc's runtime layout,
+        # and direct/external TCP init has the endpoint bd just used. Keep
+        # forwarding those explicit endpoints. Provider-owned local and
+        # socket-backed init resolve from the binding bd persisted.
         host=$(connect_host)
         set -- "$@" --host "$host" --port "$DOLT_PORT"
     fi
