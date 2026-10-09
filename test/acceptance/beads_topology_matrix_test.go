@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -196,14 +195,15 @@ func assertProjectIdentityConverged(t *testing.T, scopeRoot string) {
 	if !endpoint.Verdict.Live() {
 		t.Fatalf("M1 proxy endpoint %s is not live: %s (%v)", root, endpoint.Verdict, endpoint.Err)
 	}
-	dsn := mysql.Config{
+	dsnConfig := mysql.Config{
 		User:        "root",
 		Net:         "tcp",
 		Addr:        net.JoinHostPort(proxyendpoint.Host, strconv.Itoa(endpoint.Record.Port)),
 		DBName:      databaseName,
 		Timeout:     10 * time.Second,
 		ReadTimeout: 10 * time.Second,
-	}.FormatDSN()
+	}
+	dsn := dsnConfig.FormatDSN()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("open M1 Dolt identity reader: %v", err)
