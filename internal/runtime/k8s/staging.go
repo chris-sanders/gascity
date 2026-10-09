@@ -404,10 +404,6 @@ func tarDirSkippingWithWalkComplete(dir, skipRel string, w io.Writer, onComplete
 	return tw.Close()
 }
 
-func walkTar(dir string, tw *tar.Writer) error {
-	return walkTarSkipping(dir, tw, "")
-}
-
 func walkTarSkipping(dir string, tw *tar.Writer, skipRel string) error {
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
