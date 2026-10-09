@@ -734,7 +734,7 @@ func (s *Store) closeAtomically(closer beads.AtomicConditionalCloser, bead beads
 				return false, err
 			}
 		}
-		_, err := closer.CloseWithMetadataIfMatch(id, bead.Revision, map[string]string(patch))
+		_, err := closer.CloseWithMetadataIfMatch(id, bead.Revision, map[string]string(withRuntimeLeaseCleared(patch)))
 		switch {
 		case err == nil:
 			return true, nil
@@ -949,10 +949,11 @@ func (s *Store) applyPatchIfClosed(id string, patch MetadataPatch) (bool, error)
 // reopen and named-session retire-archive paths (session_beads.go), which open
 // the bead row after stamping archive/reopen metadata via setMetaBatch. It
 // emits a single Update op with only Status set, byte-identical to the raw
-// write.
+// write, plus the runtime lease clear (RuntimeLeaseClearPatch): a reopened
+// row holds no lease.
 func (s *Store) SetStatusOpen(id string) error {
 	open := "open"
-	if err := s.store.Update(id, beads.UpdateOpts{Status: &open}); err != nil {
+	if err := s.store.Update(id, beads.UpdateOpts{Status: &open, Metadata: map[string]string(RuntimeLeaseClearPatch())}); err != nil {
 		return err
 	}
 	return nil
