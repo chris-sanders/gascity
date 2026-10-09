@@ -196,12 +196,13 @@ func assertProjectIdentityConverged(t *testing.T, scopeRoot string) {
 		t.Fatalf("M1 proxy endpoint %s is not live: %s (%v)", root, endpoint.Verdict, endpoint.Err)
 	}
 	dsnConfig := mysql.Config{
-		User:        "root",
-		Net:         "tcp",
-		Addr:        net.JoinHostPort(proxyendpoint.Host, strconv.Itoa(endpoint.Record.Port)),
-		DBName:      databaseName,
-		Timeout:     10 * time.Second,
-		ReadTimeout: 10 * time.Second,
+		User:                 "root",
+		Net:                  "tcp",
+		Addr:                 net.JoinHostPort(proxyendpoint.Host, strconv.Itoa(endpoint.Record.Port)),
+		DBName:               databaseName,
+		AllowNativePasswords: true,
+		Timeout:              10 * time.Second,
+		ReadTimeout:          10 * time.Second,
 	}
 	dsn := dsnConfig.FormatDSN()
 	db, err := sql.Open("mysql", dsn)
