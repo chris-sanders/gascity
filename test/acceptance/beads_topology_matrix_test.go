@@ -56,7 +56,7 @@ func TestBeadsInitTopologyMatrix(t *testing.T) {
 				helpers.AssertScopeShape(t, cityRoot, cityRoot, topo.City, topo.Name+" city")
 				helpers.AssertJournalState(t, cityRoot, "city", topo.City, topo.Name+" city")
 				if topo.Name == "M1-proxied-local" {
-					assertProjectIdentityConverged(t, cityRoot)
+					assertProjectIdentityConverged(t, cityRoot, run.Env)
 				}
 			})
 		} else {
@@ -168,8 +168,19 @@ func TestBeadsInitTopologyMatrix(t *testing.T) {
 // assertProjectIdentityConverged proves the real provider-owned M1 init wrote
 // one project identity to the canonical file, bd metadata, and its live Dolt
 // database. The proxy root and generation come from the same contract gc uses.
-func assertProjectIdentityConverged(t *testing.T, scopeRoot string) {
+func assertProjectIdentityConverged(t *testing.T, scopeRoot string, env *helpers.Env) {
 	t.Helper()
+	// ProviderRoot follows bd's process-environment contract. Match the
+	// environment that initialized this topology so host BEADS_* overrides
+	// cannot redirect the assertion to a different proxy root.
+	for _, key := range []string{
+		proxyendpoint.RootPathEnv,
+		proxyendpoint.DoltDataDirEnv,
+		proxyendpoint.SharedServerModeEnv,
+		proxyendpoint.SharedServerDirEnv,
+	} {
+		t.Setenv(key, env.Get(key))
+	}
 	identityPath := contract.ProjectIdentityPath(scopeRoot)
 	if _, err := os.Stat(identityPath); err != nil {
 		t.Fatalf("canonical project identity file %s: %v", identityPath, err)
