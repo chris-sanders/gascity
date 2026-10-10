@@ -347,7 +347,9 @@ func TestGcBeadsBdProviderOwnedInitAnchorsBeadsDirBeforeBdInit(t *testing.T) {
 // init calls it after bd succeeds with the scope metadata and selected endpoint.
 func TestGcBeadsBdProviderOwnedInitEnsuresProjectIdentityAfterSuccessfulBdInit(t *testing.T) {
 	const (
-		host      = "provider-db.example.test"
+		// Loopback IPv6 catches accidental connect_host normalization when
+		// reconciling a provider-owned direct/external init binding.
+		host      = "::1"
 		port      = "3344"
 		user      = "provider-user"
 		prefix    = "px"
@@ -399,8 +401,8 @@ for arg in "$@"; do
   scope="$arg"
 done
 mkdir -p "$scope/.beads"
-cat > "$scope/.beads/metadata.json" <<'JSON'
-{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"provider_db","dolt_server_host":"provider-db.example.test","dolt_server_port":3344,"issue_prefix":"px"}
+cat > "$scope/.beads/metadata.json" <<JSON
+{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"provider_db","dolt_server_host":"${GC_DOLT_HOST}","dolt_server_port":${GC_DOLT_PORT},"issue_prefix":"px"}
 JSON
 `)
 

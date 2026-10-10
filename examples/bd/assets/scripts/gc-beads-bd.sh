@@ -781,7 +781,16 @@ ensure_project_identity() {
         # and direct/external TCP init has the endpoint bd just used. Keep
         # forwarding those explicit endpoints. Provider-owned local and
         # socket-backed init resolve from the binding bd persisted.
-        host=$(connect_host)
+        if [ "${GC_BEADS_PROVIDER_OWNED:-}" = "1" ] &&
+            [ "${GC_BEADS_TRANSPORT:-}" = "direct" ] &&
+            [ "${GC_BEADS_TARGET:-}" = "external" ]; then
+            # Reuse the exact host bd received at init. connect_host folds
+            # loopback IPv6 into IPv4 for gc-managed local servers, but an
+            # external binding may be IPv6-only.
+            host="${GC_DOLT_HOST:-$DOLT_HOST}"
+        else
+            host=$(connect_host)
+        fi
         set -- "$@" --host "$host" --port "$DOLT_PORT"
     fi
     set -- "$@" --user "$DOLT_USER" --database "$dolt_database"
