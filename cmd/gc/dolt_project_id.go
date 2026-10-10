@@ -234,7 +234,7 @@ func resolveLocalProxiedProjectIdentityTarget(scopeRoot string, target contract.
 	}
 	endpoint := proxyendpoint.Inspect(root, processTable)
 	if !endpoint.Verdict.Live() {
-		return contract.DoltConnectionTarget{}, fmt.Errorf("provider-owned proxy endpoint %s is not live (%s): %v", root, endpoint.Verdict, endpoint.Err)
+		return contract.DoltConnectionTarget{}, fmt.Errorf("provider-owned proxy endpoint %s is not live (%s): %w", root, endpoint.Verdict, endpoint.Err)
 	}
 	target.Host = proxyendpoint.Host
 	target.Port = strconv.Itoa(endpoint.Record.Port)

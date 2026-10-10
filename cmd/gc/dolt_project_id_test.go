@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,14 +47,6 @@ func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
 		} {
 			t.Setenv(name, "")
 		}
-	}
-	openLocalPort := func(t *testing.T) (net.Listener, string) {
-		t.Helper()
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return listener, fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port)
 	}
 	writeMetadata := func(t *testing.T, scope string, extra map[string]any) string {
 		t.Helper()
@@ -147,8 +138,7 @@ func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
 		scope := t.TempDir()
 		metadataPath := writeMetadata(t, scope, nil)
 		writeConfig(t, scope, "issue_prefix: gc\n")
-		listener, port := openLocalPort(t)
-		defer listener.Close()
+		const port = "43123"
 		beadsDir := filepath.Join(scope, ".beads")
 		if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.pid"), []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
 			t.Fatal(err)
