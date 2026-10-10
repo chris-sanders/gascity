@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -138,7 +139,13 @@ func TestResolveProviderOwnedProjectIdentityTarget(t *testing.T) {
 		scope := t.TempDir()
 		metadataPath := writeMetadata(t, scope, nil)
 		writeConfig(t, scope, "issue_prefix: gc\n")
-		const port = "43123"
+		listener := listenOnRandomPort(t)
+		t.Cleanup(func() {
+			if err := listener.Close(); err != nil {
+				t.Errorf("close bd server fixture listener: %v", err)
+			}
+		})
+		port := fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port)
 		beadsDir := filepath.Join(scope, ".beads")
 		if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.pid"), []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
 			t.Fatal(err)
