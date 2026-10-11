@@ -37,6 +37,7 @@ LABEL io.gascity.codex.version="${CODEX_VERSION}" \
 
 ENV CODEX_MANAGED_PACKAGE_ROOT=/opt/codex-${CODEX_VERSION}
 
-# Preserve the source-owned agent runtime identity after the additive root
-# installation layer completes.
-USER gcagent
+# Preserve the source-owned numeric non-root identity after the additive root
+# installation layer completes. The primary GID 0 keeps root-group-writable
+# image paths available when admission assigns an arbitrary non-root UID.
+USER 1001:0
