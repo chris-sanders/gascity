@@ -345,7 +345,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	// command wrapping without asking buildPod to create such a pod.
 	linuxUsername := cfg.Env["LINUX_USERNAME"]
 	if linuxUsername != "" {
-		return nil, fmt.Errorf("Kubernetes sessions require the image's non-root gcagent user; LINUX_USERNAME is incompatible with Restricted PodSecurity")
+		return nil, fmt.Errorf("kubernetes sessions require the image's non-root gcagent user; LINUX_USERNAME is incompatible with Restricted PodSecurity")
 	}
 	storeIdentity, err := resolvePodHostedDoltIdentity(cfg.Env, "", p.managedServiceHost, p.managedServicePort)
 	if err != nil {
@@ -353,7 +353,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	}
 	if !p.prebaked {
 		if _, err := resolvePodHostedDoltIdentity(cfg.Env, "GC_K8S_CITY_", p.managedServiceHost, p.managedServicePort); err != nil {
-			return nil, fmt.Errorf("City store identity: %w", err)
+			return nil, fmt.Errorf("city store identity: %w", err)
 		}
 	}
 	var userSetup string
