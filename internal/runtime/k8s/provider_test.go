@@ -1663,6 +1663,9 @@ func TestStartFailsWhenInitBeadsInPodFails(t *testing.T) {
 	p.postStartSettle = 0
 
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if out, ok := fakeTarExtractAck(cmd); ok {
+			return out, nil
+		}
 		if len(cmd) >= 3 && cmd[0] == "sh" && cmd[1] == "-c" && containsStr(cmd[2], "bd init --server") {
 			return "", errors.New("missing canonical beads")
 		}
@@ -1851,6 +1854,9 @@ func TestStartDetectsImmediateSessionDeath(t *testing.T) {
 	// tmux has-session succeeds during waitForTmux, then fails on post-start check.
 	hasSessionCalls := 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if out, ok := fakeTarExtractAck(cmd); ok {
+			return out, nil
+		}
 		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 			hasSessionCalls++
 			if hasSessionCalls <= 1 {
@@ -1902,6 +1908,9 @@ func TestStartAllowsOneShotLifecycleCommands(t *testing.T) {
 
 			hasSessionCalls := 0
 			fake.execFunc = func(_ string, cmd []string) (string, error) {
+				if out, ok := fakeTarExtractAck(cmd); ok {
+					return out, nil
+				}
 				if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 					hasSessionCalls++
 					if hasSessionCalls == 1 {
@@ -1944,6 +1953,9 @@ func TestStartChecksLivenessForScriptCommandWithoutOneShotLifecycle(t *testing.T
 
 	hasSessionCalls := 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if out, ok := fakeTarExtractAck(cmd); ok {
+			return out, nil
+		}
 		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 			hasSessionCalls++
 			if hasSessionCalls == 1 {
@@ -1976,6 +1988,9 @@ func TestStartChecksLivenessForCustomCommandWithSetupAndNudgeHints(t *testing.T)
 	// tmux has-session succeeds during waitForTmux, then fails on post-start check.
 	hasSessionCalls := 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if out, ok := fakeTarExtractAck(cmd); ok {
+			return out, nil
+		}
 		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 			hasSessionCalls++
 			if hasSessionCalls == 1 {
@@ -2031,6 +2046,9 @@ func TestStartHonorsCancellationDuringPostStartSettle(t *testing.T) {
 
 	hasSessionCalls := 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if out, ok := fakeTarExtractAck(cmd); ok {
+			return out, nil
+		}
 		if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 			hasSessionCalls++
 		}

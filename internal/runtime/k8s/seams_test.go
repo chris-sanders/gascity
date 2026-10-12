@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -16,6 +17,33 @@ import (
 // hasSessionAlive marks the in-box tmux session as present so IsRunning is true.
 func hasSessionAlive(fake *fakeK8sOps, pod string) { //nolint:unparam // pod varies in future tests
 	fake.setExecResult(pod, []string{"tmux", "has-session", "-t", tmuxSession}, "", nil)
+}
+
+func TestFakeK8sOpsTarCallbackResultIsAuthoritative(t *testing.T) {
+	fake := newFakeK8sOps()
+	fake.execFunc = func(_ string, _ []string) (string, error) {
+		return "", nil
+	}
+	stdin := strings.NewReader("archive")
+	out, err := fake.execInPod(context.Background(), "pod", "agent", tarExtractCommand("/stage"), stdin)
+	if err != nil {
+		t.Fatalf("execInPod: %v", err)
+	}
+	if out != "" {
+		t.Fatalf("execInPod output = %q, want explicit empty callback result", out)
+	}
+	if stdin.Len() != 0 {
+		t.Fatalf("tar input has %d unread bytes; want drained", stdin.Len())
+	}
+
+	fake.setExecResult("pod", []string{"printf", "static"}, "map result", nil)
+	out, err = fake.execInPod(context.Background(), "pod", "agent", []string{"printf", "static"}, nil)
+	if err != nil {
+		t.Fatalf("non-tar execInPod: %v", err)
+	}
+	if out != "" {
+		t.Fatalf("non-tar execInPod output = %q, want explicit empty callback result", out)
+	}
 }
 
 // TestSeamsK8sExecAndOpen proves Place.Exec delegates to execInPod (preserving

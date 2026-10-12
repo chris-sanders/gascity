@@ -10,7 +10,7 @@ version = 2
 [[audit_baseline]]
 scope = "all"
 resource = "subprocess"
-baseline_calls = 747
+baseline_calls = 746
 baseline_files = 222
 reported_calls = 495
 reported_files = 135
@@ -51,13 +51,13 @@ expires = "2026-10-31"
 [[debt]]
 scope = "untagged"
 resource = "subprocess"
-baseline_calls = 499
+baseline_calls = 498
 baseline_files = 148
 reported_calls = 380
 reported_files = 98
 owner_bead = "ga-cp3hwi"
 invariant = "untagged subprocess call/file totals cannot grow; reductions must lower this baseline"
-resource_owner = "the census includes the reviewed provider-owned direct/external init identity test; other process-owning tests remove or replace their source call sites"
+resource_owner = "each process-owning test removes or replaces its source call site"
 migration_target = "D1/D2/D5/D6/E6"
 expires = "2026-10-31"
 
@@ -255,22 +255,11 @@ expires = "2026-10-31"
 [[medium]]
 package_dir = "cmd/gc"
 package_name = "main"
-owner = "TestGcBeadsBdProviderOwnedDirectExternalInitReconcilesProjectIdentity"
-resources = ["subprocess"]
-owner_bead = "ga-p9iuv.30"
-invariant = "provider-owned direct/external init project identity convergence is a checked Medium subprocess owner"
-resource_owner = "the test invokes the shipped gc-beads-bd script with test-owned gc/bd executables and temporary city state, then verifies persisted identity convergence without Dolt or a host service"
-migration_target = "GC6011"
-expires = "2026-10-31"
-
-[[medium]]
-package_dir = "cmd/gc"
-package_name = "main"
 owner = "TestGcBeadsBdProviderOwnedLifecycleUsesBdBoundary"
 resources = ["subprocess"]
 owner_bead = "ga-p9iuv.30"
 invariant = "the provider-owned script boundary proof is a checked Medium subprocess owner"
-resource_owner = "the test executes the copied provider script only with a test-owned BD executable and verifies its lifecycle delegation without a host service"
+resource_owner = "the test runs the provider-owned script with test-owned BD/GC executables for lifecycle and direct/external init, checks persisted project identity convergence, and requires no host service"
 migration_target = "GC6011"
 expires = "2026-10-31"
 

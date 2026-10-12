@@ -182,10 +182,24 @@ func (f *fakeK8sOps) listPods(_ context.Context, selector string, fieldSelector 
 	return result, nil
 }
 
-func (f *fakeK8sOps) execInPod(_ context.Context, pod, container string, cmd []string, _ io.Reader) (string, error) {
+func (f *fakeK8sOps) execInPod(_ context.Context, pod, container string, cmd []string, stdin io.Reader) (string, error) {
 	f.calls = append(f.calls, fakeCall{method: "execInPod", pod: pod, container: container, cmd: cmd})
 	if f.execFunc != nil {
-		return f.execFunc(pod, cmd)
+		out, err := f.execFunc(pod, cmd)
+		if err != nil {
+			return out, err
+		}
+		if isTarExtractCommand(cmd) {
+			// The callback owns the result, including an empty result that
+			// models a missing staging acknowledgement. Drain the archive so
+			// streamArchive can finish writing without inventing that ack.
+			if stdin != nil {
+				if _, err := io.Copy(io.Discard, stdin); err != nil {
+					return "", fmt.Errorf("draining fake pod tar input: %w", err)
+				}
+			}
+		}
+		return out, nil
 	}
 	key := execKey(pod, cmd)
 	if err, ok := f.execErr[key]; ok {
@@ -194,7 +208,30 @@ func (f *fakeK8sOps) execInPod(_ context.Context, pod, container string, cmd []s
 	if out, ok := f.execOutput[key]; ok {
 		return out, nil
 	}
+	if out, ok := fakeTarExtractAck(cmd); ok {
+		// The fake cannot execute tar in a pod; consume the archive before
+		// modeling the successful staging acknowledgement.
+		if stdin != nil {
+			if _, err := io.Copy(io.Discard, stdin); err != nil {
+				return "", fmt.Errorf("draining fake pod tar input: %w", err)
+			}
+		}
+		return out, nil
+	}
 	return "", nil
+}
+
+func fakeTarExtractAck(cmd []string) (string, bool) {
+	if !isTarExtractCommand(cmd) {
+		return "", false
+	}
+	return archiveExtractAck + "\n", true
+}
+
+func isTarExtractCommand(cmd []string) bool {
+	return len(cmd) == 6 && cmd[0] == "sh" && cmd[1] == "-c" &&
+		cmd[2] == `tar xf - -C "$1" && printf '%s\n' "$2"` &&
+		cmd[3] == "sh" && cmd[5] == archiveExtractAck
 }
 
 // setExecResult configures the fake to return specific output for a pod+cmd combo.
