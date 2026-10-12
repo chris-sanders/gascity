@@ -107,6 +107,9 @@ func TestStartDeletesStalePodOnDefinitiveTmuxNegative(t *testing.T) {
 	// Provider.Exec already dispatches on.
 	probed := 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if out, ok := fakeTarExtractAck(cmd); ok {
+			return out, nil
+		}
 		if len(cmd) > 1 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 			probed++
 			if probed == 1 {
@@ -148,6 +151,9 @@ func TestStartRecreatesAPodWhoseAgentContainerIsNotRunning(t *testing.T) {
 	// Every exec fails the way the apiserver fails for a dead container —
 	// deliberately not an ExitError, so only the pod status can decide.
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if out, ok := fakeTarExtractAck(cmd); ok {
+			return out, nil
+		}
 		if len(cmd) > 1 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 			return "", errors.New("error executing command in container: container is not running")
 		}
@@ -176,6 +182,9 @@ func TestStartRetriesAnUnansweredLivenessProbeBeforeGivingUp(t *testing.T) {
 
 	probes := 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if out, ok := fakeTarExtractAck(cmd); ok {
+			return out, nil
+		}
 		if len(cmd) > 1 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 			probes++
 			if probes == 1 {
