@@ -17,10 +17,15 @@ type recordingExec struct {
 	out   []byte
 	code  int
 	err   error
+	errs  []error
 }
 
 func (r *recordingExec) Exec(_ context.Context, _ string, argv []string) ([]byte, int, error) {
+	index := len(r.calls)
 	r.calls = append(r.calls, argv)
+	if index < len(r.errs) && r.errs[index] != nil {
+		return nil, -1, r.errs[index]
+	}
 	return r.out, r.code, r.err
 }
 
@@ -59,6 +64,30 @@ func TestTmuxCarrier_NudgeTypesThenSubmits(t *testing.T) {
 		"tmux send-keys -t main -l hi there",
 		"tmux send-keys -t main Enter",
 	)
+}
+
+func TestTmuxCarrier_NudgeUsesResolvedProviderSubmitSequence(t *testing.T) {
+	f := NewFake()
+	c := NewTmuxCarrierWithSubmitKeys(f, "main", func(name string) []string {
+		if name != "codex-session" {
+			t.Fatalf("submit-key resolver session = %q, want codex-session", name)
+		}
+		return NudgeSubmitKeySequenceForProvider("builtin:codex")
+	})
+	if err := c.Nudge(context.Background(), "codex-session", TextContent("hi there")); err != nil {
+		t.Fatalf("Nudge: %v", err)
+	}
+	wantExec(t, f,
+		"tmux send-keys -t main -l hi there",
+		"tmux send-keys -t main Escape",
+		"tmux send-keys -t main Enter",
+	)
+}
+
+func TestNudgeSubmitKeySequenceForProviderDefaultsToEnter(t *testing.T) {
+	if got := NudgeSubmitKeySequenceForProvider("claude"); !slices.Equal(got, []string{"Enter"}) {
+		t.Fatalf("claude submit sequence = %v, want [Enter]", got)
+	}
 }
 
 func TestTmuxCarrier_NudgeEmptyIsNoOp(t *testing.T) {
@@ -149,6 +178,29 @@ func TestTmuxCarrier_NudgeFirstStepErrorSkipsEnter(t *testing.T) {
 	}
 	if len(rec.calls) != 1 {
 		t.Errorf("issued %d exec calls, want 1 (Enter must be skipped after the type fails)", len(rec.calls))
+	}
+}
+
+func TestTmuxCarrier_NudgeSubmitFailureSkipsRemainingKeys(t *testing.T) {
+	rec := &recordingExec{errs: []error{nil, errBoom}}
+	c := NewTmuxCarrierWithSubmitKeys(rec, "main", func(string) []string {
+		return NudgeSubmitKeySequenceForProvider("codex")
+	})
+	err := c.Nudge(context.Background(), "s", TextContent("hi"))
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Nudge err = %v, want errBoom", err)
+	}
+	want := [][]string{
+		{"tmux", "send-keys", "-t", "main", "-l", "hi"},
+		{"tmux", "send-keys", "-t", "main", "Escape"},
+	}
+	if len(rec.calls) != len(want) {
+		t.Fatalf("exec calls = %v, want %v", rec.calls, want)
+	}
+	for i := range want {
+		if !slices.Equal(rec.calls[i], want[i]) {
+			t.Errorf("exec[%d] = %v, want %v", i, rec.calls[i], want[i])
+		}
 	}
 }
 
