@@ -67,6 +67,10 @@ type schedulingFields struct {
 	priorityClassName string
 }
 
+func runtimeIdentityEnvKeys() [3]string {
+	return [3]string{"GC_SESSION_ID", "GC_INSTANCE_TOKEN", "GC_RUNTIME_EPOCH"}
+}
+
 // NewProvider creates a K8s session provider.
 // Configuration is read from environment variables (matching gc-session-k8s):
 //   - GC_K8S_NAMESPACE — namespace (default: "gc")
@@ -413,6 +417,9 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 		[]string{"tmux", "has-session", "-t", tmuxSession}, nil); err != nil {
 		return fmt.Errorf("%w: session %q (pod %s has no live tmux session)", runtime.ErrSessionNotFound, name, podName)
 	}
+	if err := p.projectSessionRuntimeIdentity(ctx, podName, name, cfg.Env); err != nil {
+		return err
+	}
 
 	// Respawn the agent in the warm "main" session.
 	if _, err := p.ops.execInPod(ctx, podName, "agent",
@@ -444,6 +451,22 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 	p.setProviderName(name, cfg.ProviderName)
 	if cfg.Nudge != "" {
 		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+	}
+	return nil
+}
+
+func (p *Provider) projectSessionRuntimeIdentity(ctx context.Context, podName, name string, env map[string]string) error {
+	for _, key := range runtimeIdentityEnvKeys() {
+		value := env[key]
+		cmd := []string{"tmux", "set-environment", "-t", tmuxSession}
+		if value == "" {
+			cmd = append(cmd, "-u", key)
+		} else {
+			cmd = append(cmd, key, value)
+		}
+		if _, err := p.ops.execInPod(ctx, podName, "agent", cmd, nil); err != nil {
+			return fmt.Errorf("projecting runtime identity %s for session %q: %w", key, name, err)
+		}
 	}
 	return nil
 }
@@ -616,20 +639,23 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 	ctx := context.Background()
 	podName, err := p.findPod(ctx, name)
 	if err != nil {
-		return "", nil
+		return "", fmt.Errorf("finding metadata runtime for session %q: %w", name, err)
 	}
 	output, err := p.ops.execInPod(ctx, podName, "agent",
-		[]string{"tmux", "show-environment", "-t", tmuxSession, key}, nil)
+		[]string{"tmux", "show-environment", "-t", tmuxSession}, nil)
 	if err != nil {
-		return "", nil
+		return "", fmt.Errorf("reading metadata %q for session %q: %w", key, name, err)
 	}
-	output = strings.TrimSpace(output)
-	// tmux output: "KEY=VALUE" (set), "-KEY" (unset).
-	if strings.HasPrefix(output, "-") {
-		return "", nil // explicitly unset
-	}
-	if _, val, ok := strings.Cut(output, "="); ok {
-		return val, nil
+	// Listing the session environment distinguishes an absent key from a failed
+	// keyed lookup (which tmux reports as exit 1 for an unknown variable).
+	for _, line := range strings.Split(output, "\n") {
+		if line == "-"+key {
+			return "", nil // explicitly unset
+		}
+		name, value, ok := strings.Cut(line, "=")
+		if ok && name == key {
+			return value, nil
+		}
 	}
 	return "", nil
 }
@@ -889,7 +915,7 @@ func (p *Provider) findPod(ctx context.Context, name string) (string, error) {
 		return "", err
 	}
 	if len(pods) == 0 {
-		return "", fmt.Errorf("no pod for session %q", name)
+		return "", fmt.Errorf("%w: no pod for session %q", runtime.ErrSessionNotFound, name)
 	}
 	return pods[0].Name, nil
 }

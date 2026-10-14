@@ -689,8 +689,11 @@ func TestStartCreatesPodsAndWaits(t *testing.T) {
 		Command:      "claude --settings .gc/settings.json",
 		ProcessNames: []string{"claude"},
 		Env: map[string]string{
-			"GC_AGENT": "mayor",
-			"GC_CITY":  "/workspace",
+			"GC_AGENT":          "mayor",
+			"GC_CITY":           "/workspace",
+			"GC_SESSION_ID":     "session-id-123",
+			"GC_INSTANCE_TOKEN": "instance-token-456",
+			"GC_RUNTIME_EPOCH":  "7",
 		},
 	}
 	err := p.Start(context.Background(), "gc-test-agent", cfg)
@@ -713,6 +716,16 @@ func TestStartCreatesPodsAndWaits(t *testing.T) {
 	}
 	if pod.Annotations["gc-session-name"] != "gc-test-agent" {
 		t.Errorf("annotation gc-session-name = %q, want gc-test-agent", pod.Annotations["gc-session-name"])
+	}
+	startScript := pod.Spec.Containers[0].Args[0]
+	for _, identity := range []string{
+		"GC_SESSION_ID=session-id-123",
+		"GC_INSTANCE_TOKEN=instance-token-456",
+		"GC_RUNTIME_EPOCH=7",
+	} {
+		if flag := "-e " + shellquote.Quote(identity); !strings.Contains(startScript, flag) {
+			t.Errorf("Start pod entrypoint missing tmux session identity flag %q: %s", flag, startScript)
+		}
 	}
 }
 
