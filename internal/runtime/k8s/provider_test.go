@@ -476,10 +476,11 @@ func TestMetaOps(t *testing.T) {
 		t.Fatalf("SetMeta: %v", err)
 	}
 
-	// GetMeta — configure fake to return the value.
+	// GetMeta reads session-scoped metadata from tmux's full environment listing.
+	showEnvironment := []string{"tmux", "show-environment", "-t", tmuxSession}
 	fake.setExecResult("gc-test-agent",
-		[]string{"tmux", "show-environment", "-t", "main", "GC_DRAIN"},
-		"GC_DRAIN=true\n", nil)
+		showEnvironment,
+		"GC_DRAIN=true\nGC_SESSION_ID=runtime-session\n", nil)
 
 	val, err := p.GetMeta("gc-test-agent", "GC_DRAIN")
 	if err != nil {
@@ -489,10 +490,10 @@ func TestMetaOps(t *testing.T) {
 		t.Errorf("GetMeta = %q, want %q", val, "true")
 	}
 
-	// GetMeta with unset key.
+	// An absent key remains absent even when other session metadata exists.
 	fake.setExecResult("gc-test-agent",
-		[]string{"tmux", "show-environment", "-t", "main", "MISSING"},
-		"-MISSING\n", nil)
+		showEnvironment,
+		"GC_DRAIN=true\nGC_SESSION_ID=runtime-session\n", nil)
 
 	val, err = p.GetMeta("gc-test-agent", "MISSING")
 	if err != nil {
@@ -502,10 +503,59 @@ func TestMetaOps(t *testing.T) {
 		t.Errorf("GetMeta unset = %q, want empty", val)
 	}
 
+	// A foreign runtime value is returned from the session, without substitution
+	// from controller expectations or another tmux environment scope.
+	val, err = p.GetMeta("gc-test-agent", "GC_SESSION_ID")
+	if err != nil {
+		t.Fatalf("GetMeta foreign identity: %v", err)
+	}
+	if val != "runtime-session" {
+		t.Errorf("GetMeta foreign identity = %q, want exact session value %q", val, "runtime-session")
+	}
+
 	// RemoveMeta.
 	if err := p.RemoveMeta("gc-test-agent", "GC_DRAIN"); err != nil {
 		t.Fatalf("RemoveMeta: %v", err)
 	}
+}
+
+func TestGetMetaPropagatesUnreadableIdentityAndDistinguishesMissingPod(t *testing.T) {
+	t.Run("missing pod is gone", func(t *testing.T) {
+		p := newProviderWithOps(newFakeK8sOps())
+		_, err := p.GetMeta("missing", "GC_SESSION_ID")
+		if !errors.Is(err, runtime.ErrSessionNotFound) {
+			t.Fatalf("GetMeta missing pod error = %v, want ErrSessionNotFound", err)
+		}
+	})
+
+	t.Run("pod lookup failure is unreadable", func(t *testing.T) {
+		fake := newFakeK8sOps()
+		p := newProviderWithOps(fake)
+		listErr := errors.New("pod API unavailable")
+		fake.listErr = listErr
+		_, err := p.GetMeta("session", "GC_SESSION_ID")
+		if !errors.Is(err, listErr) {
+			t.Fatalf("GetMeta list error = %v, want wrapped %v", err, listErr)
+		}
+		if errors.Is(err, runtime.ErrSessionNotFound) {
+			t.Fatalf("GetMeta list error = %v, must not classify an unreadable Pod list as gone", err)
+		}
+	})
+
+	t.Run("session environment exec failure is unreadable", func(t *testing.T) {
+		fake := newFakeK8sOps()
+		p := newProviderWithOps(fake)
+		addRunningPod(fake, "session", "session")
+		execErr := errors.New("pod exec channel unavailable")
+		fake.setExecResult("session", []string{"tmux", "show-environment", "-t", tmuxSession}, "", execErr)
+		_, err := p.GetMeta("session", "GC_SESSION_ID")
+		if !errors.Is(err, execErr) {
+			t.Fatalf("GetMeta exec error = %v, want wrapped %v", err, execErr)
+		}
+		if errors.Is(err, runtime.ErrSessionNotFound) {
+			t.Fatalf("GetMeta exec error = %v, must not classify an unreadable identity as gone", err)
+		}
+	})
 }
 
 func TestPeek(t *testing.T) {
@@ -2247,6 +2297,92 @@ func TestProvider_RelaunchRespawnsAgentInWarmPod(t *testing.T) {
 		if c.method == "createPod" || c.method == "deletePod" {
 			t.Errorf("Relaunch must reuse the warm pod, but called %s", c.method)
 		}
+	}
+}
+
+func TestProvider_RelaunchProjectsExactIdentityBeforeRespawn(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 0
+	addRunningPod(fake, "s", "s")
+	hasSessionAlive(fake, "s")
+	cfg := runtime.Config{
+		Command: "codex --resume",
+		Env: map[string]string{
+			"GC_SESSION_ID":     "bead-123",
+			"GC_INSTANCE_TOKEN": "incarnation-456",
+			"GC_RUNTIME_EPOCH":  "8",
+			"GC_UNRELATED":      "not-runtime-identity",
+		},
+	}
+
+	if err := p.Relaunch(context.Background(), "s", cfg); err != nil {
+		t.Fatalf("Relaunch: %v", err)
+	}
+
+	want := [][]string{
+		{"tmux", "set-environment", "-t", tmuxSession, "GC_SESSION_ID", "bead-123"},
+		{"tmux", "set-environment", "-t", tmuxSession, "GC_INSTANCE_TOKEN", "incarnation-456"},
+		{"tmux", "set-environment", "-t", tmuxSession, "GC_RUNTIME_EPOCH", "8"},
+	}
+	positions := make([]int, 0, len(want))
+	respawnPosition := -1
+	for i, call := range fake.calls {
+		if call.method != "execInPod" {
+			continue
+		}
+		for _, command := range want {
+			if strings.Join(call.cmd, "\x00") == strings.Join(command, "\x00") {
+				positions = append(positions, i)
+			}
+		}
+		if strings.Contains(strings.Join(call.cmd, " "), "respawn-pane") {
+			respawnPosition = i
+		}
+		if strings.Contains(strings.Join(call.cmd, " "), "not-runtime-identity") {
+			t.Errorf("Relaunch projected unrelated environment: %v", call.cmd)
+		}
+	}
+	if len(positions) != len(want) {
+		t.Fatalf("Relaunch identity projection calls = %d, want %d; calls: %+v", len(positions), len(want), fake.calls)
+	}
+	for i := 1; i < len(positions); i++ {
+		if positions[i] <= positions[i-1] {
+			t.Errorf("identity projection calls were not ordered before respawn: %v", positions)
+		}
+	}
+	if respawnPosition < 0 {
+		t.Fatal("Relaunch did not respawn the agent")
+	}
+	if positions[len(positions)-1] >= respawnPosition {
+		t.Errorf("Relaunch respawned before projecting identity: identity positions %v, respawn %d", positions, respawnPosition)
+	}
+}
+
+func TestProvider_RelaunchIdentityProjectionFailureStopsBeforeRespawn(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "s", "s")
+	hasSessionAlive(fake, "s")
+	projectionErr := errors.New("tmux session environment unavailable")
+	fake.setExecResult("s", []string{
+		"tmux", "set-environment", "-t", tmuxSession, "GC_INSTANCE_TOKEN", "incarnation-456",
+	}, "", projectionErr)
+	cfg := runtime.Config{
+		Command: "codex --resume",
+		Env: map[string]string{
+			"GC_SESSION_ID":     "bead-123",
+			"GC_INSTANCE_TOKEN": "incarnation-456",
+			"GC_RUNTIME_EPOCH":  "8",
+		},
+	}
+
+	err := p.Relaunch(context.Background(), "s", cfg)
+	if !errors.Is(err, projectionErr) {
+		t.Fatalf("Relaunch error = %v, want wrapped projection error %v", err, projectionErr)
+	}
+	if respawn := findExecCmd(fake, "respawn-pane"); respawn != nil {
+		t.Fatalf("Relaunch issued respawn after identity projection failed: %v", respawn)
 	}
 }
 

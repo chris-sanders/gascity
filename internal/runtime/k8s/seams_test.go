@@ -120,12 +120,13 @@ func TestSeamsK8sMetaStore(t *testing.T) {
 	if err := ms.SetMeta("s", "k", "v"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
 	}
-	fake.setExecResult("s", []string{"tmux", "show-environment", "-t", tmuxSession, "k"}, "k=v", nil)
+	showEnvironment := []string{"tmux", "show-environment", "-t", tmuxSession}
+	fake.setExecResult("s", showEnvironment, "k=v", nil)
 	if got, err := ms.GetMeta("s", "k"); err != nil || got != "v" {
 		t.Fatalf("GetMeta = %q, %v; want v, nil", got, err)
 	}
 	// An explicitly-unset key (tmux prints "-KEY") parses to empty.
-	fake.setExecResult("s", []string{"tmux", "show-environment", "-t", tmuxSession, "missing"}, "-missing", nil)
+	fake.setExecResult("s", showEnvironment, "k=v\n", nil)
 	if got, err := ms.GetMeta("s", "missing"); err != nil || got != "" {
 		t.Fatalf("GetMeta(unset) = %q, %v; want empty, nil", got, err)
 	}
