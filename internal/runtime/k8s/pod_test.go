@@ -214,6 +214,63 @@ func TestBuildPod_NoSchedulingFields_NoBehaviorChange(t *testing.T) {
 	}
 }
 
+func TestBuildPodProjectsRuntimeIdentityIntoTmuxBeforeAgentLaunch(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	cfg := runtime.Config{
+		Command: "codex",
+		Env: map[string]string{
+			"GC_SESSION_ID":     "session-123",
+			"GC_INSTANCE_TOKEN": "instance-456",
+			"GC_RUNTIME_EPOCH":  "7",
+			"GC_UNRELATED":      "not-runtime-identity",
+		},
+	}
+	pod, err := buildPod("session-123", cfg, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+
+	processEnv := make(map[string]string, len(pod.Spec.Containers[0].Env))
+	for _, variable := range pod.Spec.Containers[0].Env {
+		processEnv[variable.Name] = variable.Value
+	}
+	identity := []struct {
+		key   string
+		value string
+	}{
+		{key: "GC_SESSION_ID", value: "session-123"},
+		{key: "GC_INSTANCE_TOKEN", value: "instance-456"},
+		{key: "GC_RUNTIME_EPOCH", value: "7"},
+	}
+	for _, item := range identity {
+		if got := processEnv[item.key]; got != item.value {
+			t.Errorf("pod process env %s = %q, want cfg.Env value %q", item.key, got, item.value)
+		}
+	}
+
+	startScript := pod.Spec.Containers[0].Args[0]
+	newSession := strings.Index(startScript, "tmux new-session")
+	if newSession < 0 {
+		t.Fatalf("entrypoint has no tmux new-session command: %s", startScript)
+	}
+	lastIdentityFlag := newSession
+	for _, item := range identity {
+		flag := "-e " + shellquote.Quote(item.key+"="+item.value)
+		index := strings.Index(startScript, flag)
+		if index < newSession {
+			t.Errorf("tmux session identity flag %q missing from new-session command: %s", flag, startScript)
+			continue
+		}
+		if index <= lastIdentityFlag {
+			t.Errorf("tmux session identity flag %q is out of order in: %s", flag, startScript)
+		}
+		lastIdentityFlag = index
+	}
+	if strings.Contains(startScript, "not-runtime-identity") {
+		t.Errorf("unrelated environment value was projected into the tmux session: %s", startScript)
+	}
+}
+
 func TestBuildPodSatisfiesRestrictedPodSecurityAndKeepsWorkspaceAndSecretMounts(t *testing.T) {
 	p := newProviderWithOps(newFakeK8sOps())
 	cfg := perBeadWorkDirConfig()
