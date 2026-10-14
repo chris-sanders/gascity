@@ -154,6 +154,16 @@ func buildAgentLaunchCommand(cfg runtime.Config, tmuxCommand string, keepAlive b
 	)
 }
 
+func buildTmuxNewSessionCommand(cfg runtime.Config) string {
+	args := []string{"tmux", "new-session", "-d", "-s", tmuxSession}
+	for _, key := range runtimeIdentityEnvKeys() {
+		if value := cfg.Env[key]; value != "" {
+			args = append(args, "-e", shellquote.Quote(key+"="+value))
+		}
+	}
+	return strings.Join(args, " ")
+}
+
 // buildRespawnCommand builds the in-pod shell argv that respawns the agent in
 // the existing tmux "main" session (respawn-pane -k), reusing the warm pod. When
 // LINUX_USERNAME is set the entrypoint runs tmux under `su - <user>`, so the
@@ -397,7 +407,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	}
 	tmuxCmd := entrypointPrefix + buildAgentLaunchCommand(
 		cfg,
-		fmt.Sprintf("tmux new-session -d -s %s", tmuxSession),
+		buildTmuxNewSessionCommand(cfg),
 		true,
 	)
 

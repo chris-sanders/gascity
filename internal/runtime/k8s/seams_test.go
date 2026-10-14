@@ -126,7 +126,7 @@ func TestSeamsK8sMetaStore(t *testing.T) {
 		t.Fatalf("GetMeta = %q, %v; want v, nil", got, err)
 	}
 	// An explicitly-unset key (tmux prints "-KEY") parses to empty.
-	fake.setExecResult("s", showEnvironment, "k=v\n", nil)
+	fake.setExecResult("s", showEnvironment, "k=v\n-missing\n", nil)
 	if got, err := ms.GetMeta("s", "missing"); err != nil || got != "" {
 		t.Fatalf("GetMeta(unset) = %q, %v; want empty, nil", got, err)
 	}
