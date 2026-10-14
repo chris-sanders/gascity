@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // Carrier drives the high-level session interactions — input delivery, output
@@ -54,14 +56,24 @@ type Carrier interface {
 // argv-for-argv behavior-preserving (the provider keeps its own per-verb
 // error policy; see [Carrier]).
 type tmuxCarrier struct {
-	conn   ExecProvider
-	target string
+	conn       ExecProvider
+	target     string
+	submitKeys func(name string) []string
 }
 
 // NewTmuxCarrier returns a [Carrier] that drives the in-box tmux session
 // target over conn.
 func NewTmuxCarrier(conn ExecProvider, target string) Carrier {
-	return &tmuxCarrier{conn: conn, target: target}
+	return NewTmuxCarrierWithSubmitKeys(conn, target, nil)
+}
+
+// NewTmuxCarrierWithSubmitKeys returns a [Carrier] that drives the in-box
+// tmux session target over conn and uses the resolver's provider-aware submit
+// sequence when nudging. A nil resolver preserves the historical plain Enter
+// submit. The resolver is session-keyed because one provider connection may
+// own sessions from more than one agent family.
+func NewTmuxCarrierWithSubmitKeys(conn ExecProvider, target string, resolver func(name string) []string) Carrier {
+	return &tmuxCarrier{conn: conn, target: target, submitKeys: resolver}
 }
 
 // tmux runs `tmux <args...>` in the box over the connection and returns its
@@ -84,8 +96,23 @@ func (c *tmuxCarrier) Nudge(ctx context.Context, name string, content []ContentB
 	if _, err := c.tmux(ctx, name, "send-keys", "-t", c.target, "-l", message); err != nil {
 		return err
 	}
-	_, err := c.tmux(ctx, name, "send-keys", "-t", c.target, "Enter")
-	return err
+	keys := []string{"Enter"}
+	if c.submitKeys != nil {
+		if resolved := c.submitKeys(name); len(resolved) > 0 {
+			keys = resolved
+		}
+	}
+	for i, key := range keys {
+		if i > 0 {
+			// Codex processes Escape before the following Enter submits a pasted
+			// nudge. Match the native tmux provider's declared sequence settle.
+			time.Sleep(100 * time.Millisecond)
+		}
+		if _, err := c.tmux(ctx, name, "send-keys", "-t", c.target, key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *tmuxCarrier) SendKeys(ctx context.Context, name string, keys ...string) error {
@@ -118,4 +145,15 @@ func (c *tmuxCarrier) Interrupt(ctx context.Context, name string) error {
 func (c *tmuxCarrier) ClearScrollback(ctx context.Context, name string) error {
 	_, err := c.tmux(ctx, name, "clear-history", "-t", c.target)
 	return err
+}
+
+// NudgeSubmitKeySequenceForProvider returns the ordered tmux keys needed to
+// submit a pasted nudge for a provider family. Codex buffers a send-keys burst
+// as a composer edit, so its submit is Escape then Enter; other providers keep
+// the historical plain Enter behavior.
+func NudgeSubmitKeySequenceForProvider(provider string) []string {
+	if strings.Contains(strings.ToLower(strings.TrimSpace(provider)), "codex") {
+		return []string{"Escape", "Enter"}
+	}
+	return []string{"Enter"}
 }
