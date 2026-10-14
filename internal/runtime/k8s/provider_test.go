@@ -2092,7 +2092,8 @@ func TestStartSendsNudge(t *testing.T) {
 		[]string{"tmux", "has-session", "-t", "main"}, "", nil)
 
 	cfg := runtime.Config{
-		Command: "claude --settings .gc/settings.json",
+		Command:      "codex",
+		ProviderName: "codex",
 		Env: map[string]string{
 			"GC_AGENT": "deacon",
 			"GC_CITY":  "/workspace",
@@ -2104,27 +2105,69 @@ func TestStartSendsNudge(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Verify nudge was sent via tmux send-keys.
-	var foundText, foundEnter bool
+	// Verify the Codex nudge is typed literally, then submitted with exactly
+	// one Escape followed by Enter.
+	var got []string
 	for _, c := range fake.calls {
-		if c.method != "execInPod" {
-			continue
-		}
-		if len(c.cmd) >= 6 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" && c.cmd[4] == "-l" {
-			foundText = true
-			if c.cmd[5] != cfg.Nudge {
-				t.Errorf("nudge text = %q, want %q", c.cmd[5], cfg.Nudge)
-			}
-		}
-		if len(c.cmd) == 5 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" && c.cmd[4] == "Enter" {
-			foundEnter = true
+		if c.method == "execInPod" && len(c.cmd) >= 2 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" {
+			got = append(got, strings.Join(c.cmd, " "))
 		}
 	}
-	if !foundText {
-		t.Error("Start did not send nudge text via tmux send-keys")
+	want := []string{
+		"tmux send-keys -t main -l " + cfg.Nudge,
+		"tmux send-keys -t main Escape",
+		"tmux send-keys -t main Enter",
 	}
-	if !foundEnter {
-		t.Error("Start did not send Enter after nudge text")
+	if len(got) != len(want) {
+		t.Fatalf("nudge send-keys calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("nudge send-keys call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCodexNudgeEscapeFailureSkipsEnter(t *testing.T) {
+	const name = "gc-test-agent"
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 0
+
+	fake.setExecResult(name,
+		[]string{"tmux", "has-session", "-t", "main"}, "", nil)
+	if err := p.Start(context.Background(), name, runtime.Config{
+		Command:      "codex",
+		ProviderName: "codex",
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	submitErr := errors.New("escape submit failed")
+	fake.setExecResult(name,
+		[]string{"tmux", "send-keys", "-t", "main", "Escape"}, "", submitErr)
+	err := p.Nudge(name, runtime.TextContent("hello world"))
+	if !errors.Is(err, submitErr) {
+		t.Fatalf("Nudge err = %v, want %v", err, submitErr)
+	}
+
+	var got []string
+	for _, c := range fake.calls {
+		if c.method == "execInPod" && len(c.cmd) >= 2 && c.cmd[0] == "tmux" && c.cmd[1] == "send-keys" {
+			got = append(got, strings.Join(c.cmd, " "))
+		}
+	}
+	want := []string{
+		"tmux send-keys -t main -l hello world",
+		"tmux send-keys -t main Escape",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("nudge send-keys calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("nudge send-keys call %d = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
