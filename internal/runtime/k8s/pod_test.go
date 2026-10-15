@@ -249,8 +249,8 @@ func TestBuildPodProjectsRuntimeIdentityIntoTmuxBeforeAgentLaunch(t *testing.T) 
 		}
 	}
 
-	startScript := strings.Join(pod.Spec.Containers[0].Args, "\x00")
-	newSession := strings.Index(startScript, "tmux new-session")
+	startScript := strings.Join(pod.Spec.Containers[0].Args, " ")
+	newSession := strings.Index(startScript, "new-session")
 	if newSession < 0 {
 		t.Fatalf("entrypoint has no tmux new-session command: %s", startScript)
 	}
@@ -352,7 +352,7 @@ func TestBuildPodSatisfiesRestrictedPodSecurityAndKeepsWorkspaceAndSecretMounts(
 		t.Fatalf("default generic secret projection missing: %#v", pod.Spec.Volumes)
 	}
 	mainArgs := strings.Join(pod.Spec.Containers[0].Args, " ")
-	if !strings.Contains(mainArgs, "tmux new-session") {
+	if !strings.Contains(mainArgs, "new-session -d -s main") {
 		t.Fatalf("restricted agent lost tmux startup: %s", mainArgs)
 	}
 }
