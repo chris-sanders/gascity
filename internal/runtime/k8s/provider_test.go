@@ -1218,6 +1218,37 @@ func TestBuildPodEnvRemapsVars(t *testing.T) {
 	}
 }
 
+func TestBuildPodEnvRemapsBeadsScopeRoot(t *testing.T) {
+	tests := []struct {
+		name      string
+		scopeRoot string
+		want      string
+	}{
+		{name: "city root", scopeRoot: "/host/city", want: "/workspace"},
+		{name: "rig subdirectory", scopeRoot: "/host/city/rig/subdir/.beads", want: "/workspace/rig/subdir/.beads"},
+		{name: "nonmatching host path", scopeRoot: "/other/city/rig/.beads", want: "/other/city/rig/.beads"},
+		{name: "shared-prefix sibling", scopeRoot: "/host/city-backup/rig/.beads", want: "/host/city-backup/rig/.beads"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgEnv := map[string]string{
+				"GC_CITY":             "/host/city",
+				"GC_BEADS_SCOPE_ROOT": tc.scopeRoot,
+			}
+			env := mustBuildPodEnv(t, cfgEnv, "/workspace", podManagedDoltHost, podManagedDoltPort)
+			for _, item := range env {
+				if item.Name == "GC_BEADS_SCOPE_ROOT" {
+					if item.Value != tc.want {
+						t.Fatalf("GC_BEADS_SCOPE_ROOT = %q, want %q", item.Value, tc.want)
+					}
+					return
+				}
+			}
+			t.Fatal("GC_BEADS_SCOPE_ROOT was omitted from pod environment")
+		})
+	}
+}
+
 func TestBuildPodEnvReprojectsExternalRuntimeRoots(t *testing.T) {
 	cfgEnv := map[string]string{
 		"GC_CITY":                             "/host/city",
