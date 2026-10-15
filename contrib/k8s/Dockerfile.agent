@@ -91,7 +91,10 @@ COPY contrib/mail-scripts/gc-mail-mcp-agent-mail /usr/local/bin/gc-mail-mcp-agen
 # The CLAUDE_CONFIG_DIR env var (set by gc-session-k8s) points to the mount.
 
 WORKDIR /workspace
-RUN chown gcagent:gcagent /workspace
+# Keep the pinned gcagent UID writable and support arbitrary runtime UIDs in
+# group 0. Restrict this access to HOME and the workspace root.
+RUN chown gcagent:0 /home/gcagent /workspace \
+    && chmod 0770 /home/gcagent /workspace
 
 # Default user. When LINUX_USERNAME is set, the pod spec overrides to root
 # (UID 0) via securityContext so the entrypoint can create the dynamic user

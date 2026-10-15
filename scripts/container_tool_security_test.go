@@ -149,6 +149,18 @@ func TestAgentImageRebuildsBDAndGCWithPatchedGRPC(t *testing.T) {
 	}
 }
 
+func TestAgentImageHomeAndWorkspaceSupportGroupZeroRuntime(t *testing.T) {
+	dockerfile := readFile(t, repoRoot(t), "contrib/k8s/Dockerfile.agent")
+	for _, want := range []string{
+		"RUN chown gcagent:0 /home/gcagent /workspace",
+		"&& chmod 0770 /home/gcagent /workspace",
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Errorf("contrib/k8s/Dockerfile.agent missing %q", want)
+		}
+	}
+}
+
 func TestMCPMailImagePinsPatchedPythonDependencies(t *testing.T) {
 	root := repoRoot(t)
 	input := readFile(t, root, ".github/requirements/mcp-agent-mail.in")
