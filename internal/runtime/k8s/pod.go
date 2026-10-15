@@ -155,9 +155,17 @@ func buildAgentLaunchCommand(cfg runtime.Config, tmuxCommand string, keepAlive b
 }
 
 func buildTmuxNewSessionCommand(cfg runtime.Config) string {
-	args := []string{"tmux", "new-session", "-d", "-s", tmuxSession}
+	args := []string{
+		"tmux", "start-server", shellquote.Quote(";"),
+		"set-option", "-ag", "update-environment", "GC_INSTANCE_TOKEN", shellquote.Quote(";"),
+		"new-session", "-d", "-s", tmuxSession,
+	}
 	for _, key := range runtimeIdentityEnvKeys() {
-		if value := cfg.Env[key]; value != "" {
+		value := runtimeIdentityEnvValue(cfg, key)
+		// Copy the token from this tmux client's environment into session scope
+		// before the new pane command starts. Its name appears in argv, but the
+		// capability value stays in the existing Pod environment.
+		if value != "" && !runtime.ArgvSecretEnvValue(key, value) {
 			args = append(args, "-e", shellquote.Quote(key+"="+value))
 		}
 	}

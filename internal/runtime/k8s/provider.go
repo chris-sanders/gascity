@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -56,8 +55,6 @@ type Provider struct {
 	secretMounts       []runtime.K8sSecretMount
 	postStartSettle    time.Duration // settle time before post-start liveness check
 	stderr             io.Writer     // warning output (default os.Stderr)
-	providerMu         sync.RWMutex
-	providerNames      map[string]string // session name → resolved provider name
 }
 
 type schedulingFields struct {
@@ -67,8 +64,18 @@ type schedulingFields struct {
 	priorityClassName string
 }
 
-func runtimeIdentityEnvKeys() [3]string {
-	return [3]string{"GC_SESSION_ID", "GC_INSTANCE_TOKEN", "GC_RUNTIME_EPOCH"}
+func runtimeIdentityEnvKeys() [4]string {
+	return [4]string{"GC_SESSION_ID", "GC_INSTANCE_TOKEN", "GC_RUNTIME_EPOCH", "GC_PROVIDER"}
+}
+
+func runtimeIdentityEnvValue(cfg runtime.Config, key string) string {
+	if value := cfg.Env[key]; value != "" {
+		return value
+	}
+	if key == "GC_PROVIDER" {
+		return cfg.ProviderName
+	}
+	return ""
 }
 
 // NewProvider creates a K8s session provider.
@@ -343,8 +350,6 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 	}
 
-	p.setProviderName(name, cfg.ProviderName)
-
 	// Send initial nudge if configured (matches tmux adapter step 6).
 	if cfg.Nudge != "" {
 		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
@@ -417,7 +422,7 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 		[]string{"tmux", "has-session", "-t", tmuxSession}, nil); err != nil {
 		return fmt.Errorf("%w: session %q (pod %s has no live tmux session)", runtime.ErrSessionNotFound, name, podName)
 	}
-	if err := p.projectSessionRuntimeIdentity(ctx, podName, name, cfg.Env); err != nil {
+	if err := p.projectSessionRuntimeIdentity(ctx, podName, name, cfg); err != nil {
 		return err
 	}
 
@@ -448,19 +453,25 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 		}
 	}
 
-	p.setProviderName(name, cfg.ProviderName)
 	if cfg.Nudge != "" {
 		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
 	}
 	return nil
 }
 
-func (p *Provider) projectSessionRuntimeIdentity(ctx context.Context, podName, name string, env map[string]string) error {
+func (p *Provider) projectSessionRuntimeIdentity(ctx context.Context, podName, name string, cfg runtime.Config) error {
 	for _, key := range runtimeIdentityEnvKeys() {
-		value := env[key]
+		value := runtimeIdentityEnvValue(cfg, key)
 		cmd := []string{"tmux", "set-environment", "-t", tmuxSession}
 		if value == "" {
 			cmd = append(cmd, "-u", key)
+		} else if runtime.ArgvSecretEnvValue(key, value) {
+			cmd = runtimeIdentityProjectionExecCommand()
+			stdin := strings.NewReader(tmuxCommandFileLine([]string{"set-environment", "-t", tmuxSession, key, value}))
+			if _, err := p.ops.execInPod(ctx, podName, "agent", cmd, stdin); err != nil {
+				return fmt.Errorf("projecting runtime identity %s for session %q: %w", key, name, err)
+			}
+			continue
 		} else {
 			cmd = append(cmd, key, value)
 		}
@@ -469,6 +480,18 @@ func (p *Provider) projectSessionRuntimeIdentity(ctx context.Context, podName, n
 		}
 	}
 	return nil
+}
+
+func runtimeIdentityProjectionExecCommand() []string {
+	return []string{"sh", "-c", `set -eu; umask 077; dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT; file=$dir/session.tmux; cat > "$file"; chmod 600 "$file"; tmux source-file "$file"`}
+}
+
+func tmuxCommandFileLine(args []string) string {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		quoted[i] = "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+	}
+	return strings.Join(quoted, " ") + "\n"
 }
 
 func k8sRequiresPostStartLiveness(cfg runtime.Config) bool {
@@ -493,7 +516,6 @@ func (p *Provider) Stop(name string) error {
 	pods, err := p.ops.listPods(ctx, "gc-session="+label, "")
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			p.deleteProviderName(name)
 			return nil // session genuinely gone
 		}
 		return fmt.Errorf("k8s stop %q: listing pods: %w", name, err)
@@ -507,7 +529,6 @@ func (p *Provider) Stop(name string) error {
 	if len(errs) > 0 {
 		return fmt.Errorf("k8s stop %q: %w", name, errors.Join(errs...))
 	}
-	p.deleteProviderName(name)
 	return nil
 }
 
@@ -600,11 +621,19 @@ func (p *Provider) ProcessAlive(name string, processNames []string) bool {
 	return false
 }
 
-// Nudge types a message into the tmux session followed by Enter.
-// Uses -l (literal mode) so tmux key names in the message text are not
-// interpreted as keystrokes. Content blocks are flattened to text.
+// Nudge types a message into the tmux session and submits it with the key
+// sequence selected from the live session's provider-family metadata.
 func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
-	return p.carrier().Nudge(context.Background(), name, content)
+	if runtime.FlattenText(content) == "" {
+		return nil
+	}
+	provider, err := p.GetMeta(name, "GC_PROVIDER")
+	if err != nil {
+		return fmt.Errorf("resolving provider family for session %q: %w", name, err)
+	}
+	keys := runtime.NudgeSubmitKeySequenceForProvider(provider)
+	carrier := runtime.NewTmuxCarrierWithSubmitKeys(p, tmuxSession, func(string) []string { return keys })
+	return carrier.Nudge(context.Background(), name, content)
 }
 
 // SendKeys sends bare keystrokes to the tmux session. Best-effort on a
@@ -841,29 +870,7 @@ func agentContainerRunning(pod *corev1.Pod) (running, known bool) {
 // the pod exec connection ([Provider.Exec]). The in-box tmux session is always
 // tmuxSession ("main").
 func (p *Provider) carrier() runtime.Carrier {
-	return runtime.NewTmuxCarrierWithSubmitKeys(p, tmuxSession, p.submitKeys)
-}
-
-func (p *Provider) setProviderName(name, provider string) {
-	p.providerMu.Lock()
-	defer p.providerMu.Unlock()
-	if p.providerNames == nil {
-		p.providerNames = make(map[string]string)
-	}
-	p.providerNames[name] = provider
-}
-
-func (p *Provider) deleteProviderName(name string) {
-	p.providerMu.Lock()
-	defer p.providerMu.Unlock()
-	delete(p.providerNames, name)
-}
-
-func (p *Provider) submitKeys(name string) []string {
-	p.providerMu.RLock()
-	provider := p.providerNames[name]
-	p.providerMu.RUnlock()
-	return runtime.NudgeSubmitKeySequenceForProvider(provider)
+	return runtime.NewTmuxCarrier(p, tmuxSession)
 }
 
 // Exec implements [runtime.ExecProvider]: it runs argv inside the session
