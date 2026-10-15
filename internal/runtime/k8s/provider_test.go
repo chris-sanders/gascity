@@ -2367,11 +2367,12 @@ func TestProvider_RelaunchRespawnsAgentInWarmPod(t *testing.T) {
 }
 
 func TestProvider_RelaunchProjectsExactIdentityBeforeRespawn(t *testing.T) {
-	fake := &identityProjectionCaptureOps{fakeK8sOps: newFakeK8sOps()}
+	base := newFakeK8sOps()
+	fake := &identityProjectionCaptureOps{fakeK8sOps: base}
 	p := newProviderWithOps(fake)
 	p.postStartSettle = 0
-	addRunningPod(fake, "s", "s")
-	hasSessionAlive(fake, "s")
+	addRunningPod(base, "s", "s")
+	hasSessionAlive(base, "s")
 	cfg := runtime.Config{
 		Command: "codex --resume",
 		Env: map[string]string{
