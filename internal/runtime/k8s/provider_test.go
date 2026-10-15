@@ -788,9 +788,21 @@ func TestStartCreatesPodsAndWaits(t *testing.T) {
 		t.Errorf("annotation gc-session-name = %q, want gc-test-agent", pod.Annotations["gc-session-name"])
 	}
 	startScript := pod.Spec.Containers[0].Args[0]
+	processEnv := make(map[string]string, len(pod.Spec.Containers[0].Env))
+	for _, variable := range pod.Spec.Containers[0].Env {
+		processEnv[variable.Name] = variable.Value
+	}
+	if got := processEnv["GC_INSTANCE_TOKEN"]; got != "instance-token-456" {
+		t.Errorf("Pod process env GC_INSTANCE_TOKEN = %q, want exact session token", got)
+	}
+	if strings.Contains(startScript, "instance-token-456") {
+		t.Errorf("capability token leaked into Pod command: %s", startScript)
+	}
+	if !strings.Contains(startScript, "set-option -ag update-environment GC_INSTANCE_TOKEN") {
+		t.Errorf("Start pod entrypoint did not project token from the Pod environment into tmux session scope: %s", startScript)
+	}
 	for _, identity := range []string{
 		"GC_SESSION_ID=session-id-123",
-		"GC_INSTANCE_TOKEN=instance-token-456",
 		"GC_RUNTIME_EPOCH=7",
 	} {
 		if flag := "-e " + shellquote.Quote(identity); !strings.Contains(startScript, flag) {
@@ -2455,10 +2467,10 @@ func TestProvider_RelaunchProjectsExactIdentityBeforeRespawn(t *testing.T) {
 	if tokenProjectionPosition < 0 {
 		t.Fatal("Relaunch did not stream the capability through the private command-file path")
 	}
-	if !reflect.DeepEqual(fake.identityStdin, []byte("set-environment -t 'main' 'GC_INSTANCE_TOKEN' 'incarnation-456'\n")) {
+	if !reflect.DeepEqual(fake.identityStdin, []byte("'set-environment' '-t' 'main' 'GC_INSTANCE_TOKEN' 'incarnation-456'\n")) {
 		t.Errorf("private identity command stdin = %q, want exact tmux command file", fake.identityStdin)
 	}
-	if tokenProjectionPosition <= positions[len(positions)-1] || tokenProjectionPosition >= respawnPosition {
+	if tokenProjectionPosition <= positions[0] || tokenProjectionPosition >= positions[1] || positions[len(positions)-1] >= respawnPosition {
 		t.Errorf("Relaunch identity projection order = safe %v, token %d, respawn %d; want all projections before respawn", positions, tokenProjectionPosition, respawnPosition)
 	}
 }
