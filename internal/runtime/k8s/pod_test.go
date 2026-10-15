@@ -249,10 +249,14 @@ func TestBuildPodProjectsRuntimeIdentityIntoTmuxBeforeAgentLaunch(t *testing.T) 
 		}
 	}
 
-	startScript := pod.Spec.Containers[0].Args[0]
+	startScript := strings.Join(pod.Spec.Containers[0].Args, "\x00")
 	newSession := strings.Index(startScript, "tmux new-session")
 	if newSession < 0 {
 		t.Fatalf("entrypoint has no tmux new-session command: %s", startScript)
+	}
+	updateEnvironment := strings.Index(startScript, "set-option -ag update-environment GC_INSTANCE_TOKEN")
+	if updateEnvironment < 0 || updateEnvironment >= newSession {
+		t.Errorf("tmux must project the Pod environment token into session scope before new-session: %s", startScript)
 	}
 	lastIdentityFlag := newSession
 	for _, item := range identity {
@@ -270,8 +274,12 @@ func TestBuildPodProjectsRuntimeIdentityIntoTmuxBeforeAgentLaunch(t *testing.T) 
 	if token := processEnv["GC_INSTANCE_TOKEN"]; token != "instance-456" {
 		t.Errorf("pod process env GC_INSTANCE_TOKEN = %q, want exact session token", token)
 	}
-	if strings.Contains(startScript, "instance-456") {
-		t.Errorf("capability token leaked into the Pod command: %s", startScript)
+	for _, container := range pod.Spec.Containers {
+		for _, arg := range append(append([]string(nil), container.Command...), container.Args...) {
+			if strings.Contains(arg, "instance-456") {
+				t.Errorf("capability token leaked into Pod command/args: %v", arg)
+			}
+		}
 	}
 	if strings.Contains(startScript, "not-runtime-identity") {
 		t.Errorf("unrelated environment value was projected into the tmux session: %s", startScript)

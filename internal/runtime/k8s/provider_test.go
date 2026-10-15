@@ -350,6 +350,29 @@ func TestNudgeResolvesCodexFromLiveSessionMetadataAfterProviderRestart(t *testin
 	}
 }
 
+func TestNudgeKeepsEnterForCustomProviderFromLiveSessionMetadata(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "custom-session", "custom-session")
+	fake.setExecResult("custom-session", []string{"tmux", "show-environment", "-t", tmuxSession},
+		"GC_PROVIDER=custom:agent\n", nil)
+
+	if err := p.Nudge("custom-session", runtime.TextContent("resume this task")); err != nil {
+		t.Fatalf("Nudge custom provider: %v", err)
+	}
+
+	var got []string
+	for _, call := range fake.calls {
+		if call.method == "execInPod" && len(call.cmd) >= 2 && call.cmd[0] == "tmux" && call.cmd[1] == "send-keys" {
+			got = append(got, strings.Join(call.cmd[4:], " "))
+		}
+	}
+	want := []string{"-l resume this task", "Enter"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("nudge send-keys sequence = %v, want %v", got, want)
+	}
+}
+
 func TestNudgeDoesNotFallBackWhenProviderMetadataIsUnreadable(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
