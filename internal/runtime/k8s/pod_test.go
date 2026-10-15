@@ -222,6 +222,7 @@ func TestBuildPodProjectsRuntimeIdentityIntoTmuxBeforeAgentLaunch(t *testing.T) 
 			"GC_SESSION_ID":     "session-123",
 			"GC_INSTANCE_TOKEN": "instance-456",
 			"GC_RUNTIME_EPOCH":  "7",
+			"GC_PROVIDER":       "builtin:codex",
 			"GC_UNRELATED":      "not-runtime-identity",
 		},
 	}
@@ -239,8 +240,8 @@ func TestBuildPodProjectsRuntimeIdentityIntoTmuxBeforeAgentLaunch(t *testing.T) 
 		value string
 	}{
 		{key: "GC_SESSION_ID", value: "session-123"},
-		{key: "GC_INSTANCE_TOKEN", value: "instance-456"},
 		{key: "GC_RUNTIME_EPOCH", value: "7"},
+		{key: "GC_PROVIDER", value: "builtin:codex"},
 	}
 	for _, item := range identity {
 		if got := processEnv[item.key]; got != item.value {
@@ -265,6 +266,12 @@ func TestBuildPodProjectsRuntimeIdentityIntoTmuxBeforeAgentLaunch(t *testing.T) 
 			t.Errorf("tmux session identity flag %q is out of order in: %s", flag, startScript)
 		}
 		lastIdentityFlag = index
+	}
+	if token := processEnv["GC_INSTANCE_TOKEN"]; token != "instance-456" {
+		t.Errorf("pod process env GC_INSTANCE_TOKEN = %q, want exact session token", token)
+	}
+	if strings.Contains(startScript, "instance-456") {
+		t.Errorf("capability token leaked into the Pod command: %s", startScript)
 	}
 	if strings.Contains(startScript, "not-runtime-identity") {
 		t.Errorf("unrelated environment value was projected into the tmux session: %s", startScript)

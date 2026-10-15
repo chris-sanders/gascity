@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -326,6 +327,45 @@ func TestNudge(t *testing.T) {
 	}
 }
 
+func TestNudgeResolvesCodexFromLiveSessionMetadataAfterProviderRestart(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake) // A fresh controller has no process-local provider cache.
+	addRunningPod(fake, "codex-session", "codex-session")
+	fake.setExecResult("codex-session", []string{"tmux", "show-environment", "-t", tmuxSession},
+		"GC_PROVIDER=builtin:codex\n", nil)
+
+	if err := p.Nudge("codex-session", runtime.TextContent("resume this task")); err != nil {
+		t.Fatalf("Nudge after provider restart: %v", err)
+	}
+
+	var got []string
+	for _, call := range fake.calls {
+		if call.method == "execInPod" && len(call.cmd) >= 2 && call.cmd[0] == "tmux" && call.cmd[1] == "send-keys" {
+			got = append(got, strings.Join(call.cmd[4:], " "))
+		}
+	}
+	want := []string{"-l resume this task", "Escape", "Enter"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("nudge send-keys sequence = %v, want %v", got, want)
+	}
+}
+
+func TestNudgeDoesNotFallBackWhenProviderMetadataIsUnreadable(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "codex-session", "codex-session")
+	readErr := errors.New("tmux metadata unavailable")
+	fake.setExecResult("codex-session", []string{"tmux", "show-environment", "-t", tmuxSession}, "", readErr)
+
+	err := p.Nudge("codex-session", runtime.TextContent("resume this task"))
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Nudge metadata error = %v, want wrapped %v", err, readErr)
+	}
+	if findExecCmd(fake, "send-keys") != nil {
+		t.Fatal("Nudge sent text or submit keys after provider metadata became unreadable")
+	}
+}
+
 func TestSendKeys(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
@@ -480,7 +520,7 @@ func TestMetaOps(t *testing.T) {
 	showEnvironment := []string{"tmux", "show-environment", "-t", tmuxSession}
 	fake.setExecResult("gc-test-agent",
 		showEnvironment,
-		"GC_DRAIN=true\nGC_SESSION_ID=runtime-session\n", nil)
+		"GC_DRAIN=true\nGC_SESSION_ID=runtime-session\nGC_INSTANCE_TOKEN=instance-456\n", nil)
 
 	val, err := p.GetMeta("gc-test-agent", "GC_DRAIN")
 	if err != nil {
@@ -493,7 +533,7 @@ func TestMetaOps(t *testing.T) {
 	// An absent key remains absent even when other session metadata exists.
 	fake.setExecResult("gc-test-agent",
 		showEnvironment,
-		"GC_DRAIN=true\nGC_SESSION_ID=runtime-session\n", nil)
+		"GC_DRAIN=true\nGC_SESSION_ID=runtime-session\nGC_INSTANCE_TOKEN=instance-456\n", nil)
 
 	val, err = p.GetMeta("gc-test-agent", "MISSING")
 	if err != nil {
@@ -511,6 +551,13 @@ func TestMetaOps(t *testing.T) {
 	}
 	if val != "runtime-session" {
 		t.Errorf("GetMeta foreign identity = %q, want exact session value %q", val, "runtime-session")
+	}
+	val, err = p.GetMeta("gc-test-agent", "GC_INSTANCE_TOKEN")
+	if err != nil {
+		t.Fatalf("GetMeta instance token: %v", err)
+	}
+	if val != "instance-456" {
+		t.Errorf("GetMeta instance token = %q, want exact projected token", val)
 	}
 
 	// RemoveMeta.
@@ -2153,13 +2200,16 @@ func TestStartSendsNudge(t *testing.T) {
 
 	fake.setExecResult("gc-test-agent",
 		[]string{"tmux", "has-session", "-t", "main"}, "", nil)
+	fake.setExecResult("gc-test-agent", []string{"tmux", "show-environment", "-t", tmuxSession},
+		"GC_PROVIDER=builtin:codex\n", nil)
 
 	cfg := runtime.Config{
 		Command:      "codex",
 		ProviderName: "codex",
 		Env: map[string]string{
-			"GC_AGENT": "deacon",
-			"GC_CITY":  "/workspace",
+			"GC_AGENT":    "deacon",
+			"GC_CITY":     "/workspace",
+			"GC_PROVIDER": "builtin:codex",
 		},
 		Nudge: "Run 'gc prime' to check patrol status.",
 	}
@@ -2199,9 +2249,12 @@ func TestCodexNudgeEscapeFailureSkipsEnter(t *testing.T) {
 
 	fake.setExecResult(name,
 		[]string{"tmux", "has-session", "-t", "main"}, "", nil)
+	fake.setExecResult(name, []string{"tmux", "show-environment", "-t", tmuxSession},
+		"GC_PROVIDER=builtin:codex\n", nil)
 	if err := p.Start(context.Background(), name, runtime.Config{
 		Command:      "codex",
 		ProviderName: "codex",
+		Env:          map[string]string{"GC_PROVIDER": "builtin:codex"},
 	}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -2314,7 +2367,7 @@ func TestProvider_RelaunchRespawnsAgentInWarmPod(t *testing.T) {
 }
 
 func TestProvider_RelaunchProjectsExactIdentityBeforeRespawn(t *testing.T) {
-	fake := newFakeK8sOps()
+	fake := &identityProjectionCaptureOps{fakeK8sOps: newFakeK8sOps()}
 	p := newProviderWithOps(fake)
 	p.postStartSettle = 0
 	addRunningPod(fake, "s", "s")
@@ -2325,6 +2378,7 @@ func TestProvider_RelaunchProjectsExactIdentityBeforeRespawn(t *testing.T) {
 			"GC_SESSION_ID":     "bead-123",
 			"GC_INSTANCE_TOKEN": "incarnation-456",
 			"GC_RUNTIME_EPOCH":  "8",
+			"GC_PROVIDER":       "builtin:codex",
 			"GC_UNRELATED":      "not-runtime-identity",
 		},
 	}
@@ -2335,11 +2389,12 @@ func TestProvider_RelaunchProjectsExactIdentityBeforeRespawn(t *testing.T) {
 
 	want := [][]string{
 		{"tmux", "set-environment", "-t", tmuxSession, "GC_SESSION_ID", "bead-123"},
-		{"tmux", "set-environment", "-t", tmuxSession, "GC_INSTANCE_TOKEN", "incarnation-456"},
 		{"tmux", "set-environment", "-t", tmuxSession, "GC_RUNTIME_EPOCH", "8"},
+		{"tmux", "set-environment", "-t", tmuxSession, "GC_PROVIDER", "builtin:codex"},
 	}
 	positions := make([]int, 0, len(want))
 	respawnPosition := -1
+	tokenProjectionPosition := -1
 	for i, call := range fake.calls {
 		if call.method != "execInPod" {
 			continue
@@ -2351,6 +2406,12 @@ func TestProvider_RelaunchProjectsExactIdentityBeforeRespawn(t *testing.T) {
 		}
 		if strings.Contains(strings.Join(call.cmd, " "), "respawn-pane") {
 			respawnPosition = i
+		}
+		if isIdentityProjectionCommand(call.cmd) {
+			tokenProjectionPosition = i
+		}
+		if strings.Contains(strings.Join(call.cmd, "\x00"), "incarnation-456") {
+			t.Errorf("capability token leaked into exec argv: %v", call.cmd)
 		}
 		if strings.Contains(strings.Join(call.cmd, " "), "not-runtime-identity") {
 			t.Errorf("Relaunch projected unrelated environment: %v", call.cmd)
@@ -2367,8 +2428,14 @@ func TestProvider_RelaunchProjectsExactIdentityBeforeRespawn(t *testing.T) {
 	if respawnPosition < 0 {
 		t.Fatal("Relaunch did not respawn the agent")
 	}
-	if positions[len(positions)-1] >= respawnPosition {
-		t.Errorf("Relaunch respawned before projecting identity: identity positions %v, respawn %d", positions, respawnPosition)
+	if tokenProjectionPosition < 0 {
+		t.Fatal("Relaunch did not stream the capability through the private command-file path")
+	}
+	if !reflect.DeepEqual(fake.identityStdin, []byte("set-environment -t 'main' 'GC_INSTANCE_TOKEN' 'incarnation-456'\n")) {
+		t.Errorf("private identity command stdin = %q, want exact tmux command file", fake.identityStdin)
+	}
+	if tokenProjectionPosition <= positions[len(positions)-1] || tokenProjectionPosition >= respawnPosition {
+		t.Errorf("Relaunch identity projection order = safe %v, token %d, respawn %d; want all projections before respawn", positions, tokenProjectionPosition, respawnPosition)
 	}
 }
 
@@ -2378,15 +2445,14 @@ func TestProvider_RelaunchIdentityProjectionFailureStopsBeforeRespawn(t *testing
 	addRunningPod(fake, "s", "s")
 	hasSessionAlive(fake, "s")
 	projectionErr := errors.New("tmux session environment unavailable")
-	fake.setExecResult("s", []string{
-		"tmux", "set-environment", "-t", tmuxSession, "GC_INSTANCE_TOKEN", "incarnation-456",
-	}, "", projectionErr)
+	fake.setExecResult("s", runtimeIdentityProjectionCommandForTest(), "", projectionErr)
 	cfg := runtime.Config{
 		Command: "codex --resume",
 		Env: map[string]string{
 			"GC_SESSION_ID":     "bead-123",
 			"GC_INSTANCE_TOKEN": "incarnation-456",
 			"GC_RUNTIME_EPOCH":  "8",
+			"GC_PROVIDER":       "builtin:codex",
 		},
 	}
 
@@ -2397,6 +2463,33 @@ func TestProvider_RelaunchIdentityProjectionFailureStopsBeforeRespawn(t *testing
 	if respawn := findExecCmd(fake, "respawn-pane"); respawn != nil {
 		t.Fatalf("Relaunch issued respawn after identity projection failed: %v", respawn)
 	}
+}
+
+const identityProjectionExecScriptTest = `set -eu; umask 077; dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT; file=$dir/session.tmux; cat > "$file"; chmod 600 "$file"; tmux source-file "$file"`
+
+func runtimeIdentityProjectionCommandForTest() []string {
+	return []string{"sh", "-c", identityProjectionExecScriptTest}
+}
+
+func isIdentityProjectionCommand(cmd []string) bool {
+	return reflect.DeepEqual(cmd, runtimeIdentityProjectionCommandForTest())
+}
+
+type identityProjectionCaptureOps struct {
+	*fakeK8sOps
+	identityStdin []byte
+}
+
+func (o *identityProjectionCaptureOps) execInPod(ctx context.Context, pod, container string, cmd []string, stdin io.Reader) (string, error) {
+	if isIdentityProjectionCommand(cmd) && stdin != nil {
+		body, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", err
+		}
+		o.identityStdin = body
+		stdin = nil
+	}
+	return o.fakeK8sOps.execInPod(ctx, pod, container, cmd, stdin)
 }
 
 func TestProvider_RelaunchMissingPodIsErrSessionNotFound(t *testing.T) {
