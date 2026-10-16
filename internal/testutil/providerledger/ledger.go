@@ -221,7 +221,7 @@ func Catalog() []Entry {
 			waivedRuntime(
 				repoSymbol("cmd/gc", "k8sProviderFromSession"),
 				time.Date(2026, time.November, 12, 0, 0, 0, 0, time.UTC),
-				"no runnable harness proves k8sProviderFromSession() against a live Kubernetes API plus pod exec lifecycle; focused secret-projection tests use fake K8s ops, and no kind/integration-tagged harness exists in internal/runtime/k8s",
+				"no runnable harness proves k8sProviderFromSession() against a live Kubernetes API plus pod exec lifecycle; focused fake-K8s tests cover secret projection and pod identity wiring, and no kind/integration-tagged harness exists in internal/runtime/k8s",
 			),
 		),
 		builtin(
