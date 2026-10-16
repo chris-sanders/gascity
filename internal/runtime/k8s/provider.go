@@ -1108,7 +1108,7 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity, skipRel s
 
 // initBeadsInPod attaches the city ledger and active store scope to the
 // projected Dolt service. Both scopes must already be initialized: raw bd init
-// cannot create Gas City's canonical identity.toml and is not a valid fallback.
+// cannot create Gas City's canonical project identity and is not a valid fallback.
 func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime.Config, workDir, managedServiceHost, managedServicePort string) error {
 	projected, err := projectedPodDoltEnv(cfg.Env, managedServiceHost, managedServicePort)
 	if err != nil {
