@@ -2074,6 +2074,9 @@ func TestStartAllowsOneShotLifecycleCommands(t *testing.T) {
 
 			hasSessionCalls := 0
 			fake.execFunc = func(_ string, cmd []string) (string, error) {
+				if len(cmd) == 6 && cmd[0] == "tmux" && cmd[1] == "show-environment" && cmd[5] == "GC_PROVIDER" {
+					return "GC_PROVIDER=claude\n", nil
+				}
 				if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
 					hasSessionCalls++
 					if hasSessionCalls == 1 {
@@ -2086,7 +2089,7 @@ func TestStartAllowsOneShotLifecycleCommands(t *testing.T) {
 
 			cfg := runtime.Config{
 				Command:   tt.command,
-				Env:       map[string]string{"GC_AGENT": "hyperscale/worker", "GC_CITY": "/workspace"},
+				Env:       map[string]string{"GC_AGENT": "hyperscale/worker", "GC_CITY": "/workspace", "GC_PROVIDER": "claude"},
 				Lifecycle: runtime.LifecycleOneShot,
 				Nudge:     "Check your hook for work.",
 			}
@@ -2244,12 +2247,15 @@ func TestStartSendsNudge(t *testing.T) {
 
 	fake.setExecResult("gc-test-agent",
 		[]string{"tmux", "has-session", "-t", "main"}, "", nil)
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_PROVIDER"}, "GC_PROVIDER=claude\n", nil)
 
 	cfg := runtime.Config{
 		Command: "claude --settings .gc/settings.json",
 		Env: map[string]string{
-			"GC_AGENT": "deacon",
-			"GC_CITY":  "/workspace",
+			"GC_AGENT":    "deacon",
+			"GC_CITY":     "/workspace",
+			"GC_PROVIDER": "claude",
 		},
 		Nudge: "Run 'gc prime' to check patrol status.",
 	}
