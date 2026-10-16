@@ -1666,14 +1666,38 @@ func TestBuildPodPrebaked(t *testing.T) {
 		t.Error("prebaked pod missing claude-config Secret volume")
 	}
 
-	// Entrypoint should NOT contain workspace-ready wait.
+	// Entrypoint waits on a fresh pod-local store-attachment gate.
 	entrypoint := pod.Spec.Containers[0].Args[0]
-	if containsStr(entrypoint, ".gc-workspace-ready") {
-		t.Error("prebaked entrypoint should not wait for .gc-workspace-ready")
+	if !containsStr(entrypoint, "/tmp/.gc-workspace-ready") {
+		t.Error("prebaked entrypoint should wait for the pod-local store-attachment gate")
 	}
 }
 
-func TestInitBeadsInPodUsesProjectedStoreRootAndPrefix(t *testing.T) {
+func TestBuildPodReadinessWaitsForScopedStoreAttachment(t *testing.T) {
+	for _, prebaked := range []bool{false, true} {
+		name := "staged"
+		if prebaked {
+			name = "prebaked"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := newProviderWithOps(newFakeK8sOps())
+			p.prebaked = prebaked
+			pod, err := buildPod("store-gated", runtime.Config{Command: "agent", WorkDir: "/city", Env: map[string]string{"GC_CITY": "/city"}}, p)
+			if err != nil {
+				t.Fatalf("buildPod: %v", err)
+			}
+			probe := pod.Spec.Containers[0].ReadinessProbe
+			if probe == nil || probe.Exec == nil {
+				t.Fatal("agent container has no exec readiness probe")
+			}
+			if got := strings.Join(probe.Exec.Command, " "); !strings.Contains(got, "/tmp/.gc-workspace-ready") {
+				t.Fatalf("readiness probe command = %q, want pod-local store gate", got)
+			}
+		})
+	}
+}
+
+func TestInitBeadsInPodAttachesCityAndProjectedStoreRoot(t *testing.T) {
 	fake := newFakeK8sOps()
 	cfg := runtime.Config{
 		WorkDir: "/host/city/rigs/frontend",
@@ -1689,31 +1713,27 @@ func TestInitBeadsInPodUsesProjectedStoreRootAndPrefix(t *testing.T) {
 	if err := initBeadsInPod(context.Background(), fake, "gc-test-pod", cfg, podWorkDir, podManagedDoltHost, podManagedDoltPort); err != nil {
 		t.Fatalf("initBeadsInPod: %v", err)
 	}
-	wantStoreRootB64 := base64.StdEncoding.EncodeToString([]byte("/workspace/custom-scope"))
-	wantPrefixB64 := base64.StdEncoding.EncodeToString([]byte("cs"))
-	wrongWorkDirB64 := base64.StdEncoding.EncodeToString([]byte("/workspace/rigs/frontend"))
-	found := false
+	wantRoots := map[string]bool{"/workspace": false, "/workspace/custom-scope": false}
 	for _, c := range fake.calls {
-		if c.method != "execInPod" || len(c.cmd) < 3 {
+		if c.method != "execInPod" || len(c.cmd) < 7 || c.cmd[0] != "sh" || c.cmd[1] != "-c" {
 			continue
 		}
-		if c.cmd[0] != "sh" || c.cmd[1] != "-c" {
-			continue
+		script, root := c.cmd[2], c.cmd[4]
+		if _, ok := wantRoots[root]; !ok {
+			t.Fatalf("attachment used unexpected scope root %q", root)
 		}
-		script := c.cmd[2]
-		if !strings.Contains(script, wantStoreRootB64) || !strings.Contains(script, wantPrefixB64) {
-			continue
+		if !strings.Contains(script, "gc dolt-state ensure-project-id") || !strings.Contains(script, "bd context --json") {
+			t.Fatalf("attachment for %s did not reconcile identity and check context: %s", root, script)
 		}
-		if strings.Contains(script, wrongWorkDirB64) {
-			t.Fatalf("repair script used pod workdir instead of projected store root: %s", script)
+		if strings.Contains(script, "bd init") || strings.Contains(script, "project_id', None") {
+			t.Fatalf("attachment for %s used raw bd init or stripped canonical identity: %s", root, script)
 		}
-		if !strings.Contains(script, "m.pop('project_id'") {
-			t.Fatalf("repair script did not strip project_id: %s", script)
-		}
-		found = true
+		wantRoots[root] = true
 	}
-	if !found {
-		t.Fatal("initBeadsInPod did not use projected store root and prefix")
+	for root, found := range wantRoots {
+		if !found {
+			t.Errorf("initBeadsInPod did not attach required scope %s", root)
+		}
 	}
 }
 
@@ -1800,7 +1820,7 @@ func TestVerifyBeadsInPodRejectsHostOnlyProjectedTarget(t *testing.T) {
 	}
 }
 
-func TestStartUsesPodBeadsRepairScript(t *testing.T) {
+func TestStartAttachesPodBeadsScopesBeforeOpeningReadinessGate(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
 	p.prebaked = true
@@ -1824,34 +1844,44 @@ func TestStartUsesPodBeadsRepairScript(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	foundRepair := false
-	for _, c := range fake.calls {
-		if c.method != "execInPod" || len(c.cmd) < 3 {
+	attached := map[string]bool{"/workspace": false, "/workspace/custom-scope": false}
+	lastAttachment := -1
+	gateAt := -1
+	for callIndex, c := range fake.calls {
+		if c.method == "execInPod" && len(c.cmd) >= 2 && c.cmd[0] == "touch" && c.cmd[1] == "/tmp/.gc-workspace-ready" {
+			gateAt = callIndex
+		}
+		if c.method != "execInPod" || len(c.cmd) < 7 {
 			continue
 		}
 		if c.cmd[0] != "sh" || c.cmd[1] != "-c" {
 			continue
 		}
 		script := c.cmd[2]
-		if containsStr(script, "bd init --server") && containsStr(script, "m.pop('project_id'") {
-			foundRepair = true
-			break
+		if containsStr(script, "gc dolt-state ensure-project-id") && containsStr(script, "bd context --json") {
+			attached[c.cmd[4]] = true
+			lastAttachment = callIndex
 		}
 	}
-	if !foundRepair {
-		t.Fatal("Start did not invoke the pod .beads repair/bootstrap script")
+	for scope, found := range attached {
+		if !found {
+			t.Errorf("Start did not attach %s scope through the identity contract", scope)
+		}
+	}
+	if gateAt < 0 || lastAttachment < 0 || gateAt < lastAttachment {
+		t.Fatalf("readiness gate must open after both store attachments (last attachment=%d gate=%d)", lastAttachment, gateAt)
 	}
 }
 
-func TestStartWarnsWhenInitBeadsInPodFails(t *testing.T) {
+func TestStartFailsClosedWhenScopedStoreAttachmentFails(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
 	p.prebaked = true
 	p.postStartSettle = 0
 
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
-		if len(cmd) >= 3 && cmd[0] == "sh" && cmd[1] == "-c" && containsStr(cmd[2], "bd init --server") {
-			return "", errors.New("missing canonical beads")
+		if len(cmd) >= 3 && cmd[0] == "sh" && cmd[1] == "-c" && containsStr(cmd[2], "gc dolt-state ensure-project-id") {
+			return "", errors.New("simulated attachment failure")
 		}
 		return "", nil
 	}
@@ -1867,15 +1897,23 @@ func TestStartWarnsWhenInitBeadsInPodFails(t *testing.T) {
 			"GC_DOLT_PORT": "31364",
 		},
 	}
-	if err := p.Start(context.Background(), "gc-test-agent", cfg); err != nil {
-		t.Fatalf("Start should warn and continue when pod beads repair fails: %v", err)
+	if err := p.Start(context.Background(), "gc-test-agent", cfg); err == nil {
+		t.Fatal("Start succeeded after scoped-store attachment failed")
+	}
+	if _, exists := fake.pods["gc-test-agent"]; exists {
+		t.Fatal("failed startup left its pod behind")
+	}
+	for _, call := range fake.calls {
+		if call.method == "execInPod" && len(call.cmd) >= 2 && call.cmd[0] == "touch" && call.cmd[1] == "/tmp/.gc-workspace-ready" {
+			t.Fatal("Start opened the readiness gate after attachment failed")
+		}
 	}
 }
 
-// TestInitBeadsInPodBdInitSetsBEADSDIR verifies that the pod bootstrap bd init
-// sets BEADS_DIR so bd does not create a .git/ as a side effect in the pod
-// workspace. Regression for #399.
-func TestInitBeadsInPodBdInitSetsBEADSDIR(t *testing.T) {
+// TestInitBeadsInPodDoesNotBootstrapMissingScopes verifies startup requires
+// existing scope metadata rather than raw bd init, which cannot write the
+// canonical Gas City identity.toml.
+func TestInitBeadsInPodDoesNotBootstrapMissingScopes(t *testing.T) {
 	fake := newFakeK8sOps()
 	cfg := runtime.Config{
 		Env: map[string]string{
@@ -1897,18 +1935,17 @@ func TestInitBeadsInPodBdInitSetsBEADSDIR(t *testing.T) {
 	if script == "" {
 		t.Fatal("no sh -c exec call found")
 	}
-	want := `BEADS_DIR="$WD/.beads" bd init --server`
-	if !strings.Contains(script, want) {
-		t.Errorf("bd init invocation missing BEADS_DIR env prefix: %q not found in script:\n%s", want, script)
+	if !strings.Contains(script, `test -s "$META"`) || !strings.Contains(script, `test -f "$SCOPE/.beads/config.yaml"`) {
+		t.Fatalf("attachment must require already initialized scope metadata:\n%s", script)
+	}
+	if strings.Contains(script, "bd init") {
+		t.Fatalf("attachment unexpectedly bootstraps a missing scope with bd init:\n%s", script)
 	}
 }
 
-// TestInitBeadsInPodStripsProjectIDFromMetadata verifies that the metadata
-// patch removes the controller's project_id so the agent pod's bd does not
-// fail with PROJECT IDENTITY MISMATCH against the in-cluster Dolt server.
-// The staged .beads/metadata.json carries the controller's project_id, which
-// is wrong for the pod and must be dropped so bd rediscovers it.
-func TestInitBeadsInPodStripsProjectIDFromMetadata(t *testing.T) {
+// TestInitBeadsInPodDoesNotStripProjectIdentity pins the canonical identity
+// reconciler as the only writer of project identity during pod attachment.
+func TestInitBeadsInPodDoesNotStripProjectIdentity(t *testing.T) {
 	fake := newFakeK8sOps()
 	cfg := runtime.Config{
 		Env: map[string]string{
@@ -1933,18 +1970,14 @@ func TestInitBeadsInPodStripsProjectIDFromMetadata(t *testing.T) {
 		t.Fatal("no sh -c exec call found")
 	}
 
-	// Both the argv and stdin python3 fallback paths must drop project_id
-	// after merging the patch into the staged metadata.
-	want := "m.pop('project_id', None)"
-	count := strings.Count(script, want)
-	if count < 2 {
-		t.Errorf("expected %q to appear in both python3 patch invocations (>=2 times), got %d\nscript:\n%s", want, count, script)
+	if !strings.Contains(script, "gc dolt-state ensure-project-id") {
+		t.Fatalf("scope attachment does not use canonical project identity reconciliation:\n%s", script)
 	}
-	if strings.Contains(script, "<<<") {
-		t.Errorf("metadata patch script must be POSIX sh compatible; found bash here-string in:\n%s", script)
+	if !strings.Contains(script, `BEADS_DIR="$SCOPE/.beads" bd context --json`) {
+		t.Fatalf("context verification does not target the attached scope:\n%s", script)
 	}
-	if !strings.Contains(script, `printf '%s' "$PATCH" | python3 -c`) {
-		t.Errorf("metadata patch fallback should pipe PATCH into python3 stdin for POSIX sh compatibility:\n%s", script)
+	if strings.Contains(script, "project_id', None") || strings.Contains(script, "bd init") {
+		t.Fatalf("scope attachment must preserve project identity and avoid raw bd init:\n%s", script)
 	}
 }
 
@@ -1974,10 +2007,6 @@ func TestStartSkipsStagingWhenPrebaked(t *testing.T) {
 	// Verify no staging-related exec calls occurred.
 	for _, c := range fake.calls {
 		if c.method == "execInPod" {
-			// Should not see touch .gc-workspace-ready
-			if len(c.cmd) >= 2 && c.cmd[0] == "touch" && containsStr(c.cmd[1], ".gc-workspace-ready") {
-				t.Error("prebaked Start should not touch .gc-workspace-ready")
-			}
 			// Should not see gc init
 			if len(c.cmd) >= 2 && c.cmd[0] == "gc" && c.cmd[1] == "init" {
 				t.Error("prebaked Start should not run gc init")
