@@ -2,7 +2,6 @@ package k8s
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -334,27 +333,32 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		return fmt.Errorf("waiting for pod %q: %w", podName, err)
 	}
 
-	if !p.prebaked {
-		// Initialize the city inside the pod.
-		if ctrlCity != "" {
-			skipRel := cityTemplateSkipRel(workDirStaged, ctrlCity, cfg.WorkDir)
-			if err := initCityInPod(ctx, p.ops, podName, ctrlCity, skipRel); err != nil {
-				fmt.Fprintf(p.stderr, "gc: warning: initCityInPod for %s: %v\n", podName, err) //nolint:errcheck
-			}
-		}
-
-		// Signal entrypoint to proceed.
-		if _, err := p.ops.execInPod(ctx, podName, "agent",
-			[]string{"touch", "/workspace/.gc-workspace-ready"}, nil); err != nil {
-			fmt.Fprintf(p.stderr, "gc: warning: touch .gc-workspace-ready in %s: %v\n", podName, err) //nolint:errcheck
+	if !p.prebaked && ctrlCity != "" {
+		// Initialize the city inside the pod. Its result is load-bearing: store
+		// identity must be attached before the entrypoint launches the agent.
+		skipRel := cityTemplateSkipRel(workDirStaged, ctrlCity, cfg.WorkDir)
+		if err := initCityInPod(ctx, p.ops, podName, ctrlCity, skipRel); err != nil {
+			cleanup("city initialization failed")
+			return fmt.Errorf("initializing city in pod %q: %w", podName, err)
 		}
 	}
 
-	// Ensure .beads/ inside the pod. This remains warning-only so older staged
-	// or prebaked workspaces can self-heal instead of failing session startup.
+	// Attach both the city ledger and the active store scope before allowing
+	// the entrypoint to launch. This also runs for prebaked workspaces: those
+	// trees are already staged, but still need their live store identity checked.
 	podWorkDir := projectedPodWorkDir(cfg)
 	if err := initBeadsInPod(ctx, p.ops, podName, cfg, podWorkDir, p.managedServiceHost, p.managedServicePort); err != nil {
-		fmt.Fprintf(p.stderr, "gc: warning: initBeadsInPod for %s: %v\n", podName, err) //nolint:errcheck
+		cleanup("beads attachment failed")
+		return fmt.Errorf("attaching beads stores in pod %q: %w", podName, err)
+	}
+
+	// The marker is pod-local so prebaked image layers cannot carry a stale
+	// readiness signal into a new pod. All required store attachments now
+	// precede agent startup.
+	if _, err := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"touch", "/tmp/.gc-workspace-ready"}, nil); err != nil {
+		cleanup("workspace readiness gate failed")
+		return fmt.Errorf("opening workspace readiness gate in pod %q", podName)
 	}
 
 	// Wait for tmux session.
@@ -1102,9 +1106,9 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity, skipRel s
 	return nil
 }
 
-// initBeadsInPod ensures the pod workspace has usable .beads state. It keeps
-// the older warning-only self-heal behavior for prebaked or older staged
-// workspaces by patching existing metadata and bootstrapping missing state.
+// initBeadsInPod attaches the city ledger and active store scope to the
+// projected Dolt service. Both scopes must already be initialized: raw bd init
+// cannot create Gas City's canonical identity.toml and is not a valid fallback.
 func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime.Config, workDir, managedServiceHost, managedServicePort string) error {
 	projected, err := projectedPodDoltEnv(cfg.Env, managedServiceHost, managedServicePort)
 	if err != nil {
@@ -1113,50 +1117,46 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 	if len(projected) == 0 {
 		return nil
 	}
-	doltHost := projected["GC_DOLT_HOST"]
-	doltPort := projected["GC_DOLT_PORT"]
-	storeRoot := projectedPodStoreRoot(cfg, workDir)
-	prefix := strings.TrimSpace(cfg.Env["GC_BEADS_PREFIX"])
-	if prefix == "" {
-		return fmt.Errorf("missing projected GC_BEADS_PREFIX")
+	cityRoot := podWorkspaceRoot
+	activeRoot := projectedPodStoreRoot(cfg, workDir)
+	for _, scope := range []struct {
+		name string
+		root string
+	}{
+		{name: "city", root: cityRoot},
+		{name: "active", root: activeRoot},
+	} {
+		if scope.root == "" || (scope.name == "active" && scope.root == cityRoot) {
+			continue
+		}
+		if err := attachDoltScopeInPod(ctx, ops, podName, scope.root, cityRoot, projected["GC_DOLT_HOST"], projected["GC_DOLT_PORT"]); err != nil {
+			return fmt.Errorf("attaching %s beads scope: %w", scope.name, err)
+		}
 	}
+	return nil
+}
 
-	portNum, err := strconv.Atoi(doltPort)
+// attachDoltScopeInPod reconciles the existing scope identity through gc's
+// canonical contract command, then verifies that bd can resolve the attached
+// context. All command output is suppressed because the useful failure signal
+// is the exit status and stderr can contain database connection details.
+func attachDoltScopeInPod(ctx context.Context, ops k8sOps, podName, scopeRoot, cityRoot, doltHost, doltPort string) error {
+	const attachScript = `set -eu
+SCOPE=$1
+CITY=$2
+HOST=$3
+PORT=$4
+META="$SCOPE/.beads/metadata.json"
+test -s "$META" && test -f "$SCOPE/.beads/config.yaml"
+DB=$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(str(m.get("dolt_database", "")).strip())' "$META" 2>/dev/null)
+test -n "$DB"
+gc dolt-state ensure-project-id --metadata "$META" --database "$DB" --city "$CITY" --host "$HOST" --port "$PORT" >/dev/null 2>&1
+(cd "$SCOPE" && BEADS_DIR="$SCOPE/.beads" bd context --json >/dev/null 2>&1)`
+	_, err := ops.execInPod(ctx, podName, "agent", []string{"sh", "-c", attachScript, "sh", scopeRoot, cityRoot, doltHost, doltPort}, nil)
 	if err != nil {
-		return fmt.Errorf("invalid projected GC_DOLT_PORT %q: %w", doltPort, err)
+		return errors.New("identity reconciliation or context check failed")
 	}
-	patchJSON, err := json.Marshal(map[string]any{
-		"dolt_server_host": doltHost,
-		"dolt_server_port": portNum,
-	})
-	if err != nil {
-		return fmt.Errorf("marshaling beads patch: %w", err)
-	}
-	patchB64 := base64.StdEncoding.EncodeToString(patchJSON)
-	prefixB64 := base64.StdEncoding.EncodeToString([]byte(prefix))
-	storeRootB64 := base64.StdEncoding.EncodeToString([]byte(storeRoot))
-
-	patchCmd := fmt.Sprintf(
-		`WD=$(echo '%s' | base64 -d) && cd "$WD" && PATCH=$(echo '%s' | base64 -d) && `+
-			`if [ -f .beads/metadata.json ]; then `+
-			`python3 -c "import json,sys; `+
-			`m=json.load(open('.beads/metadata.json')); `+
-			`p=json.loads(sys.argv[1]); m.update(p); m.pop('project_id', None); `+
-			`json.dump(m,open('.beads/metadata.json','w'),indent=2)" "$PATCH" 2>/dev/null || `+
-			`printf '%%s' "$PATCH" | python3 -c "import json,sys; `+
-			`m=json.load(open('.beads/metadata.json')); `+
-			`p=json.loads(sys.stdin.read()); m.update(p); m.pop('project_id', None); `+
-			`json.dump(m,open('.beads/metadata.json','w'),indent=2)"; `+
-			`else PREFIX=$(echo '%s' | base64 -d) && `+
-			`DOLT_HOST=$(echo '%s' | base64 -d) && `+
-			`DOLT_PORT=$(echo '%s' | base64 -d) && `+
-			`yes | BEADS_DIR="$WD/.beads" bd init --server --server-host "$DOLT_HOST" --server-port "$DOLT_PORT" -p "$PREFIX" --skip-hooks --skip-agents; fi`,
-		storeRootB64, patchB64, prefixB64,
-		base64.StdEncoding.EncodeToString([]byte(doltHost)),
-		base64.StdEncoding.EncodeToString([]byte(doltPort)),
-	)
-	_, err = ops.execInPod(ctx, podName, "agent", []string{"sh", "-c", patchCmd}, nil)
-	return err
+	return nil
 }
 
 // verifyBeadsInPod confirms that canonical tracked .beads files are already

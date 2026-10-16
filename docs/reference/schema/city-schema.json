@@ -1951,7 +1951,7 @@
         },
         "prebaked": {
           "type": "boolean",
-          "description": "Prebaked skips init container staging and EmptyDir volumes when true.\nUse with images built by `gc build-image` that have city content baked in."
+          "description": "Prebaked skips init container staging and EmptyDir volumes when true.\nUse with images built by `gc build-image` that have initialized city and\nrig store metadata baked in; each pod still reconciles live scope identity\nbefore starting its agent or reporting Ready."
         },
         "secret_env": {
           "items": {

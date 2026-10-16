@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "cutover.go",
         "exec.go",
+        "metadata.go",
         "name.go",
         "pod.go",
         "provider.go",
@@ -37,6 +38,7 @@ go_test(
         "beads_script_test.go",
         "controller_script_test.go",
         "exec_provider_test.go",
+        "metadata_test.go",
         "name_test.go",
         "pod_prompt_test.go",
         "pod_test.go",

@@ -317,10 +317,9 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 		)
 	}
 	credCopy := `umask 077; mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null; git config --global --add safe.directory '*' 2>/dev/null; `
-	wsWait := ""
-	if !p.prebaked {
-		wsWait = `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
-	}
+	// The provider opens this fresh pod-local gate only after scoped stores are
+	// attached. /tmp cannot carry a stale marker from a prebaked image layer.
+	wsWait := `while [ ! -f /tmp/.gc-workspace-ready ]; do sleep 0.5; done; `
 
 	// The pod spec's WorkingDir names the workspace root, because the kubelet
 	// chdirs into it before this command runs and a per-bead workDir does not
@@ -437,12 +436,18 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 				// its own working directory; other runtimes may refuse to start
 				// the container. The entrypoint creates and enters podWorkDir
 				// itself, as the agent user, so it comes out owned correctly.
-				WorkingDir:      podWorkspaceRoot,
-				Command:         []string{"/bin/sh", "-c"},
-				Args:            agentCommandShellArgs(tmuxCmd, cfg),
-				Env:             env,
-				Stdin:           true,
-				TTY:             true,
+				WorkingDir: podWorkspaceRoot,
+				Command:    []string{"/bin/sh", "-c"},
+				Args:       agentCommandShellArgs(tmuxCmd, cfg),
+				Env:        env,
+				Stdin:      true,
+				TTY:        true,
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"sh", "-c", "test -f /tmp/.gc-workspace-ready"}}},
+					PeriodSeconds:    2,
+					TimeoutSeconds:   1,
+					FailureThreshold: 1,
+				},
 				Resources:       resources,
 				VolumeMounts:    mainVolMounts,
 				SecurityContext: agentSecurityContext(linuxUsername),
