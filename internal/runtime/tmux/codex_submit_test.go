@@ -39,6 +39,18 @@ func TestCodexNudgeSubmitsWithExactlyOneEscapeThenEnter(t *testing.T) {
 	}
 }
 
+func TestNudgeSubmitSequenceForProviderResolvesWrappedCodexAndReturnsCopy(t *testing.T) {
+	got := NudgeSubmitKeySequenceForProvider("vendor/codex-pro")
+	want := []string{"Escape", "Enter"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider nudge sequence = %v, want %v", got, want)
+	}
+	got[0] = "changed"
+	if next := NudgeSubmitKeySequenceForProvider("codex"); !reflect.DeepEqual(next, want) {
+		t.Fatalf("provider nudge sequence mutation leaked into policy: %v", next)
+	}
+}
+
 // Control: the claude path is byte-identical to what it has always been. If the
 // codex entry had been added to a shared default, or the skip list had been
 // edited instead of the table, this row would move too.

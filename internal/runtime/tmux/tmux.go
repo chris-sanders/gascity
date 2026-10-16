@@ -108,6 +108,14 @@ func nudgeSubmitKeySequenceForFamily(family string) []string {
 	return defaultNudgeSubmitKeySequence
 }
 
+// NudgeSubmitKeySequenceForProvider returns the current submission sequence
+// for a live provider value such as "codex" or a wrapped provider name. The
+// returned slice is independent of tmux's internal policy table.
+func NudgeSubmitKeySequenceForProvider(provider string) []string {
+	sequence := nudgeSubmitKeySequenceForFamily(sessionlog.ProviderFamily(provider))
+	return append([]string(nil), sequence...)
+}
+
 // Config holds configurable timeouts and intervals for the tmux provider.
 // All fields have sensible defaults matching the original hardcoded values.
 type Config struct {
