@@ -361,6 +361,10 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		cleanup("tmux not ready")
 		return fmt.Errorf("waiting for tmux in pod %q: %w", podName, err)
 	}
+	if err := p.seedStartMetadata(ctx, podName, name, cfg.Env); err != nil {
+		cleanup("metadata projection failed")
+		return err
+	}
 
 	// Enable pane logging + run session setup (shared with the relaunch tail).
 	p.runPodPostLaunchSetup(ctx, podName, cfg)
@@ -468,6 +472,9 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 	if _, err := p.ops.execInPod(ctx, podName, "agent",
 		[]string{"tmux", "has-session", "-t", tmuxSession}, nil); err != nil {
 		return fmt.Errorf("%w: session %q (pod %s has no live tmux session)", runtime.ErrSessionNotFound, name, podName)
+	}
+	if err := p.seedStartMetadata(ctx, podName, name, cfg.Env); err != nil {
+		return err
 	}
 
 	// Respawn the agent in the warm "main" session.
@@ -655,47 +662,64 @@ func (p *Provider) RunLive(_ string, _ runtime.Config) error {
 // SetMeta stores a key-value pair in the tmux environment.
 func (p *Provider) SetMeta(name, key, value string) error {
 	ctx := context.Background()
-	podName, err := p.findPod(ctx, name)
+	podName, err := p.findRunningPod(ctx, name)
 	if err != nil {
-		return nil // best-effort
+		return fmt.Errorf("k8s set metadata key %q for session %q: %w", key, name, err)
 	}
-	_, _ = p.ops.execInPod(ctx, podName, "agent",
-		[]string{"tmux", "set-environment", "-t", tmuxSession, key, value}, nil)
+	if _, err := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "set-environment", "-t", tmuxSession, key, value}, nil); err != nil {
+		// Do not wrap an exec error here: the in-pod argv contains value, which
+		// may be an incarnation capability and must not appear in diagnostics.
+		return fmt.Errorf("k8s set metadata key %q for session %q failed", key, name)
+	}
 	return nil
 }
 
 // GetMeta retrieves a metadata value from the tmux environment.
 func (p *Provider) GetMeta(name, key string) (string, error) {
 	ctx := context.Background()
-	podName, err := p.findPod(ctx, name)
+	podName, err := p.findRunningPod(ctx, name)
 	if err != nil {
-		return "", nil
+		return "", fmt.Errorf("k8s read metadata key %q for session %q: %w", key, name, err)
 	}
 	output, err := p.ops.execInPod(ctx, podName, "agent",
 		[]string{"tmux", "show-environment", "-t", tmuxSession, key}, nil)
 	if err != nil {
-		return "", nil
+		var exitErr execerr.ExitError
+		if errors.As(err, &exitErr) && exitErr.Exited() && exitErr.ExitStatus() == 1 {
+			// tmux uses status 1 for an absent key. Verify the session itself is
+			// still readable before treating that as an ordinary empty value.
+			if _, sessionErr := p.ops.execInPod(ctx, podName, "agent",
+				[]string{"tmux", "has-session", "-t", tmuxSession}, nil); sessionErr == nil {
+				return "", nil
+			} else {
+				return "", fmt.Errorf("k8s verify tmux session while reading metadata key %q for %q: %w", key, name, sessionErr)
+			}
+		}
+		return "", fmt.Errorf("k8s read metadata key %q for session %q: %w", key, name, err)
 	}
-	output = strings.TrimSpace(output)
+	output = strings.TrimRight(output, "\r\n")
 	// tmux output: "KEY=VALUE" (set), "-KEY" (unset).
-	if strings.HasPrefix(output, "-") {
+	if output == "" || output == "-"+key {
 		return "", nil // explicitly unset
 	}
-	if _, val, ok := strings.Cut(output, "="); ok {
+	if gotKey, val, ok := strings.Cut(output, "="); ok && gotKey == key {
 		return val, nil
 	}
-	return "", nil
+	return "", fmt.Errorf("k8s read metadata key %q for session %q: unexpected tmux response", key, name)
 }
 
 // RemoveMeta removes a metadata key from the tmux environment.
 func (p *Provider) RemoveMeta(name, key string) error {
 	ctx := context.Background()
-	podName, err := p.findPod(ctx, name)
+	podName, err := p.findRunningPod(ctx, name)
 	if err != nil {
-		return nil // best-effort
+		return fmt.Errorf("k8s remove metadata key %q for session %q: %w", key, name, err)
 	}
-	_, _ = p.ops.execInPod(ctx, podName, "agent",
-		[]string{"tmux", "set-environment", "-t", tmuxSession, "-u", key}, nil)
+	if _, err := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"tmux", "set-environment", "-t", tmuxSession, "-u", key}, nil); err != nil {
+		return fmt.Errorf("k8s remove metadata key %q for session %q: %w", key, name, err)
+	}
 	return nil
 }
 
