@@ -14,8 +14,8 @@ func TestGenerateDockerfile(t *testing.T) {
 	}
 
 	// Must copy workspace.
-	if !strings.Contains(content, "COPY workspace/ /workspace/") {
-		t.Error("missing COPY workspace/")
+	if !strings.Contains(content, "COPY --chown=1001:0 workspace/ /workspace/") {
+		t.Error("missing group-owned prebaked workspace copy")
 	}
 
 	// Must touch the ready sentinel.
@@ -23,11 +23,11 @@ func TestGenerateDockerfile(t *testing.T) {
 		t.Error("missing touch .gc-workspace-ready")
 	}
 
-	// The image identity is a numeric, non-root fallback. The root group
-	// permissions keep baked workspace content writable when admission supplies
-	// a different non-root UID with GID 0.
-	if !strings.Contains(content, "chown -R 1001:0 /workspace") || !strings.Contains(content, "chmod -R g=u /workspace") {
-		t.Error("workspace must be owned by the numeric fallback UID and root group with group permissions matching owner permissions")
+	// The image identity is a numeric, non-root fallback. Permissions are
+	// prepared per entry in the build context, so generated Dockerfiles must not
+	// recursively chmod private state.
+	if strings.Contains(content, "chmod -R") || strings.Contains(content, "chown -R") {
+		t.Error("generated Dockerfile must not recursively chmod or chown workspace content")
 	}
 	if !strings.Contains(content, "USER 1001:0") {
 		t.Error("missing numeric non-root fallback USER 1001:0")

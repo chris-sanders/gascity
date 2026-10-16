@@ -92,7 +92,7 @@ COPY contrib/mail-scripts/gc-mail-mcp-agent-mail /usr/local/bin/gc-mail-mcp-agen
 # The CLAUDE_CONFIG_DIR env var (set by gc-session-k8s) points to the mount.
 
 WORKDIR /workspace
-RUN chown gcagent:0 /workspace && chmod 0775 /workspace
+RUN chown gcagent:0 /workspace && chmod 0770 /workspace
 
 # Numeric fallback for clusters that do not assign a pod UID. Agent pods may
 # override it through admission or [session.k8s] run_as_user.

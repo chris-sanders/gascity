@@ -61,6 +61,53 @@ name = "test-city"
 	}
 }
 
+func TestAssembleContextPrebakedPermissions(t *testing.T) {
+	cityDir := t.TempDir()
+	outputDir := t.TempDir()
+	writeFile(t, cityDir, "city.toml", `[workspace]
+name = "permission-city"
+`)
+	mkdirAll(t, cityDir, "tree")
+	writeFile(t, cityDir, "tree/run.sh", "#!/bin/sh\nexit 0\n")
+	writeFile(t, cityDir, "tree/config.toml", "name = \"agent\"\n")
+	writeFile(t, cityDir, "tree/private-state", "private\n")
+	mkdirAll(t, cityDir, "tree/.private")
+	writeFile(t, cityDir, "tree/.private/identity", "private identity\n")
+	for rel, mode := range map[string]os.FileMode{
+		"tree":                   0o755,
+		"tree/run.sh":            0o755,
+		"tree/config.toml":       0o644,
+		"tree/private-state":     0o600,
+		"tree/.private":          0o700,
+		"tree/.private/identity": 0o600,
+	} {
+		if err := os.Chmod(filepath.Join(cityDir, rel), mode); err != nil {
+			t.Fatalf("chmod %s: %v", rel, err)
+		}
+	}
+
+	if err := AssembleContext(Options{CityPath: cityDir, OutputDir: outputDir}); err != nil {
+		t.Fatalf("AssembleContext: %v", err)
+	}
+	for rel, want := range map[string]os.FileMode{
+		"workspace":                        0o770,
+		"workspace/tree":                   0o770,
+		"workspace/tree/run.sh":            0o770,
+		"workspace/tree/config.toml":       0o660,
+		"workspace/tree/private-state":     0o600,
+		"workspace/tree/.private":          0o700,
+		"workspace/tree/.private/identity": 0o600,
+	} {
+		info, err := os.Stat(filepath.Join(outputDir, rel))
+		if err != nil {
+			t.Fatalf("stat %s: %v", rel, err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s mode = %04o, want %04o", rel, got, want)
+		}
+	}
+}
+
 func TestAssembleContextExcludes(t *testing.T) {
 	cityDir := t.TempDir()
 	outputDir := t.TempDir()

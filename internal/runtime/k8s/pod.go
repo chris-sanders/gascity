@@ -316,7 +316,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			linuxUsername,
 		)
 	}
-	credCopy := `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; git config --global --add safe.directory '*' 2>/dev/null; `
+	credCopy := `umask 077; mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null; git config --global --add safe.directory '*' 2>/dev/null; `
 	wsWait := ""
 	if !p.prebaked {
 		wsWait = `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
