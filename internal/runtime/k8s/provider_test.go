@@ -2074,7 +2074,7 @@ func TestStartAllowsOneShotLifecycleCommands(t *testing.T) {
 
 			hasSessionCalls := 0
 			fake.execFunc = func(_ string, cmd []string) (string, error) {
-				if len(cmd) == 6 && cmd[0] == "tmux" && cmd[1] == "show-environment" && cmd[5] == "GC_PROVIDER" {
+				if len(cmd) == 5 && cmd[0] == "tmux" && cmd[1] == "show-environment" && cmd[4] == "GC_PROVIDER" {
 					return "GC_PROVIDER=claude\n", nil
 				}
 				if len(cmd) >= 3 && cmd[0] == "tmux" && cmd[1] == "has-session" {
