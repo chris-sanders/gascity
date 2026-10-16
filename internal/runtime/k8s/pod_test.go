@@ -491,7 +491,7 @@ func TestBuildPod_LinuxUsernameKeepsLegacyRootSetup(t *testing.T) {
 		t.Fatalf("legacy Linux username securityContext = %v, want runAsUser 0", security)
 	}
 	args := strings.Join(pod.Spec.Containers[0].Args, " ")
-	for _, want := range []string{"useradd", "/etc/sudoers.d/", "chown -R", "su - developer"} {
+	for _, want := range []string{"useradd", "/etc/sudoers.d/", "chown -R", "su - " + shellquote.Quote("developer")} {
 		if !strings.Contains(args, want) {
 			t.Errorf("legacy Linux username startup is missing %q: %s", want, args)
 		}
