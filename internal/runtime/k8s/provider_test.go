@@ -357,6 +357,9 @@ func TestNudge(t *testing.T) {
 	p := newProviderWithOps(fake)
 
 	addRunningPod(fake, "gc-test-agent", "gc-test-agent")
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_PROVIDER"},
+		"GC_PROVIDER=claude\n", nil)
 
 	err := p.Nudge("gc-test-agent", runtime.TextContent("hello world"))
 	if err != nil {
@@ -386,6 +389,136 @@ func TestNudge(t *testing.T) {
 	}
 	if !foundEnter {
 		t.Error("no tmux send-keys Enter call recorded for Nudge")
+	}
+}
+
+func TestNudgeUsesLiveDefaultSubmitSequenceExactlyOnce(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "claude-worker", "claude-worker")
+	fake.setExecResult("claude-worker",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_PROVIDER"},
+		"GC_PROVIDER=claude\n", nil)
+
+	if err := p.Nudge("claude-worker", runtime.TextContent("hello world")); err != nil {
+		t.Fatalf("Nudge: %v", err)
+	}
+	var got [][]string
+	for _, call := range fake.calls {
+		if call.method == "execInPod" && len(call.cmd) > 1 && call.cmd[0] == "tmux" && call.cmd[1] == "send-keys" {
+			got = append(got, call.cmd)
+		}
+	}
+	want := [][]string{
+		{"tmux", "send-keys", "-t", tmuxSession, "-l", "hello world"},
+		{"tmux", "send-keys", "-t", tmuxSession, "Enter"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("nudge keystrokes = %v, want exactly one literal paste and one provider submit sequence %v", got, want)
+	}
+}
+
+func TestNudgeMissingLiveProviderMetadataDoesNotTypeContent(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "worker", "worker")
+	fake.setExecResult("worker",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_PROVIDER"},
+		"-GC_PROVIDER\n", nil)
+
+	err := p.Nudge("worker", runtime.TextContent("hello world"))
+	if err == nil || !strings.Contains(err.Error(), "provider metadata is missing") {
+		t.Fatalf("Nudge error = %v, want missing live provider metadata", err)
+	}
+	if findExecCmd(fake, "send-keys") != nil {
+		t.Fatal("Nudge typed content without resolving the live provider family")
+	}
+}
+
+func TestNudgeUsesLiveCodexSubmitSequenceExactlyOnce(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "codex-worker", "codex-worker")
+	fake.setExecResult("codex-worker",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_PROVIDER"},
+		"GC_PROVIDER=vendor/codex-pro\n", nil)
+
+	if err := p.Nudge("codex-worker", runtime.TextContent("hello world")); err != nil {
+		t.Fatalf("Nudge: %v", err)
+	}
+	var got [][]string
+	for _, call := range fake.calls {
+		if call.method == "execInPod" && len(call.cmd) > 1 && call.cmd[0] == "tmux" && call.cmd[1] == "send-keys" {
+			got = append(got, call.cmd)
+		}
+	}
+	want := [][]string{
+		{"tmux", "send-keys", "-t", tmuxSession, "-l", "hello world"},
+		{"tmux", "send-keys", "-t", tmuxSession, "Escape"},
+		{"tmux", "send-keys", "-t", tmuxSession, "Enter"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("nudge keystrokes = %v, want exactly one literal paste and one provider submit sequence %v", got, want)
+	}
+}
+
+func TestNudgeMetadataReadFailureDoesNotTypeContent(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "worker", "worker")
+	readErr := errors.New("metadata transport failure")
+	fake.setExecResult("worker",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_PROVIDER"}, "", readErr)
+
+	err := p.Nudge("worker", runtime.TextContent("hello world"))
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Nudge error = %v, want metadata read error", err)
+	}
+	if findExecCmd(fake, "send-keys") != nil {
+		t.Fatal("Nudge typed content before resolving live provider metadata")
+	}
+}
+
+func TestStartNudgeErrorPropagatesWithoutRetry(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	p.postStartSettle = 0
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_PROVIDER"}, "GC_PROVIDER=claude\n", nil)
+	fake.setExecResult("gc-test-agent",
+		[]string{"tmux", "send-keys", "-t", tmuxSession, "Enter"}, "", errors.New("submit transport failure"))
+
+	err := p.Start(context.Background(), "gc-test-agent", runtime.Config{
+		Command: "agent", Nudge: "wake once", Env: map[string]string{"GC_PROVIDER": "claude"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not retried") {
+		t.Fatalf("Start nudge error = %v, want propagated single-attempt error", err)
+	}
+	if countExecCommand(fake, []string{"tmux", "send-keys", "-t", tmuxSession, "Enter"}) != 1 {
+		t.Fatal("Start retried an uncertain nudge submission")
+	}
+	if _, exists := fake.pods["gc-test-agent"]; !exists {
+		t.Fatal("Start deleted the warm pod after an uncertain nudge submission")
+	}
+}
+
+func TestRelaunchNudgeErrorPropagatesWithoutRetry(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "worker", "worker")
+	fake.setExecResult("worker",
+		[]string{"tmux", "show-environment", "-t", tmuxSession, "GC_PROVIDER"}, "GC_PROVIDER=claude\n", nil)
+	fake.setExecResult("worker",
+		[]string{"tmux", "send-keys", "-t", tmuxSession, "Enter"}, "", errors.New("submit transport failure"))
+
+	err := p.Relaunch(context.Background(), "worker", runtime.Config{
+		Command: "agent", Nudge: "wake once", Env: map[string]string{"GC_PROVIDER": "claude"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not retried") {
+		t.Fatalf("Relaunch nudge error = %v, want propagated single-attempt error", err)
+	}
+	if countExecCommand(fake, []string{"tmux", "send-keys", "-t", tmuxSession, "Enter"}) != 1 {
+		t.Fatal("Relaunch retried an uncertain nudge submission")
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	execerr "k8s.io/client-go/util/exec"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessiontmux "github.com/gastownhall/gascity/internal/runtime/tmux"
 )
 
 // Compile-time interface checks.
@@ -403,7 +404,11 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 
 	// Send initial nudge if configured (matches tmux adapter step 6).
 	if cfg.Nudge != "" {
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+		if err := p.nudge(ctx, name, runtime.TextContent(cfg.Nudge)); err != nil {
+			// A failed submission can be partial, so surface it once and leave the
+			// warm pod in place. Never replay an uncertain startup nudge here.
+			return fmt.Errorf("k8s startup nudge for session %q failed (not retried): %w", name, err)
+		}
 	}
 
 	return nil
@@ -505,7 +510,9 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 	}
 
 	if cfg.Nudge != "" {
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+		if err := p.nudge(ctx, name, runtime.TextContent(cfg.Nudge)); err != nil {
+			return fmt.Errorf("k8s relaunch nudge for session %q failed (not retried): %w", name, err)
+		}
 	}
 	return nil
 }
@@ -637,11 +644,50 @@ func (p *Provider) ProcessAlive(name string, processNames []string) bool {
 	return false
 }
 
-// Nudge types a message into the tmux session followed by Enter.
-// Uses -l (literal mode) so tmux key names in the message text are not
-// interpreted as keystrokes. Content blocks are flattened to text.
+// Nudge types literal message text into the tmux session and submits it with
+// the live provider family's one-shot key sequence. Content blocks are flattened
+// to text before transmission.
 func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
-	return p.carrier().Nudge(context.Background(), name, content)
+	return p.nudge(context.Background(), name, content)
+}
+
+func (p *Provider) nudge(ctx context.Context, name string, content []runtime.ContentBlock) error {
+	message := runtime.FlattenText(content)
+	if message == "" {
+		return nil
+	}
+	podName, err := p.findRunningPod(ctx, name)
+	if err != nil {
+		return fmt.Errorf("k8s nudge %q: %w", name, err)
+	}
+	provider, err := p.getMetaFromPod(ctx, podName, name, "GC_PROVIDER")
+	if err != nil {
+		return fmt.Errorf("k8s nudge %q: resolving live provider family: %w", name, err)
+	}
+	if strings.TrimSpace(provider) == "" {
+		return fmt.Errorf("k8s nudge %q: live provider metadata is missing", name)
+	}
+	textArgs := append([]string{"tmux", "send-keys", "-t", tmuxSession, "-l"}, runtime.TmuxLiteralArgs(message)...)
+	if _, err := p.ops.execInPod(ctx, podName, "agent", textArgs, nil); err != nil {
+		// The argv contains user-authored prompt text; keep transport diagnostics
+		// out of the returned error because they may echo the submitted content.
+		return fmt.Errorf("k8s nudge %q: typing literal content failed", name)
+	}
+	for i, key := range sessiontmux.NudgeSubmitKeySequenceForProvider(provider) {
+		if i > 0 {
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("k8s nudge %q: %w", name, ctx.Err())
+			case <-timer.C:
+			}
+		}
+		if _, err := p.ops.execInPod(ctx, podName, "agent", []string{"tmux", "send-keys", "-t", tmuxSession, key}, nil); err != nil {
+			return fmt.Errorf("k8s nudge %q: submitting provider key %q failed", name, key)
+		}
+	}
+	return nil
 }
 
 // SendKeys sends bare keystrokes to the tmux session. Best-effort on a
@@ -682,6 +728,10 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("k8s read metadata key %q for session %q: %w", key, name, err)
 	}
+	return p.getMetaFromPod(ctx, podName, name, key)
+}
+
+func (p *Provider) getMetaFromPod(ctx context.Context, podName, name, key string) (string, error) {
 	output, err := p.ops.execInPod(ctx, podName, "agent",
 		[]string{"tmux", "show-environment", "-t", tmuxSession, key}, nil)
 	if err != nil {

@@ -184,6 +184,23 @@ func hasExecCommand(fake *fakeK8sOps, want []string) bool {
 	return false
 }
 
+func countExecCommand(fake *fakeK8sOps, want []string) int {
+	count := 0
+	for _, call := range fake.calls {
+		if call.method != "execInPod" || len(call.cmd) != len(want) {
+			continue
+		}
+		match := true
+		for i := range want {
+			match = match && call.cmd[i] == want[i]
+		}
+		if match {
+			count++
+		}
+	}
+	return count
+}
+
 func TestK8sMetaOperationsFailClosedWithoutRunningPod(t *testing.T) {
 	p := newProviderWithOps(newFakeK8sOps())
 	if _, err := p.GetMeta("missing", "GC_SESSION_ID"); !errors.Is(err, runtime.ErrSessionNotFound) {
