@@ -519,6 +519,27 @@ func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.
 	if len(secondExecs) != 2 || len(secondExecs) >= firstReadExecs {
 		t.Fatalf("second identity read used %d pod execs; want two reads without repair (first repair used %d)", len(secondExecs), firstReadExecs)
 	}
+	// GC_TEMPLATE is absent from both the session and the pod environment, so
+	// this read reaches the compatibility-backfill gate. The hidden completion
+	// marker must stop it before pod-env reads or another source-file repair.
+	ops.calls = nil
+	if got, err := p.GetMeta("legacy", "GC_TEMPLATE"); err != nil || got != "" {
+		t.Fatalf("absent legacy template read = %q, %v; want empty metadata", got, err)
+	}
+	markerRead := false
+	templateExecs := tmuxMetadataPodExecs(ops.calls)
+	for _, call := range templateExecs {
+		joined := strings.Join(call.cmd, " ")
+		if strings.Contains(joined, legacyIdentityBackfillKey) {
+			markerRead = true
+		}
+		if strings.Contains(joined, `printenv "$1"`) || strings.Contains(joined, "tmux source-file") {
+			t.Fatalf("completed legacy backfill repeated compatibility repair exec: %q", call.cmd)
+		}
+	}
+	if len(templateExecs) != 4 || !markerRead {
+		t.Fatalf("absent legacy template read used %d pod execs (marker read %t); want exactly four execs including the hidden-marker check, without repair", len(templateExecs), markerRead)
+	}
 	if got, err := p.GetMeta("legacy", "GC_SESSION_ID"); err != nil || got != "legacy-session" {
 		t.Fatalf("legacy session identity backfill = %q, %v", got, err)
 	}
