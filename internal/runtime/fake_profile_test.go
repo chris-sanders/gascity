@@ -50,6 +50,7 @@ var optionalInterfaces = map[string]reflect.Type{
 	"InterruptBoundaryWaitProvider":   reflect.TypeFor[runtime.InterruptBoundaryWaitProvider](),
 	"InterruptedTurnResetProvider":    reflect.TypeFor[runtime.InterruptedTurnResetProvider](),
 	"InventoryProvider":               reflect.TypeFor[runtime.InventoryProvider](),
+	"K8sStoreAttachmentProvider":      reflect.TypeFor[runtime.K8sStoreAttachmentProvider](),
 	"KeyedNudgeProvider":              reflect.TypeFor[runtime.KeyedNudgeProvider](),
 	"ListingAttestation":              reflect.TypeFor[runtime.ListingAttestation](),
 	"LivenessObserver":                reflect.TypeFor[runtime.LivenessObserver](),

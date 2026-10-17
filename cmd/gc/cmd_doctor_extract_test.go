@@ -95,12 +95,10 @@ func TestBuildDoctorChecksSkipsNamedAlwaysMinConflictCheckWithoutConfig(t *testi
 	}
 }
 
-// TestBuildDoctorChecksRegistersNudgeUnconfirmedCheckWithoutConfig: the
-// nudge-unconfirmed check reads only the city path, so it must stay outside
-// the config gate. Behind it, a broken city.toml — precisely when session
-// diagnostics matter most — both hid existing findings and made
-// `gc doctor --check nudge-unconfirmed` fail as an unregistered check.
-func TestBuildDoctorChecksRegistersNudgeUnconfirmedCheckWithoutConfig(t *testing.T) {
+// TestBuildDoctorChecksRegistersRecoveryChecksWithoutConfig: recovery
+// diagnostics read only controller-owned state and the city path, so they
+// stay outside the config gate. A broken city.toml must not hide them.
+func TestBuildDoctorChecksRegistersRecoveryChecksWithoutConfig(t *testing.T) {
 	cityDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"demo\"\n"), 0o644); err != nil {
 		t.Fatalf("write city.toml: %v", err)
@@ -124,6 +122,9 @@ func TestBuildDoctorChecksRegistersNudgeUnconfirmedCheckWithoutConfig(t *testing
 			}))
 			if got := doctorCheckIndex(names, "nudge-unconfirmed"); got < 0 {
 				t.Fatalf("nudge-unconfirmed absent, want registered regardless of config; names=%v", names)
+			}
+			if got := doctorCheckIndex(names, "startup-nudge-delivery"); got < 0 {
+				t.Fatalf("startup-nudge-delivery absent, want registered regardless of config; names=%v", names)
 			}
 		})
 	}
