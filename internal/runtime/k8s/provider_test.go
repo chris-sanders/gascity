@@ -831,7 +831,7 @@ func TestStartTreatsYoungPodWithDeadTmuxAsInitializing(t *testing.T) {
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
 			ContainerStatuses: []corev1.ContainerStatus{{
-				Name: "agent", ContainerID: "containerd://test-" + name,
+				Name: "agent", ContainerID: "containerd://test-young",
 				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
 			}},
 		},
@@ -876,7 +876,7 @@ func TestStartDeletesOldPodWithDeadTmux(t *testing.T) {
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
 			ContainerStatuses: []corev1.ContainerStatus{{
-				Name: "agent", ContainerID: "containerd://test-" + name,
+				Name: "agent", ContainerID: "containerd://test-old",
 				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
 			}},
 		},
