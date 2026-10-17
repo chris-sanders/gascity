@@ -172,8 +172,8 @@ func TestK8sStoreAttachmentProjectsCityAndRigIndependently(t *testing.T) {
 		if env["GC_K8S_ATTACH_REQUIRED"] != "1" || env["GC_K8S_DOLT_MANAGED_LOCAL"] != "1" {
 			t.Fatalf("rig projection = %#v, want required inherited managed-local rig", env)
 		}
-		if activeEnv["GC_DOLT_HOST"] != "127.0.0.1" || activeEnv["GC_DOLT_PORT"] != managedPort {
-			t.Fatalf("inherited rig endpoint changed: host=%q port=%q", activeEnv["GC_DOLT_HOST"], activeEnv["GC_DOLT_PORT"])
+		if activeEnv["GC_DOLT_HOST"] != "" || activeEnv["GC_DOLT_PORT"] != managedPort {
+			t.Fatalf("inherited managed rig binding = host %q port %q, want empty host and resolved managed port %q", activeEnv["GC_DOLT_HOST"], activeEnv["GC_DOLT_PORT"], managedPort)
 		}
 	})
 
