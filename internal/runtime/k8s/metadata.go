@@ -24,9 +24,9 @@ import (
 )
 
 const (
-	k8sMetaReadMissing     = 44
-	k8sMetaOpTimeout       = 15 * time.Second
-	identityUnboundKey     = "__gc_identity_unbound"
+	k8sMetaReadMissing = 44
+	k8sMetaOpTimeout   = 15 * time.Second
+	identityUnboundKey = "__gc_identity_unbound"
 )
 
 func processCityPath() string {

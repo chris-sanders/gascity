@@ -909,11 +909,13 @@ func StartupNudgeDiagnostics(cityPath string) ([]runtime.StartupNudgeStatus, err
 	return diagnostics, nil
 }
 
-var _ runtime.StartupNudgeRecoveryProvider = (*Provider)(nil)
-var _ runtime.StartupNudgeSessionProvider = (*Provider)(nil)
-var _ runtime.StartupNudgeLeasedSessionProvider = (*Provider)(nil)
-var _ runtime.StartupNudgeLeaseTargetProvider = (*Provider)(nil)
-var _ runtime.StartupNudgeEventAcknowledger = (*Provider)(nil)
+var (
+	_ runtime.StartupNudgeRecoveryProvider      = (*Provider)(nil)
+	_ runtime.StartupNudgeSessionProvider       = (*Provider)(nil)
+	_ runtime.StartupNudgeLeasedSessionProvider = (*Provider)(nil)
+	_ runtime.StartupNudgeLeaseTargetProvider   = (*Provider)(nil)
+	_ runtime.StartupNudgeEventAcknowledger     = (*Provider)(nil)
+)
 
 func validStartupNudgeIntent(intent startupNudgeIntent) bool {
 	if intent.SchemaVersion != 1 || intent.ID == "" || intent.SessionName == "" || intent.Target != tmuxSession {

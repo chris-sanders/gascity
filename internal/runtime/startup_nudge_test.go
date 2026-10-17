@@ -50,6 +50,7 @@ func (p *startupNudgeLeasedLeaf) RecoverStartupNudgesForLeasedSession(_ context.
 func (p *startupNudgeLeaf) StartupNudgeSessionNames(context.Context) []string {
 	return p.names
 }
+
 func (p *startupNudgeLeaf) RecoverStartupNudgesForSession(_ context.Context, name string) []runtime.StartupNudgeStatus {
 	p.calls = append(p.calls, name)
 	return []runtime.StartupNudgeStatus{{SessionName: name, Status: "uncertain"}}
