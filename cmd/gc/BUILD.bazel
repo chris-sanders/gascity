@@ -1501,6 +1501,7 @@ go_test(
         "json_runtime_schema_test.go",
         "json_schema_test.go",
         "jsonl_archive_doctor_check_test.go",
+        "k8s_store_attachment_route_test.go",
         "legacy_act_test.go",
         "legacy_pack_preflight_test.go",
         "legacy_raw_session_writes_test.go",

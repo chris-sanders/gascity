@@ -35,8 +35,11 @@ func newBuildImageCmd(stdout, stderr io.Writer) *cobra.Command {
 and rig content, then build a container image with everything pre-staged.
 
 Pods using the prebaked image skip init containers and file staging,
-reducing startup from 30-60s to seconds. Configure with prebaked = true
-in [session.k8s].
+reducing startup from 30-60s to seconds. Their city and active store scopes
+still need initialized .beads metadata: the provider reconciles each scope's
+project identity and checks bd context before opening the agent startup
+gate and reporting the pod Ready. Missing or unattachable scope state fails
+startup. Configure with prebaked = true in [session.k8s].
 
 Secrets (Claude credentials) are never baked — they stay as K8s Secret
 volume mounts at runtime.`,

@@ -458,10 +458,57 @@ func TestBuildPodCopiesCredentialStateWithPrivatePermissions(t *testing.T) {
 		t.Fatalf("buildPod: %v", err)
 	}
 	args := strings.Join(pod.Spec.Containers[0].Args, " ")
-	for _, want := range []string{`umask 077`, `chmod 0700 "$HOME/.claude"`, `cp -rL /tmp/claude-secret/. "$HOME/.claude/"`, `git config --global --add safe.directory '*' 2>/dev/null || true`, `cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || true`} {
+	for _, want := range []string{`credential_umask=$(umask); umask 077`, `chmod 0700 "$HOME/.claude"`, `cp -rL /tmp/claude-secret/. "$HOME/.claude/"`, `umask "$credential_umask"`, `git config --global --add safe.directory '*' 2>/dev/null || true`, `cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || true`} {
 		if !strings.Contains(args, want) {
 			t.Errorf("entrypoint credential-copy command missing private-state setup %q: %s", want, args)
 		}
+	}
+}
+
+func TestBuildPodDynamicUserOwnsClaudeCredentialsAndGlobalGitConfig(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	cfg := perBeadWorkDirConfig()
+	cfg.Env["LINUX_USERNAME"] = "developer"
+	pod, err := buildPod("test-session", cfg, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	args := strings.Join(pod.Spec.Containers[0].Args, " ")
+	copyAt := strings.Index(args, `cp -rL /tmp/claude-secret/. "$HOME/.claude/"`)
+	ownerAt := strings.Index(args, `chown -R 'developer' "$HOME/.claude"`)
+	gitAt := strings.Index(args, `su - 'developer' -c 'git config --global --add safe.directory '\''*'\'''`)
+	if copyAt < 0 || ownerAt <= copyAt || gitAt <= ownerAt {
+		t.Fatalf("dynamic credential setup must copy first, transfer .claude ownership, then configure git as the login user: %s", args)
+	}
+}
+
+func TestBuildPodDynamicUserFailsWhenRequiredCredentialOwnershipCannotBeEstablished(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	p.secretMounts = []runtime.K8sSecretMount{{Secret: "required-claude", MountPath: "/tmp/claude-secret"}}
+	cfg := perBeadWorkDirConfig()
+	cfg.Env["LINUX_USERNAME"] = "developer"
+	pod, err := buildPod("test-session", cfg, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	args := strings.Join(pod.Spec.Containers[0].Args, " ")
+	for _, want := range []string{
+		"gc: required credential copy failed",
+		"gc: required credential ownership setup failed",
+		`chown -R 'developer' "$HOME/.claude"`,
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("required dynamic credential setup is missing %q: %s", want, args)
+		}
+	}
+}
+
+func TestBuildPodRejectsUnsafeLinuxUsername(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	cfg := perBeadWorkDirConfig()
+	cfg.Env["LINUX_USERNAME"] = `developer"; touch /tmp/pwned; #`
+	if _, err := buildPod("test-session", cfg, p); err == nil || !strings.Contains(err.Error(), "valid Linux account name") {
+		t.Fatalf("buildPod error = %v, want invalid account name", err)
 	}
 }
 
@@ -616,7 +663,7 @@ func TestBuildPod_EntrypointCreatesWorkDirAsDynamicUser(t *testing.T) {
 		t.Fatalf("buildPod: %v", err)
 	}
 	args := strings.Join(pod.Spec.Containers[0].Args, " ")
-	if !strings.Contains(args, "mkdir -p \""+perBeadPodWorkDir+"\"") {
+	if !strings.Contains(args, "mkdir -p "+shellquote.Quote(perBeadPodWorkDir)) {
 		t.Errorf("entrypoint should mkdir the per-bead WorkingDir as root; got: %s", args)
 	}
 	if !strings.Contains(args, "cd "+shellquote.Quote(perBeadPodWorkDir)) {
