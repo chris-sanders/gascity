@@ -11,6 +11,24 @@ import (
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
+func hasEmptyDirVolume(pod *corev1.Pod, name string) bool {
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == name && volume.EmptyDir != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func containerMountsVolume(mounts []corev1.VolumeMount, name string) bool {
+	for _, mount := range mounts {
+		if mount.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBuildPod_NodeSelector(t *testing.T) {
 	p := newProviderWithOps(newFakeK8sOps())
 	p.nodeSelector = map[string]string{"workload": "gc-agents"}
@@ -91,8 +109,14 @@ func TestBuildPodSecretProjectionDefaultsAndOverrides(t *testing.T) {
 		if !hasSecretEnvRef(pod.Spec.Containers[0].Env, "GITHUB_TOKEN", "git-credentials", "token") {
 			t.Fatal("default GITHUB_TOKEN SecretKeyRef missing")
 		}
+		if optional := secretEnvOptional(pod.Spec.Containers[0].Env, "GITHUB_TOKEN"); optional == nil || !*optional {
+			t.Fatal("default GITHUB_TOKEN projection should remain optional")
+		}
 		if !hasSecretVolume(pod, "claude-credentials", "/tmp/claude-secret") {
 			t.Fatal("default claude-credentials read-only mount missing")
+		}
+		if optional := secretVolumeOptional(pod, "claude-credentials"); optional == nil || !*optional {
+			t.Fatal("default claude-credentials mount should remain optional")
 		}
 	})
 	t.Run("custom categories replace independently", func(t *testing.T) {
@@ -118,6 +142,12 @@ func TestBuildPodSecretProjectionDefaultsAndOverrides(t *testing.T) {
 		}
 		if !hasSecretVolume(pod, "app-auth", "/var/run/app-auth") || hasSecretVolume(pod, "claude-credentials", "/tmp/claude-secret") {
 			t.Fatal("custom mount replacement incorrect")
+		}
+		if optional := secretEnvOptional(pod.Spec.Containers[0].Env, "SERVICE_TOKEN"); optional == nil || *optional {
+			t.Fatal("custom SecretKeyRef should be required")
+		}
+		if optional := secretVolumeOptional(pod, "app-auth"); optional == nil || *optional {
+			t.Fatal("custom Secret volume should be required")
 		}
 	})
 	t.Run("custom env retains default mount", func(t *testing.T) {
@@ -173,15 +203,24 @@ func hasSecretEnvRef(env []corev1.EnvVar, name, secret, key string) bool {
 	for _, item := range env {
 		if item.Name == name && item.Value == "" && item.ValueFrom != nil && item.ValueFrom.SecretKeyRef != nil {
 			ref := item.ValueFrom.SecretKeyRef
-			return ref.Name == secret && ref.Key == key && ref.Optional != nil && *ref.Optional
+			return ref.Name == secret && ref.Key == key
 		}
 	}
 	return false
 }
 
+func secretEnvOptional(env []corev1.EnvVar, name string) *bool {
+	for _, item := range env {
+		if item.Name == name && item.ValueFrom != nil && item.ValueFrom.SecretKeyRef != nil {
+			return item.ValueFrom.SecretKeyRef.Optional
+		}
+	}
+	return nil
+}
+
 func hasSecretVolume(pod *corev1.Pod, secret, mountPath string) bool {
 	for _, volume := range pod.Spec.Volumes {
-		if volume.Secret == nil || volume.Secret.SecretName != secret || volume.Secret.Optional == nil || !*volume.Secret.Optional {
+		if volume.Secret == nil || volume.Secret.SecretName != secret {
 			continue
 		}
 		for _, mount := range pod.Spec.Containers[0].VolumeMounts {
@@ -191,6 +230,15 @@ func hasSecretVolume(pod *corev1.Pod, secret, mountPath string) bool {
 		}
 	}
 	return false
+}
+
+func secretVolumeOptional(pod *corev1.Pod, secret string) *bool {
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Secret != nil && volume.Secret.SecretName == secret {
+			return volume.Secret.Optional
+		}
+	}
+	return nil
 }
 
 func TestBuildPod_NoSchedulingFields_NoBehaviorChange(t *testing.T) {
@@ -345,8 +393,58 @@ func TestBuildPod_AppliesOptionalPodIdentityConfiguration(t *testing.T) {
 	if len(security.SupplementalGroups) != 1 || security.SupplementalGroups[0] != 0 {
 		t.Errorf("pod SupplementalGroups = %v, want [0] while preserving primary GID %d", security.SupplementalGroups, runAsGroup)
 	}
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("staged workspace has %d init containers, want one", len(pod.Spec.InitContainers))
+	}
+	if !hasEmptyDirVolume(pod, "ws") || !containerMountsVolume(pod.Spec.InitContainers[0].VolumeMounts, "ws") {
+		t.Fatal("staged workspace EmptyDir is not mounted in the init container")
+	}
+	if pod.Spec.InitContainers[0].SecurityContext == nil || pod.Spec.InitContainers[0].SecurityContext.RunAsNonRoot == nil || !*pod.Spec.InitContainers[0].SecurityContext.RunAsNonRoot {
+		t.Error("workspace staging init container must retain its restricted non-root security context")
+	}
 	if strings.Contains(strings.Join(pod.Spec.Containers[0].Args, " "), "chown") {
 		t.Error("normal non-legacy pod entrypoint contains runtime chown")
+	}
+}
+
+func TestBuildPod_PreBakedWorkspaceKeepsConfiguredFilesystemIdentity(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	p.prebaked = true
+	runAsUser, runAsGroup, fsGroup := int64(12345), int64(2000), int64(3456)
+	p.podSecurity = PodSecurityConfig{RunAsUser: &runAsUser, RunAsGroup: &runAsGroup, FSGroup: &fsGroup}
+
+	pod, err := buildPod("test-session", perBeadWorkDirConfig(), p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	if len(pod.Spec.InitContainers) != 0 {
+		t.Fatalf("prebaked workspace has %d init containers, want none", len(pod.Spec.InitContainers))
+	}
+	if hasEmptyDirVolume(pod, "ws") {
+		t.Fatal("prebaked workspace unexpectedly has a staged EmptyDir")
+	}
+	security := pod.Spec.SecurityContext
+	if security == nil || security.RunAsUser == nil || *security.RunAsUser != runAsUser ||
+		security.RunAsGroup == nil || *security.RunAsGroup != runAsGroup ||
+		security.FSGroup == nil || *security.FSGroup != fsGroup {
+		t.Fatalf("prebaked pod securityContext = %#v, want configured UID, GID, and fsGroup", security)
+	}
+	if len(security.SupplementalGroups) != 1 || security.SupplementalGroups[0] != 0 {
+		t.Errorf("prebaked pod SupplementalGroups = %v, want [0] for group-owned image descendants", security.SupplementalGroups)
+	}
+}
+
+func TestBuildPodCopiesCredentialStateWithPrivatePermissions(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	pod, err := buildPod("test-session", runtime.Config{Command: "/bin/bash"}, p)
+	if err != nil {
+		t.Fatalf("buildPod: %v", err)
+	}
+	args := strings.Join(pod.Spec.Containers[0].Args, " ")
+	for _, want := range []string{`umask 077`, `chmod 0700 "$HOME/.claude"`, `cp -rL /tmp/claude-secret/. "$HOME/.claude/"`} {
+		if !strings.Contains(args, want) {
+			t.Errorf("entrypoint credential-copy command missing private-state setup %q: %s", want, args)
+		}
 	}
 }
 

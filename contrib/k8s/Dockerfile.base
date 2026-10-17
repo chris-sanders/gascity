@@ -166,6 +166,8 @@ RUN gh --version && dolt version
 # When LINUX_USERNAME is set at runtime, the pod entrypoint creates a dynamic
 # user via useradd and drops privileges via su. gcagent is kept as fallback.
 RUN useradd -m -s /bin/bash gcagent \
+    && chown gcagent:0 /home/gcagent \
+    && chmod 0770 /home/gcagent \
     && echo "gcagent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/gcagent \
     && chmod 0440 /etc/sudoers.d/gcagent
 ENV HOME=/home/gcagent

@@ -316,7 +316,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			linuxUsername,
 		)
 	}
-	credCopy := `mkdir -p $HOME/.claude && cp -rL /tmp/claude-secret/. $HOME/.claude/ 2>/dev/null; git config --global --add safe.directory '*' 2>/dev/null; `
+	credCopy := `umask 077; if [ -d /tmp/claude-secret ]; then mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || true; fi; git config --global --add safe.directory '*' 2>/dev/null || true; `
 	wsWait := ""
 	if !p.prebaked {
 		wsWait = `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
@@ -386,7 +386,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			Name: volumeName, VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName: projection.Secret,
-					Optional:   boolPtr(true),
+					Optional:   boolPtr(defaultSecretMounts),
 				},
 			},
 		})
@@ -629,7 +629,8 @@ func buildPodEnvWithSecretEnv(cfgEnv map[string]string, podWorkDir, managedServi
 		env = append(env, corev1.EnvVar{Name: "CLAUDE_CONFIG_DIR", Value: "/home/gcagent/.claude"})
 	}
 
-	if len(secretEnv) == 0 {
+	defaultSecretEnv := len(secretEnv) == 0
+	if defaultSecretEnv {
 		secretEnv = []runtime.K8sSecretEnv{{Name: "GITHUB_TOKEN", Secret: "git-credentials", Key: "token"}}
 	}
 	for _, projection := range secretEnv {
@@ -639,7 +640,7 @@ func buildPodEnvWithSecretEnv(cfgEnv map[string]string, podWorkDir, managedServi
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: projection.Secret},
 					Key:                  projection.Key,
-					Optional:             boolPtr(true),
+					Optional:             boolPtr(defaultSecretEnv),
 				},
 			},
 		})

@@ -18,11 +18,8 @@ func GenerateDockerfile(baseImage string) []byte {
 ARG BASE=%s
 FROM ${BASE}
 USER root
-COPY workspace/ /workspace/
-# Keep baked workspace content writable to the numeric fallback UID and to an
-# arbitrary non-root UID with the root group. The legacy LINUX_USERNAME path
-# re-chowns its per-bead directory before switching users.
-RUN chown -R 1001:0 /workspace && chmod -R g=u /workspace && touch /workspace/.gc-workspace-ready
+COPY --chown=1001:0 workspace/ /workspace/
+RUN touch /workspace/.gc-workspace-ready
 USER 1001:0
 `
 	return []byte(fmt.Sprintf(tmpl, baseImage))

@@ -81,8 +81,11 @@ func AssembleContext(opts Options) error {
 	}
 
 	wsDir := filepath.Join(opts.OutputDir, "workspace")
-	if err := os.MkdirAll(wsDir, 0o755); err != nil {
+	if err := os.MkdirAll(wsDir, 0o770); err != nil {
 		return fmt.Errorf("creating workspace dir: %w", err)
+	}
+	if err := os.Chmod(wsDir, 0o770); err != nil {
+		return fmt.Errorf("setting workspace root permissions: %w", err)
 	}
 
 	// Copy city directory contents into workspace, excluding runtime state.
@@ -165,7 +168,11 @@ func copyDirFiltered(src, dst string, stderr io.Writer) error {
 		target := filepath.Join(dst, rel)
 
 		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
+			mode := prebakedWorkspaceMode(info.Mode())
+			if err := os.MkdirAll(target, mode); err != nil {
+				return err
+			}
+			return os.Chmod(target, mode)
 		}
 
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -194,11 +201,24 @@ func copyDirFiltered(src, dst string, stderr io.Writer) error {
 			if excludedPath(resolvedRel) || excludedResolvedPath(resolvedRel) {
 				return nil
 			}
-			return copyFile(resolvedPath, target, resolved.Mode())
+			return copyFile(resolvedPath, target, prebakedWorkspaceMode(resolved.Mode()))
 		}
 
-		return copyFile(path, target, info.Mode())
+		return copyFile(path, target, prebakedWorkspaceMode(info.Mode()))
 	})
+}
+
+// prebakedWorkspaceMode makes ordinary workspace entries writable to a pod
+// using the image's root group while keeping owner-only files and directories
+// private. It mirrors owner permissions into group permissions and removes
+// world access without clearing executable bits.
+func prebakedWorkspaceMode(mode os.FileMode) os.FileMode {
+	permissions := mode.Perm()
+	if permissions&0o077 == 0 || permissions&0o700 == 0 {
+		return permissions
+	}
+	owner := permissions & 0o700
+	return owner | owner>>3
 }
 
 func excludedResolvedPath(rel string) bool {
@@ -235,5 +255,8 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		_ = out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(dst, mode.Perm())
 }

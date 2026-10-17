@@ -152,6 +152,29 @@ func TestAgentImageRebuildsBDAndGCWithPatchedGRPC(t *testing.T) {
 	}
 }
 
+func TestK8sAgentHomeSupportsArbitraryUIDWithoutExposingPrivateState(t *testing.T) {
+	root := repoRoot(t)
+	base := readFile(t, root, "contrib/k8s/Dockerfile.base")
+	for _, want := range []string{
+		"chown gcagent:0 /home/gcagent",
+		"chmod 0770 /home/gcagent",
+	} {
+		if !strings.Contains(base, want) {
+			t.Errorf("contrib/k8s/Dockerfile.base missing HOME permission setup %q", want)
+		}
+	}
+	if strings.Contains(base, "chmod -R") {
+		t.Error("HOME permission setup must not recursively chmod private state")
+	}
+	agent := readFile(t, root, "contrib/k8s/Dockerfile.agent")
+	if !strings.Contains(agent, "chmod 0770 /workspace") {
+		t.Error("agent image workspace root must be group-writable without world access")
+	}
+	if strings.Contains(agent, "chmod -R") {
+		t.Error("agent image root permission setup must not recursively chmod descendants")
+	}
+}
+
 func TestMCPMailImagePinsPatchedPythonDependencies(t *testing.T) {
 	root := repoRoot(t)
 	input := readFile(t, root, ".github/requirements/mcp-agent-mail.in")
