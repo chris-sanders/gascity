@@ -364,11 +364,18 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			linuxUsername,
 		)
 	}
-	credCopy := `umask 077; if [ -d /tmp/claude-secret ]; then mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || true; fi; git config --global --add safe.directory '*' 2>/dev/null || true; `
-	wsWait := ""
-	if !p.prebaked {
-		wsWait = `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
+	requiredClaudeSecret := false
+	for _, mount := range p.secretMounts {
+		if mount.MountPath == "/tmp/claude-secret" {
+			requiredClaudeSecret = true
+			break
+		}
 	}
+	credCopy := `umask 077; if [ -d /tmp/claude-secret ]; then mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || true; fi; git config --global --add safe.directory '*' 2>/dev/null || true; `
+	if requiredClaudeSecret {
+		credCopy = `umask 077; if [ -d /tmp/claude-secret ]; then mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || { echo 'gc: required credential copy failed' >&2; exit 1; }; else echo 'gc: required credential mount missing' >&2; exit 1; fi; git config --global --add safe.directory '*' 2>/dev/null || true; `
+	}
+	wsWait := `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
 
 	// The pod spec's WorkingDir names the workspace root, because the kubelet
 	// chdirs into it before this command runs and a per-bead workDir does not

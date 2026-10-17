@@ -172,6 +172,23 @@ func TestBuildPodSecretProjectionDefaultsAndOverrides(t *testing.T) {
 			t.Fatal("custom mount projection removed the default env")
 		}
 	})
+	t.Run("configured Claude credential mount is required", func(t *testing.T) {
+		p := newProviderWithOps(newFakeK8sOps())
+		p.secretMounts = []runtime.K8sSecretMount{{Secret: "required-claude", MountPath: "/tmp/claude-secret"}}
+		pod, err := buildPod("test-session", runtime.Config{Command: "/bin/bash"}, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if optional := secretVolumeOptional(pod, "required-claude"); optional == nil || *optional {
+			t.Fatal("configured Claude credential Secret must be required")
+		}
+		args := strings.Join(pod.Spec.Containers[0].Args, " ")
+		for _, want := range []string{"required credential mount missing", "required credential copy failed"} {
+			if !strings.Contains(args, want) {
+				t.Errorf("entrypoint does not report %q: %s", want, args)
+			}
+		}
+	})
 }
 
 func TestBuildPodRejectsMalformedSecretProjection(t *testing.T) {
@@ -441,7 +458,7 @@ func TestBuildPodCopiesCredentialStateWithPrivatePermissions(t *testing.T) {
 		t.Fatalf("buildPod: %v", err)
 	}
 	args := strings.Join(pod.Spec.Containers[0].Args, " ")
-	for _, want := range []string{`umask 077`, `chmod 0700 "$HOME/.claude"`, `cp -rL /tmp/claude-secret/. "$HOME/.claude/"`} {
+	for _, want := range []string{`umask 077`, `chmod 0700 "$HOME/.claude"`, `cp -rL /tmp/claude-secret/. "$HOME/.claude/"`, `git config --global --add safe.directory '*' 2>/dev/null || true`, `cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || true`} {
 		if !strings.Contains(args, want) {
 			t.Errorf("entrypoint credential-copy command missing private-state setup %q: %s", want, args)
 		}
