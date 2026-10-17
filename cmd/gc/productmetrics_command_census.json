@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 212,
+  "next_id": 213,
   "permanent_ids": [
     {
       "name": "help",
@@ -4023,6 +4023,39 @@
       "classification": "start",
       "owner": "immediate",
       "id": 162
+    },
+    {
+      "path": "gc startup-nudge",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable-group",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "unknown",
+      "canonical_target": "@unknown",
+      "owner": "deferred",
+      "resolver": "group-dispatch",
+      "deferred_default": "unknown",
+      "id": 3
+    },
+    {
+      "path": "gc startup-nudge resolve",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "startup-nudge-resolve",
+      "owner": "immediate",
+      "id": 212
     },
     {
       "path": "gc status",

@@ -221,7 +221,8 @@
               "beads-city-migrate-proxied",
               "storage-repair-sequence",
               "runtime-workdir-export",
-              "agent-is-foreign"
+              "agent-is-foreign",
+              "startup-nudge-resolve"
             ]
           },
           "event_id": {

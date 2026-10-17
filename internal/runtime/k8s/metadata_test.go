@@ -454,6 +454,70 @@ func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.
 	}
 }
 
+func TestK8sRelaunchIdentityReadPreservesNewGenerationWhenSessionIDMatchesGlobal(t *testing.T) {
+	ops, run := newTmuxMetadataTestOps(t, "worker")
+	city := t.TempDir()
+	t.Setenv("GC_CITY_PATH", city)
+	oldEnv := map[string]string{
+		"GC_SESSION_ID":         "stable-session",
+		"GC_INSTANCE_TOKEN":     "pod-instance",
+		"GC_RUNTIME_EPOCH":      "pod-runtime-epoch",
+		"GC_CONTINUATION_EPOCH": "pod-continuation-epoch",
+		"GC_PROVIDER":           "claude",
+	}
+	for key, value := range oldEnv {
+		t.Setenv(key, value)
+	}
+	if _, err := run("set-environment", "-g", "GC_SESSION_ID", "stable-session"); err != nil {
+		t.Fatalf("set matching global session ID: %v", err)
+	}
+	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
+		t.Fatalf("create warm tmux session: %v", err)
+	}
+
+	p := newProviderWithOps(ops)
+	p.cityPath = city
+	p.postStartSettle = 0
+	if err := p.seedStartMetadata(context.Background(), "worker", "worker", oldEnv); err != nil {
+		t.Fatalf("seed pod-creation identity: %v", err)
+	}
+	newEnv := map[string]string{
+		"GC_SESSION_ID":         "stable-session",
+		"GC_INSTANCE_TOKEN":     "relaunched-instance",
+		"GC_RUNTIME_EPOCH":      "relaunched-runtime-epoch",
+		"GC_CONTINUATION_EPOCH": "relaunched-continuation-epoch",
+		"GC_PROVIDER":           "codex",
+	}
+	if err := p.Relaunch(context.Background(), "worker", runtime.Config{Command: "sleep 300", Env: newEnv}); err != nil {
+		t.Fatalf("warm Relaunch: %v", err)
+	}
+
+	if got, err := p.GetMeta("worker", "GC_SESSION_ID"); err != nil || got != "stable-session" {
+		t.Fatalf("identity after relaunch GetMeta(GC_SESSION_ID) = %q, %v; want stable-session", got, err)
+	}
+	for key, want := range map[string]string{
+		"GC_INSTANCE_TOKEN":     "relaunched-instance",
+		"BEADS_HOLDER_TOKEN":    "relaunched-instance",
+		"GC_RUNTIME_EPOCH":      "relaunched-runtime-epoch",
+		"GC_CONTINUATION_EPOCH": "relaunched-continuation-epoch",
+		"GC_PROVIDER":           "codex",
+	} {
+		got, err := p.GetMeta("worker", key)
+		if err != nil || got != want {
+			t.Fatalf("identity after relaunch GetMeta(%s) = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	marker, err := run("show-environment", "-h", "-t", tmuxSession, identityMetadataVersionKey)
+	if err != nil || strings.TrimSpace(marker) != identityMetadataVersionKey+"="+identityMetadataVersion {
+		t.Fatalf("current identity marker = %q, %v", marker, err)
+	}
+	for _, call := range ops.calls {
+		if strings.Contains(strings.Join(call.cmd, " "), `printenv "$1"`) {
+			t.Fatal("current relaunch identity triggered legacy container-environment backfill")
+		}
+	}
+}
+
 func TestControllerPrivateMetadataIsDurableAndOutsidePod(t *testing.T) {
 	city := t.TempDir()
 	t.Setenv("GC_CITY_PATH", city)

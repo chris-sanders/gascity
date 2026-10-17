@@ -22,6 +22,7 @@ func TestClassifyProductMetricsCommandCanonicalMatrix(t *testing.T) {
 		{name: "bare root", args: nil, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},
 		{name: "deferred help group", args: []string{"analyze"}, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},
 		{name: "deferred unknown group", args: []string{"agent"}, wantID: productMetricsCommandUnknown, recording: productMetricsRecordingRecordable},
+		{name: "startup nudge resolve", args: []string{"startup-nudge", "resolve"}, wantID: productMetricsGeneratedCommandID212, recording: productMetricsRecordingRecordable},
 		{name: "target help", args: []string{"session", "peek", "--help"}, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},
 		{name: "help after positional", args: []string{"session", "peek", "private-value", "--help"}, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},
 		{name: "help after terminator is data", args: []string{"session", "peek", "--", "--help"}, wantID: productMetricsGeneratedCommandID147, recording: productMetricsRecordingRecordable},
@@ -97,6 +98,27 @@ func TestClassifyProductMetricsCommandCanonicalMatrix(t *testing.T) {
 				t.Fatalf("classification = %+v, want id=%d recording=%q", got, test.wantID, test.recording)
 			}
 		})
+	}
+}
+
+func TestClassifyStartupNudgeResolutionDoesNotRecordIntentValues(t *testing.T) {
+	root := newRootCmdWithOptions(io.Discard, io.Discard, rootCommandOptions{})
+	args := []string{
+		"startup-nudge", "resolve",
+		"--city-path", "/private/city",
+		"--intent", "private-intent-id",
+		"--incarnation", "private-session-incarnation",
+		"--decision", "retry",
+	}
+	got := classifyProductMetricsCommand(root, args, productMetricsPolicyContext{})
+	if got.ID != productMetricsGeneratedCommandID212 || got.Recording != productMetricsRecordingRecordable || got.Notice != productMetricsNoticeEligible {
+		t.Fatalf("startup-nudge classification = %+v, want its static recordable command identity", got)
+	}
+	formatted := fmt.Sprintf("%+v", got)
+	for _, privateValue := range []string{"/private/city", "private-intent-id", "private-session-incarnation", "retry"} {
+		if strings.Contains(formatted, privateValue) {
+			t.Fatalf("startup-nudge classification leaked private argument %q", privateValue)
+		}
 	}
 }
 

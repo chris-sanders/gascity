@@ -24,9 +24,11 @@ import (
 )
 
 const (
-	k8sMetaReadMissing = 44
-	k8sMetaOpTimeout   = 15 * time.Second
-	identityUnboundKey = "__gc_identity_unbound"
+	k8sMetaReadMissing         = 44
+	k8sMetaOpTimeout           = 15 * time.Second
+	identityUnboundKey         = "__gc_identity_unbound"
+	identityMetadataVersionKey = "__gc_k8s_identity_metadata_version"
+	identityMetadataVersion    = "1"
 )
 
 func processCityPath() string {
@@ -191,7 +193,7 @@ func (p *Provider) publishSessionMetadata(ctx context.Context, podName, sessionN
 }
 
 func sessionMetadataCommands(env map[string]string, publishIdentity, publishRuntimeOwner, clearProtocol bool) string {
-	lines := make([]string, 0, len(orderedSessionIdentityKeys)*2+len(runtimeOwnerEnvKeys)+len(protocolMetadataKeys))
+	lines := make([]string, 0, len(orderedSessionIdentityKeys)*2+len(runtimeOwnerEnvKeys)+len(protocolMetadataKeys)+1)
 	if publishIdentity {
 		for _, key := range orderedSessionIdentityKeys {
 			lines = append(lines, tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", key))
@@ -233,6 +235,10 @@ func sessionMetadataCommands(env map[string]string, publishIdentity, publishRunt
 		if sessionID := env["GC_SESSION_ID"]; sessionID != "" {
 			lines = append(lines, tmuxMetadataCommand("set-environment", "-t", tmuxSession, "GC_SESSION_ID", sessionID))
 		}
+		// This hidden, session-scoped marker distinguishes identity written by
+		// the current protocol from legacy values inherited from tmux globals.
+		// Keep it last so it certifies the whole identity publication.
+		lines = append(lines, tmuxMetadataCommand("set-environment", "-h", "-t", tmuxSession, identityMetadataVersionKey, identityMetadataVersion))
 	}
 	if len(lines) == 0 {
 		return ""
@@ -593,10 +599,11 @@ func syncControllerMetadataDir(root string) error {
 	return dir.Sync()
 }
 
-// getMetaFromPod reads an allowlisted shared value from tmux. Existing pods
-// predating the metadata allowlist are repaired from their container's own
+// getMetaFromPod reads an allowlisted shared value from tmux. Legacy pods
+// without an identity-version marker are repaired from their container's own
 // environment when the session key is absent or still inherited from tmux's
-// global environment.
+// global environment. Current identity publications remain authoritative even
+// when GC_SESSION_ID happens to equal the global value.
 func (p *Provider) getMetaFromPod(ctx context.Context, podName, name, key string) (string, error) {
 	if !metadataKeyPattern.MatchString(key) || !isTmuxMetadataKey(key) {
 		return "", fmt.Errorf("invalid shared metadata key")
@@ -646,20 +653,45 @@ func (p *Provider) getMetaFromPod(ctx context.Context, podName, name, key string
 	if globalErr == nil {
 		globalValue, removed, parseErr := parseTmuxMetadataOutput(global, key)
 		if parseErr == nil && !removed && globalValue == value {
-			if err := p.backfillMetadataFromPodEnv(ctx, podName, name, key); err != nil {
-				return "", err
+			legacyIdentity := true
+			if classifyMetadataKey(key) == metadataIdentity {
+				current, markerErr := p.hasCurrentIdentityMetadataVersion(ctx, podName)
+				if markerErr != nil {
+					return "", fmt.Errorf("k8s verify identity metadata version for session %q failed", name)
+				}
+				legacyIdentity = !current
 			}
-			output, err = read()
-			if err != nil {
-				return "", fmt.Errorf("k8s read repaired metadata key %q for session %q: %w", key, name, err)
-			}
-			value, _, err = parseTmuxMetadataOutput(output, key)
-			if err != nil {
-				return "", fmt.Errorf("k8s read repaired metadata key %q for session %q: %w", key, name, err)
+			if legacyIdentity {
+				if err := p.backfillMetadataFromPodEnv(ctx, podName, name, key); err != nil {
+					return "", err
+				}
+				output, err = read()
+				if err != nil {
+					return "", fmt.Errorf("k8s read repaired metadata key %q for session %q: %w", key, name, err)
+				}
+				value, _, err = parseTmuxMetadataOutput(output, key)
+				if err != nil {
+					return "", fmt.Errorf("k8s read repaired metadata key %q for session %q: %w", key, name, err)
+				}
 			}
 		}
 	}
 	return value, nil
+}
+
+func (p *Provider) hasCurrentIdentityMetadataVersion(ctx context.Context, podName string) (bool, error) {
+	output, err := p.execTmuxMetadataRead(ctx, podName, "show-environment", "-h", "-t", tmuxSession, identityMetadataVersionKey)
+	if err != nil {
+		if isExecExitStatus(err, 1) {
+			return false, nil
+		}
+		return false, err
+	}
+	value, explicitlyRemoved, err := parseTmuxMetadataOutput(output, identityMetadataVersionKey)
+	if err != nil {
+		return false, err
+	}
+	return !explicitlyRemoved && value == identityMetadataVersion, nil
 }
 
 func (p *Provider) backfillMetadataFromPodEnv(ctx context.Context, podName, name, requestedKey string) error {
