@@ -786,10 +786,16 @@ func (p *Provider) recoverStartupNudges(ctx context.Context, sessionName, expect
 				state = startupNudgeState{Status: "recovery_error", Reason: "startup nudge delivery failed without a readable checkpoint"}
 			}
 		case startupNudgePasting, startupNudgeTyped, startupNudgeSubmitting:
+			priorRevision := state.Revision
 			resumeErr := resumeStartupNudgeSubmission(intentCtx, p, &intent, state)
 			state, stateErr = p.loadStartupNudgeState(intentCtx, &intent)
 			if stateErr != nil {
 				state = startupNudgeState{Status: startupNudgeUncertain, Reason: "startup nudge recovery checkpoint is unreadable"}
+			} else if state.Revision != priorRevision {
+				// A checkpoint written during recovery is a durable state
+				// transition that must reach the controller event stream. The
+				// event acknowledgement happens only after that append succeeds.
+				changed = true
 			}
 			if resumeErr != nil && state.Status != startupNudgeUncertain {
 				state.Status, state.Reason = startupNudgeUncertain, "startup nudge composer could not be safely resumed"

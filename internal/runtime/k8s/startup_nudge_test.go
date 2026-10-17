@@ -369,6 +369,9 @@ func TestStartupNudgeDeliveryUsesPersistedProviderAndFencesPaneGeneration(t *tes
 	if len(recovered) != 1 || recovered[0].Status != startupNudgeSubmitted || !recovered[0].Changed {
 		t.Fatalf("first submitted-state scan = %+v; want one durable transport-submitted event", recovered)
 	}
+	if err := p.AcknowledgeStartupNudgeEvent(context.Background(), "worker", intent.ID, recovered[0].CheckpointRevision); err != nil {
+		t.Fatalf("acknowledge appended transport-submitted event: %v", err)
+	}
 	if recovered = p.RecoverStartupNudgesForSession(context.Background(), "worker"); len(recovered) != 0 {
 		t.Fatalf("second submitted-state scan = %+v; want no duplicate event", recovered)
 	}
