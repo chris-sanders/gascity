@@ -219,7 +219,7 @@ func Catalog() []Entry {
 		builtin(
 			"k8s", "exact:k8s", nil,
 			waivedRuntime(
-repoSymbol("cmd/gc", "k8sProviderFromSession"),
+\t\t\t\trepoSymbol("cmd/gc", "k8sProviderFromSession"),
 				time.Date(2026, time.November, 12, 0, 0, 0, 0, time.UTC),
 				"no runnable harness proves k8sProviderFromSession() against a live Kubernetes API plus pod exec lifecycle; fake K8s ops cover secret projection and pod identity configuration, and no kind/integration-tagged harness exists in internal/runtime/k8s",
 			),
