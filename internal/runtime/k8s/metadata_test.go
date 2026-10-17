@@ -526,14 +526,17 @@ func TestK8sLegacyRelaunchIdentityReadPreservesNewGenerationWhenSessionIDMatches
 
 func TestK8sRuntimeOwnerBackfillPreservesExistingAndFillsMissingValues(t *testing.T) {
 	ops, run := newTmuxMetadataTestOps(t, "worker")
-	t.Setenv("GC_CITY_PATH", "/pod-creation/city")
-	t.Setenv("GT_PROCESS_NAMES", "claude,codex")
 	if _, err := run("set-environment", "-g", "GC_CITY_PATH", "/session/city"); err != nil {
 		t.Fatalf("set global runtime-owner path: %v", err)
 	}
 	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
 		t.Fatalf("create legacy tmux session: %v", err)
 	}
+	if _, err := run("set-environment", "-t", tmuxSession, "GC_CITY_PATH", "/session/city"); err != nil {
+		t.Fatalf("set existing session runtime-owner path: %v", err)
+	}
+	t.Setenv("GC_CITY_PATH", "/pod-creation/city")
+	t.Setenv("GT_PROCESS_NAMES", "claude,codex")
 	p := newProviderWithOps(ops)
 	p.cityPath = t.TempDir()
 
