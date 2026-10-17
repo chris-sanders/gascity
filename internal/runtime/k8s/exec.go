@@ -8,11 +8,15 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // k8sOps abstracts Kubernetes API calls for testability.
@@ -31,6 +35,42 @@ type realK8sOps struct {
 	clientset  kubernetes.Interface
 	restConfig *rest.Config
 	namespace  string
+}
+
+// execTmuxOwner runs controller commands as the account that owns the pod's
+// tmux server. Ordinary Pods already execute as their configured container
+// identity; the legacy LINUX_USERNAME path starts tmux after su and must use
+// the same login user for every later tmux command.
+func (p *Provider) execTmuxOwner(ctx context.Context, pod, container string, cmd []string, stdin io.Reader) (string, error) {
+	ownerCommand, err := p.tmuxOwnerCommand(ctx, pod, container, cmd)
+	if err != nil {
+		return "", err
+	}
+	return p.ops.execInPod(ctx, pod, container, ownerCommand, stdin)
+}
+
+func (p *Provider) tmuxOwnerCommand(ctx context.Context, pod, container string, cmd []string) ([]string, error) {
+	podSpec, err := p.ops.getPod(ctx, pod)
+	if err != nil {
+		return nil, err
+	}
+	username := ""
+	for _, candidate := range podSpec.Spec.Containers {
+		if candidate.Name != container {
+			continue
+		}
+		for _, env := range candidate.Env {
+			if env.Name == "LINUX_USERNAME" {
+				username = strings.TrimSpace(env.Value)
+				break
+			}
+		}
+		break
+	}
+	if username == "" {
+		return cmd, nil
+	}
+	return []string{"su", "-", username, "-c", shellquote.Join(cmd)}, nil
 }
 
 func (r *realK8sOps) createPod(ctx context.Context, pod *corev1.Pod) (*corev1.Pod, error) {
@@ -120,6 +160,7 @@ type fakeCall struct {
 	container string
 	cmd       []string
 	selector  string
+	stdin     []byte
 }
 
 func newFakeK8sOps() *fakeK8sOps {
@@ -141,6 +182,9 @@ func (f *fakeK8sOps) createPod(_ context.Context, pod *corev1.Pod) (*corev1.Pod,
 	}
 	p := pod.DeepCopy()
 	p.Status.Phase = corev1.PodRunning
+	if p.UID == "" {
+		p.UID = types.UID("test-generation-" + pod.Name)
+	}
 	f.pods[pod.Name] = p
 	return p, nil
 }
@@ -152,7 +196,7 @@ func (f *fakeK8sOps) getPod(_ context.Context, name string) (*corev1.Pod, error)
 	}
 	p, ok := f.pods[name]
 	if !ok {
-		return nil, fmt.Errorf("pod %q not found", name)
+		return nil, apierrors.NewNotFound(corev1.Resource("pods"), name)
 	}
 	return p.DeepCopy(), nil
 }
@@ -182,8 +226,12 @@ func (f *fakeK8sOps) listPods(_ context.Context, selector string, fieldSelector 
 	return result, nil
 }
 
-func (f *fakeK8sOps) execInPod(_ context.Context, pod, container string, cmd []string, _ io.Reader) (string, error) {
-	f.calls = append(f.calls, fakeCall{method: "execInPod", pod: pod, container: container, cmd: cmd})
+func (f *fakeK8sOps) execInPod(_ context.Context, pod, container string, cmd []string, stdin io.Reader) (string, error) {
+	call := fakeCall{method: "execInPod", pod: pod, container: container, cmd: cmd}
+	if stdin != nil {
+		call.stdin, _ = io.ReadAll(stdin)
+	}
+	f.calls = append(f.calls, call)
 	if f.execFunc != nil {
 		return f.execFunc(pod, cmd)
 	}

@@ -34,6 +34,7 @@ var (
 // HTTP/2 connections. Pod manifests are compatible with gc-session-k8s.
 type Provider struct {
 	ops                k8sOps
+	cityPath           string // controller-owned metadata root
 	namespace          string
 	image              string
 	k8sContext         string
@@ -654,50 +655,144 @@ func (p *Provider) RunLive(_ string, _ runtime.Config) error {
 	return nil
 }
 
-// SetMeta stores a key-value pair in the tmux environment.
+// SetMeta stores shared identity/protocol values in the tmux environment and
+// controller-private values in the private metadata store. Shared values are
+// written through stdin-backed source files so capabilities never enter argv.
 func (p *Provider) SetMeta(name, key, value string) error {
-	ctx := context.Background()
-	podName, err := p.findPod(ctx, name)
-	if err != nil {
-		return nil // best-effort
+	ctx, cancel := context.WithTimeout(context.Background(), k8sMetaOpTimeout)
+	defer cancel()
+	if !isTmuxMetadataKey(key) {
+		return p.setPrivateMetadata(ctx, name, key, value)
 	}
-	_, _ = p.ops.execInPod(ctx, podName, "agent",
-		[]string{"tmux", "set-environment", "-t", tmuxSession, key, value}, nil)
+	var releaseGeneration func()
+	if classifyMetadataKey(key) == metadataIdentity {
+		var err error
+		releaseGeneration, err = p.acquireControllerGenerationLock(ctx, name)
+		if err != nil {
+			return fmt.Errorf("k8s set identity metadata for session %q: generation fence unavailable", name)
+		}
+		defer releaseGeneration()
+	}
+	podName, err := p.findRunningPod(ctx, name)
+	if err != nil {
+		return fmt.Errorf("k8s set metadata key %q for session %q: %w", key, name, err)
+	}
+	commands, err := p.sharedMetadataSetCommands(ctx, podName, name, key, value)
+	if err != nil {
+		return err
+	}
+	if err := p.sourcePrivateTmuxFile(ctx, podName, commands); err != nil {
+		return fmt.Errorf("k8s set shared metadata key %q for session %q failed", key, name)
+	}
 	return nil
 }
 
-// GetMeta retrieves a metadata value from the tmux environment.
-func (p *Provider) GetMeta(name, key string) (string, error) {
-	ctx := context.Background()
-	podName, err := p.findPod(ctx, name)
-	if err != nil {
-		return "", nil
+func (p *Provider) sharedMetadataSetCommands(ctx context.Context, podName, name, key, value string) (string, error) {
+	class := classifyMetadataKey(key)
+	if class == metadataIdentity && key == "GC_SESSION_ID" {
+		token, err := p.getMetaFromPod(ctx, podName, name, "GC_INSTANCE_TOKEN")
+		if err != nil {
+			return "", fmt.Errorf("k8s set session identity for %q failed: runtime token could not be read", name)
+		}
+		commands := tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "GC_SESSION_ID") + "\n"
+		if token != "" {
+			commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, "BEADS_HOLDER_TOKEN", token) + "\n"
+		}
+		if value != "" {
+			commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value) + "\n"
+		}
+		return commands, nil
 	}
-	output, err := p.ops.execInPod(ctx, podName, "agent",
-		[]string{"tmux", "show-environment", "-t", tmuxSession, key}, nil)
-	if err != nil {
-		return "", nil
+	if class == metadataIdentity && key == "BEADS_HOLDER_TOKEN" {
+		instanceToken, err := p.getMetaFromPod(ctx, podName, name, "GC_INSTANCE_TOKEN")
+		if err != nil {
+			return "", fmt.Errorf("k8s set holder metadata for session %q failed: runtime identity could not be read", name)
+		}
+		if instanceToken == "" {
+			return "", fmt.Errorf("k8s set holder metadata for session %q failed: runtime identity is absent", name)
+		}
+		value = instanceToken
 	}
-	output = strings.TrimSpace(output)
-	// tmux output: "KEY=VALUE" (set), "-KEY" (unset).
-	if strings.HasPrefix(output, "-") {
-		return "", nil // explicitly unset
+	if class == metadataIdentity && key == "GC_INSTANCE_TOKEN" {
+		sessionID, err := p.getMetaFromPod(ctx, podName, name, "GC_SESSION_ID")
+		if err != nil {
+			return "", fmt.Errorf("k8s set runtime identity for session %q failed: session identity could not be read", name)
+		}
+		commands := tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "GC_SESSION_ID") + "\n"
+		if value == "" {
+			commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "GC_INSTANCE_TOKEN") + "\n"
+			commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "BEADS_HOLDER_TOKEN") + "\n"
+			return commands, nil
+		}
+		commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value) + "\n"
+		commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, "BEADS_HOLDER_TOKEN", value) + "\n"
+		if sessionID != "" {
+			commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, "GC_SESSION_ID", sessionID) + "\n"
+		}
+		return commands, nil
 	}
-	if _, val, ok := strings.Cut(output, "="); ok {
-		return val, nil
+	if class != metadataControllerPrivate && value == "" {
+		return tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", key) + "\n", nil
 	}
-	return "", nil
+	return tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value) + "\n", nil
 }
 
-// RemoveMeta removes a metadata key from the tmux environment.
-func (p *Provider) RemoveMeta(name, key string) error {
-	ctx := context.Background()
-	podName, err := p.findPod(ctx, name)
-	if err != nil {
-		return nil // best-effort
+// GetMeta retrieves identity and interoperable protocol values from tmux;
+// controller-private metadata is stored separately.
+func (p *Provider) GetMeta(name, key string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), k8sMetaOpTimeout)
+	defer cancel()
+	if !isTmuxMetadataKey(key) {
+		return p.getPrivateMetadata(ctx, name, key)
 	}
-	_, _ = p.ops.execInPod(ctx, podName, "agent",
-		[]string{"tmux", "set-environment", "-t", tmuxSession, "-u", key}, nil)
+	var releaseGeneration func()
+	if classifyMetadataKey(key) == metadataIdentity {
+		var err error
+		releaseGeneration, err = p.acquireControllerGenerationLock(ctx, name)
+		if err != nil {
+			return "", fmt.Errorf("k8s read identity metadata for session %q: generation fence unavailable", name)
+		}
+		defer releaseGeneration()
+	}
+	podName, err := p.findRunningPod(ctx, name)
+	if err != nil {
+		return "", fmt.Errorf("k8s read metadata key %q for session %q: %w", key, name, err)
+	}
+	return p.getMetaFromPod(ctx, podName, name, key)
+}
+
+// RemoveMeta clears a shared key with tmux's removal marker, so no global pod
+// environment value can resurrect stale identity or protocol state.
+func (p *Provider) RemoveMeta(name, key string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), k8sMetaOpTimeout)
+	defer cancel()
+	if !isTmuxMetadataKey(key) {
+		return p.removePrivateMetadata(ctx, name, key)
+	}
+	var releaseGeneration func()
+	if classifyMetadataKey(key) == metadataIdentity {
+		var err error
+		releaseGeneration, err = p.acquireControllerGenerationLock(ctx, name)
+		if err != nil {
+			return fmt.Errorf("k8s remove identity metadata for session %q: generation fence unavailable", name)
+		}
+		defer releaseGeneration()
+	}
+	podName, err := p.findRunningPod(ctx, name)
+	if err != nil {
+		return fmt.Errorf("k8s remove metadata key %q for session %q: %w", key, name, err)
+	}
+	keys := []string{key}
+	if key == "GC_INSTANCE_TOKEN" || key == "BEADS_HOLDER_TOKEN" {
+		keys = []string{"GC_SESSION_ID", "GC_INSTANCE_TOKEN", "BEADS_HOLDER_TOKEN"}
+	}
+	lines := make([]string, 0, len(keys))
+	for _, removeKey := range keys {
+		lines = append(lines, tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", removeKey))
+	}
+	if err := p.sourcePrivateTmuxFile(ctx, podName, strings.Join(lines, "\n")+"\n"); err != nil {
+		return fmt.Errorf("k8s remove metadata key %q for session %q failed", key, name)
+	}
 	return nil
 }
 
@@ -746,7 +841,7 @@ func (p *Provider) GetLastActivity(name string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, nil
 	}
-	output, err := p.ops.execInPod(ctx, podName, "agent",
+	output, err := p.execTmuxOwner(ctx, podName, "agent",
 		[]string{"tmux", "display-message", "-t", tmuxSession, "-p", "#{session_activity}"}, nil)
 	if err != nil {
 		return time.Time{}, nil
@@ -831,7 +926,7 @@ func (p *Provider) probeTmuxLiveness(ctx context.Context, pod *corev1.Pod) (aliv
 	}
 	podName := pod.Name
 	for attempt := 0; attempt < livenessProbeAttempts; attempt++ {
-		_, err = p.ops.execInPod(ctx, podName, "agent",
+		_, err = p.execTmuxOwner(ctx, podName, "agent",
 			[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
 		if err == nil {
 			return true, true, nil
