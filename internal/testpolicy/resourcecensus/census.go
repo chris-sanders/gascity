@@ -169,12 +169,27 @@ func scopeContains(scope Scope, occurrence Occurrence) bool {
 	}
 }
 
-// TrackedGoFiles lists every git-tracked *.go file under root, repository-
-// relative with forward slashes. Listing tracked files rather than walking the
-// filesystem means an untracked nested git worktree checked out under root —
-// the common gitignored worktrees/<bead> pool-slot pattern — contributes
-// nothing: its files live in that worktree's own index, never this one's.
+// TrackedGoFiles lists every git-tracked *.go file under a repository root,
+// repository-relative with forward slashes. Listing tracked files rather than
+// walking the filesystem means an untracked nested git worktree checked out
+// under root — the common gitignored worktrees/<bead> pool-slot pattern —
+// contributes nothing: its files live in that worktree's own index, never this
+// one's. A Bazel runfiles root may sit below an enclosing git checkout, so only
+// use the index when root itself is that worktree's top level.
 func TrackedGoFiles(root string) ([]string, error) {
+	gitRoot, err := exec.Command("git", "-C", root, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		// Bazel runfiles trees carry no .git; walk the declared source tree
+		// so census consumers stay effective under `bazel test`.
+		return walkedTrackedGoFiles(root), nil
+	}
+	rootAbs, rootErr := filepath.Abs(root)
+	gitRootAbs, gitRootErr := filepath.Abs(strings.TrimSpace(string(gitRoot)))
+	if rootErr != nil || gitRootErr != nil || filepath.Clean(rootAbs) != filepath.Clean(gitRootAbs) {
+		// A nested runfiles tree can discover the enclosing checkout's index,
+		// which has no entries for the runfiles paths. Scan its declared tree.
+		return walkedTrackedGoFiles(root), nil
+	}
 	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "--", "*.go")
 	out, err := cmd.Output()
 	if err != nil {

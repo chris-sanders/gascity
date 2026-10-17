@@ -17,6 +17,7 @@ func newStartupNudgeDeliveryCheck(cityPath string) *startupNudgeDeliveryCheck {
 func (*startupNudgeDeliveryCheck) Name() string                     { return "startup-nudge-delivery" }
 func (*startupNudgeDeliveryCheck) CanFix() bool                     { return false }
 func (*startupNudgeDeliveryCheck) Fix(_ *doctor.CheckContext) error { return nil }
+func (*startupNudgeDeliveryCheck) WarmupEligible() bool             { return false }
 
 func (c *startupNudgeDeliveryCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	diagnostics, err := k8s.StartupNudgeDiagnostics(c.cityPath)

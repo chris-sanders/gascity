@@ -56,7 +56,7 @@ func decodedAgentCommandChunks(t *testing.T, args []string, firstChunk int, cfg 
 	return chunks
 }
 
-func decodedRespawnAgentCommand(t *testing.T, args []string, cfg runtime.Config) string {
+func decodedRespawnAgentCommand(t *testing.T, args []string, cfg runtime.Config) {
 	t.Helper()
 	commandArgs := args
 	if len(args) >= 5 && args[0] == "su" && args[1] == "-" {
@@ -81,7 +81,6 @@ func decodedRespawnAgentCommand(t *testing.T, args []string, cfg runtime.Config)
 	if !strings.Contains(string(decoded), want) {
 		t.Fatalf("respawn payload does not launch the configured agent command %q: %s", want, decoded)
 	}
-	return string(decoded)
 }
 
 func TestAgentCommandIncludesPromptAsPositionalArg(t *testing.T) {

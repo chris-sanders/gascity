@@ -49,6 +49,7 @@ type startupNudgeIntent struct {
 
 type startupNudgeState struct {
 	IntentID              string    `json:"intent_id"`
+	Revision              uint64    `json:"revision"`
 	Status                string    `json:"status"`
 	Progress              string    `json:"progress,omitempty"`
 	Reason                string    `json:"reason,omitempty"`
@@ -104,7 +105,7 @@ func (p *Provider) persistStartupNudgeIntent(ctx context.Context, name string, c
 		CreatedAt:         time.Now().UTC(),
 	}
 	intentKey := startupNudgeIntentKey(intent.ID)
-	state := startupNudgeState{IntentID: intent.ID, Status: startupNudgeUnsent, UpdatedAt: time.Now().UTC()}
+	state := startupNudgeState{IntentID: intent.ID, Revision: 1, Status: startupNudgeUnsent, UpdatedAt: time.Now().UTC()}
 	intentData, err := json.Marshal(intent)
 	if err != nil {
 		return nil, errors.New("startup nudge intent could not be encoded")
@@ -180,6 +181,7 @@ func (p *Provider) updateStartupNudgeState(ctx context.Context, intent *startupN
 	state.IntentID = intent.ID
 	state.UpdatedAt = time.Now().UTC()
 	if prior, err := p.loadStartupNudgeState(ctx, intent); err == nil {
+		state.Revision = prior.Revision + 1
 		if state.OperatorAction == "" {
 			state.OperatorAction = prior.OperatorAction
 		}
@@ -189,6 +191,8 @@ func (p *Provider) updateStartupNudgeState(ctx context.Context, intent *startupN
 		if state.OperatorAt.IsZero() {
 			state.OperatorAt = prior.OperatorAt
 		}
+	} else if state.Revision == 0 {
+		state.Revision = 1
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
@@ -668,6 +672,46 @@ func (p *Provider) RecoverStartupNudgesForLeasedSession(ctx context.Context, ses
 	return p.recoverStartupNudges(ctx, sessionName, sessionID)
 }
 
+// AcknowledgeStartupNudgeEvent closes the report-pending checkpoint only
+// after the controller has appended the matching durable event.
+func (p *Provider) AcknowledgeStartupNudgeEvent(ctx context.Context, sessionName, intentID string, revision uint64) error {
+	if ctx == nil || strings.TrimSpace(sessionName) == "" || len(intentID) != 32 || revision == 0 {
+		return runtime.ErrStartupNudgeCheckpointUnavailable
+	}
+	if _, err := hex.DecodeString(intentID); err != nil {
+		return runtime.ErrStartupNudgeCheckpointUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	release, err := p.acquireControllerGenerationLock(ctx, sessionName)
+	if err != nil {
+		return fmt.Errorf("startup nudge event acknowledgement generation fence unavailable")
+	}
+	defer release()
+	root, err := controllerMetadataRoot(p.cityPath)
+	if err != nil {
+		return runtime.ErrStartupNudgeCheckpointUnavailable
+	}
+	path := controllerMetadataValuePath(root, sessionName, startupNudgeIntentKey(intentID))
+	intent, err := readStartupNudgeIntent(path)
+	if err != nil || !validStartupNudgeIntent(intent) || intent.SessionName != sessionName || intent.ID != intentID {
+		return runtime.ErrStartupNudgeCheckpointUnavailable
+	}
+	state, err := p.loadStartupNudgeState(ctx, &intent)
+	if err != nil {
+		return runtime.ErrStartupNudgeCheckpointUnavailable
+	}
+	if state.Reported {
+		return nil
+	}
+	if state.Revision != revision {
+		return runtime.ErrStartupNudgeCheckpointUnavailable
+	}
+	state.Reported = true
+	return p.updateStartupNudgeState(ctx, &intent, state)
+}
+
 func (p *Provider) recoverStartupNudges(ctx context.Context, sessionName, expectedSessionID string) []runtime.StartupNudgeStatus {
 	if ctx == nil {
 		ctx = context.Background()
@@ -705,19 +749,26 @@ func (p *Provider) recoverStartupNudges(ctx context.Context, sessionName, expect
 		state, stateErr := p.loadStartupNudgeState(intentCtx, &intent)
 		if stateErr != nil {
 			state = startupNudgeState{Status: startupNudgeUncertain, Reason: "startup nudge checkpoint is unreadable"}
-			_ = p.updateStartupNudgeState(intentCtx, &intent, state)
+			changed := false
+			if err := p.updateStartupNudgeState(intentCtx, &intent, state); err == nil {
+				changed = true
+			} else {
+				state.Reason = "startup nudge checkpoint is unreadable and uncertainty could not be persisted"
+			}
+			state = p.reportableStartupNudgeState(intentCtx, &intent, state, &changed)
 			release()
 			cancel()
-			reports = append(reports, nudgeReport(intent, state, true))
+			reports = append(reports, nudgeReport(intent, state, changed))
 			continue
 		}
 		if expectedSessionID != "" && intent.SessionID != expectedSessionID {
 			reason := "session_row_incarnation_mismatch"
 			changed := state.Status != startupNudgeUncertain || state.Reason != reason || !state.Reported
-			state.Status, state.Reason, state.Reported = startupNudgeUncertain, reason, true
+			state.Status, state.Reason, state.Reported = startupNudgeUncertain, reason, false
 			if err := p.updateStartupNudgeState(intentCtx, &intent, state); err != nil {
-				state.Reason = "session row incarnation mismatch; uncertainty could not be persisted"
+				state.Status, state.Reason, changed = startupNudgeUncertain, "session row incarnation mismatch; uncertainty could not be persisted", false
 			}
+			state = p.reportableStartupNudgeState(intentCtx, &intent, state, &changed)
 			release()
 			cancel()
 			reports = append(reports, nudgeReport(intent, state, changed))
@@ -730,10 +781,6 @@ func (p *Provider) recoverStartupNudges(ctx context.Context, sessionName, expect
 			state, stateErr = p.loadStartupNudgeState(intentCtx, &intent)
 			if stateErr == nil && (state.Status == startupNudgeUncertain || state.Status == startupNudgeSubmitted) {
 				changed = true
-				state.Reported = true
-				if updateErr := p.updateStartupNudgeState(intentCtx, &intent, state); updateErr != nil {
-					state.Reason = "startup nudge result could not be durably marked for reporting"
-				}
 			}
 			if err != nil && stateErr != nil {
 				state = startupNudgeState{Status: "recovery_error", Reason: "startup nudge delivery failed without a readable checkpoint"}
@@ -746,50 +793,41 @@ func (p *Provider) recoverStartupNudges(ctx context.Context, sessionName, expect
 			}
 			if resumeErr != nil && state.Status != startupNudgeUncertain {
 				state.Status, state.Reason = startupNudgeUncertain, "startup nudge composer could not be safely resumed"
+				stateErr = errors.New("recovery outcome changed")
 			}
-			state.Reported = true
-			if err := p.updateStartupNudgeState(intentCtx, &intent, state); err != nil {
-				state.Status, state.Reason = startupNudgeUncertain, "startup nudge recovery result could not be durably recorded"
+			if stateErr != nil {
+				if err := p.updateStartupNudgeState(intentCtx, &intent, state); err != nil {
+					state.Status, state.Reason = startupNudgeUncertain, "startup nudge recovery result could not be durably recorded"
+					changed = false
+				} else {
+					changed = true
+				}
 			}
-			changed = true
 		case startupNudgeUncertain:
 			// Durable uncertainty remains visible; never re-send without an
 			// explicit operator decision bound to this intent and incarnation.
 			if !state.Reported {
-				state.Reported = true
-				if err := p.updateStartupNudgeState(intentCtx, &intent, state); err != nil {
-					state.Reason = "uncertain startup nudge could not be durably marked for reporting"
-				} else {
-					changed = true
-				}
+				changed = true
 			}
 		case startupNudgeSubmitted, startupNudgeConfirmed:
 			// Transport submission is terminal for automatic delivery. Record
 			// the terminal transition once; the application does not expose a
 			// reliable consumption receipt.
 			if !state.Reported {
-				state.Reported = true
-				if err := p.updateStartupNudgeState(intentCtx, &intent, state); err != nil {
-					state.Reason = "transport-submitted event checkpoint could not be persisted"
-				} else {
-					changed = true
-				}
+				changed = true
 			}
 		case startupNudgeOperatorConfirmed:
 			if !state.Reported {
-				state.Reported = true
-				if err := p.updateStartupNudgeState(intentCtx, &intent, state); err != nil {
-					state.Reason = "operator resolution could not be durably recorded"
-				} else {
-					changed = true
-				}
+				changed = true
 			}
 		default:
 			state.Status = startupNudgeUncertain
 			state.Reason = "unknown startup nudge state"
-			_ = p.updateStartupNudgeState(intentCtx, &intent, state)
-			changed = true
+			if err := p.updateStartupNudgeState(intentCtx, &intent, state); err == nil {
+				changed = true
+			}
 		}
+		state = p.reportableStartupNudgeState(intentCtx, &intent, state, &changed)
 		release()
 		cancel()
 		if changed || state.Status == startupNudgeUncertain || state.Status == startupNudgeOperatorConfirmed {
@@ -797,6 +835,18 @@ func (p *Provider) recoverStartupNudges(ctx context.Context, sessionName, expect
 		}
 	}
 	return reports
+}
+
+// reportableStartupNudgeState reloads the durable revision used to fence the
+// later event acknowledgement. A failed checkpoint write is never reported as
+// a durable transition.
+func (p *Provider) reportableStartupNudgeState(ctx context.Context, intent *startupNudgeIntent, state startupNudgeState, changed *bool) startupNudgeState {
+	latest, err := p.loadStartupNudgeState(ctx, intent)
+	if err != nil || latest.Status != state.Status || latest.Reason != state.Reason {
+		*changed = false
+		return state
+	}
+	return latest
 }
 
 func nudgeReport(intent startupNudgeIntent, state startupNudgeState, changed bool) runtime.StartupNudgeStatus {
@@ -807,7 +857,7 @@ func nudgeReport(intent startupNudgeIntent, state startupNudgeState, changed boo
 	return runtime.StartupNudgeStatus{
 		SessionName: intent.SessionName, IntentID: intent.ID,
 		ProviderFamily: intent.ProviderFamily, Incarnation: incarnation,
-		Status: state.Status, Reason: state.Reason, Changed: changed,
+		Status: state.Status, Reason: state.Reason, CheckpointRevision: state.Revision, Changed: changed,
 	}
 }
 
@@ -853,10 +903,13 @@ func StartupNudgeDiagnostics(cityPath string) ([]runtime.StartupNudgeStatus, err
 	return diagnostics, nil
 }
 
-var _ runtime.StartupNudgeRecoveryProvider = (*Provider)(nil)
-var _ runtime.StartupNudgeSessionProvider = (*Provider)(nil)
-var _ runtime.StartupNudgeLeasedSessionProvider = (*Provider)(nil)
-var _ runtime.StartupNudgeLeaseTargetProvider = (*Provider)(nil)
+var (
+	_ runtime.StartupNudgeRecoveryProvider      = (*Provider)(nil)
+	_ runtime.StartupNudgeSessionProvider       = (*Provider)(nil)
+	_ runtime.StartupNudgeLeasedSessionProvider = (*Provider)(nil)
+	_ runtime.StartupNudgeLeaseTargetProvider   = (*Provider)(nil)
+	_ runtime.StartupNudgeEventAcknowledger     = (*Provider)(nil)
+)
 
 func validStartupNudgeIntent(intent startupNudgeIntent) bool {
 	if intent.SchemaVersion != 1 || intent.ID == "" || intent.SessionName == "" || intent.Target != tmuxSession {

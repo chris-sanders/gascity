@@ -27,6 +27,7 @@ var (
 	_ runtime.StartupNudgeSessionProvider       = (*seamBackedProvider)(nil)
 	_ runtime.StartupNudgeLeasedSessionProvider = (*seamBackedProvider)(nil)
 	_ runtime.StartupNudgeLeaseTargetProvider   = (*seamBackedProvider)(nil)
+	_ runtime.StartupNudgeEventAcknowledger     = (*seamBackedProvider)(nil)
 )
 
 // NewSeamBacked constructs a k8s provider served through the seams.
@@ -106,4 +107,8 @@ func (s *seamBackedProvider) RecoverStartupNudgesForLeasedSession(ctx context.Co
 
 func (s *seamBackedProvider) StartupNudgeLeaseTargets(ctx context.Context) []runtime.StartupNudgeLeaseTarget {
 	return s.raw.StartupNudgeLeaseTargets(ctx)
+}
+
+func (s *seamBackedProvider) AcknowledgeStartupNudgeEvent(ctx context.Context, name, intentID string, revision uint64) error {
+	return s.raw.AcknowledgeStartupNudgeEvent(ctx, name, intentID, revision)
 }

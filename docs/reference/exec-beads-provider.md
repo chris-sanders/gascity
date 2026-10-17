@@ -196,6 +196,12 @@ The parent environment is otherwise inherited, except that `BEADS_*` and
 `GC_DOLT_*` keys are stripped so a script cannot accidentally inherit the
 default store's backend configuration.
 
+For Kubernetes session attachment, `GC_BEADS_SCOPE_ROOT` is the canonical
+active-scope declaration. `GC_STORE_ROOT` is accepted there only as a legacy
+fallback when the canonical variable is absent; conflicting declarations fail
+closed. That controller attachment contract is separate from this exec-script
+environment contract.
+
 ## Writing Your Own Script
 
 1. Start from `contrib/beads-scripts/gc-beads-br` as a template.

@@ -107,8 +107,47 @@ func TestStartupNudgeRecoveryMarksTypedDraftUncertainWithoutTransportRetry(t *te
 		}
 	}
 	state, err := p.loadStartupNudgeState(context.Background(), intent)
-	if err != nil || state.Status != startupNudgeUncertain || !state.Reported {
-		t.Fatalf("checkpoint = %+v, %v; want reported uncertainty", state, err)
+	if err != nil || state.Status != startupNudgeUncertain || state.Reported {
+		t.Fatalf("checkpoint = %+v, %v; want durable uncertainty pending its event acknowledgement", state, err)
+	}
+	if len(statuses) != 1 || statuses[0].CheckpointRevision != state.Revision {
+		t.Fatalf("reported checkpoint revision = %+v, state=%+v; want exact durable revision", statuses, state)
+	}
+	if err := p.AcknowledgeStartupNudgeEvent(context.Background(), "worker", intent.ID, statuses[0].CheckpointRevision); err != nil {
+		t.Fatalf("AcknowledgeStartupNudgeEvent: %v", err)
+	}
+	state, err = p.loadStartupNudgeState(context.Background(), intent)
+	if err != nil || !state.Reported {
+		t.Fatalf("checkpoint after event acknowledgement = %+v, %v; want reported uncertainty", state, err)
+	}
+}
+
+func TestStartupNudgeEventAcknowledgementRejectsStaleCheckpointRevision(t *testing.T) {
+	p := newProviderWithOps(newFakeK8sOps())
+	p.cityPath = t.TempDir()
+	intent, err := p.persistStartupNudgeIntent(context.Background(), "worker", runtime.Config{
+		ProviderName: "claude", Nudge: "run task",
+		Env: map[string]string{"GC_SESSION_ID": "session-1", "GC_INSTANCE_TOKEN": "instance-1", "GC_PROVIDER": "claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.updateStartupNudgeState(context.Background(), intent, startupNudgeState{Status: startupNudgeUncertain, Reason: "first transition"}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := p.loadStartupNudgeState(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.updateStartupNudgeState(context.Background(), intent, startupNudgeState{Status: startupNudgeUncertain, Reason: "second transition"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.AcknowledgeStartupNudgeEvent(context.Background(), "worker", intent.ID, first.Revision); err == nil {
+		t.Fatal("stale event acknowledgement succeeded")
+	}
+	state, err := p.loadStartupNudgeState(context.Background(), intent)
+	if err != nil || state.Reported {
+		t.Fatalf("checkpoint after stale acknowledgement = %+v, %v; want newer transition still pending", state, err)
 	}
 }
 
