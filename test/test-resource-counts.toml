@@ -697,6 +697,16 @@ resource = "subprocess"
 calls = 2
 
 [[count]]
+path = "cmd/gc/dolt_project_id_tls_test.go"
+resource = "http_test_server"
+calls = 1
+
+[[count]]
+path = "cmd/gc/dolt_project_id_tls_test.go"
+resource = "net_listen"
+calls = 1
+
+[[count]]
 path = "cmd/gc/dolt_runtime_test_helpers_test.go"
 resource = "fixed_sleep"
 calls = 1
@@ -2180,6 +2190,22 @@ calls = 1
 path = "internal/runtime/k8s/controller_script_test.go"
 resource = "subprocess"
 calls = 1
+
+[[count]]
+path = "internal/runtime/k8s/metadata_test.go"
+resource = "subprocess"
+calls = 1
+
+[[count]]
+path = "internal/runtime/k8s/metadata_test.go"
+resource = "tmux"
+calls = 1
+
+[[count]]
+path = "internal/runtime/k8s/pod_prompt_test.go"
+resource = "subprocess"
+calls = 1
+medium = 1
 
 [[count]]
 path = "internal/runtime/k8s/provider_test.go"
