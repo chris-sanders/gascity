@@ -19,6 +19,7 @@ func TestK8sStoreAttachmentUsesResolvedProviderAndScopeBindings(t *testing.T) {
 	t.Setenv("BEADS_DOLT_SERVER_TLS", "")
 	t.Setenv("BEADS_DOLT_SERVER_CA", "")
 	t.Setenv("BEADS_DOLT_CREDENTIAL_COMMAND", "")
+	writeK8sRouteTestKubeconfig(t)
 
 	cityRoot := t.TempDir()
 	writeK8sAttachmentScope(t, cityRoot, contract.MetadataState{
@@ -154,8 +155,7 @@ func TestK8sStoreAttachmentProjectsCityAndRigIndependently(t *testing.T) {
 			Database: "dolt", Backend: "dolt", DoltMode: "server", DoltDatabase: "frontenddb",
 		}, contract.ConfigState{
 			IssuePrefix: "fe", EndpointOrigin: contract.EndpointOriginInheritedCity,
-			EndpointStatus: contract.EndpointStatusVerified, DoltHost: "127.0.0.1",
-			DoltPort: managedPort,
+			EndpointStatus: contract.EndpointStatusVerified,
 		})
 		rigs := []config.Rig{{Name: "frontend", Path: "rigs/frontend", Prefix: "fe"}}
 		activeEnv, err := sessionBackendEnvWithError(cityRoot, rigRoot, rigs)
@@ -178,6 +178,9 @@ func TestK8sStoreAttachmentProjectsCityAndRigIndependently(t *testing.T) {
 	})
 
 	t.Run("external city and non-Dolt rig", func(t *testing.T) {
+		// `http` is served by the linked beads backend. Its workspace carries
+		// .beads metadata, but it does not use the controller's Dolt attachment.
+		registerLibraryBackendForTest(t, "http")
 		cityRoot := t.TempDir()
 		writeK8sAttachmentScope(t, cityRoot, contract.MetadataState{
 			Database: "dolt", Backend: "dolt", DoltMode: "server", DoltDatabase: "citydb",
@@ -189,8 +192,12 @@ func TestK8sStoreAttachmentProjectsCityAndRigIndependently(t *testing.T) {
 
 		rigRoot := filepath.Join(cityRoot, "rigs", "frontend")
 		writeK8sAttachmentScope(t, rigRoot, contract.MetadataState{
-			Database: "file", Backend: "file",
-		}, contract.ConfigState{IssuePrefix: "fe"})
+			Database: "dolt", Backend: "http", DoltDatabase: "frontenddb",
+		}, contract.ConfigState{
+			IssuePrefix: "fe", EndpointOrigin: contract.EndpointOriginExplicit,
+			EndpointStatus: contract.EndpointStatusVerified, DoltHost: "beads.example.test",
+			DoltPort: "443",
+		})
 		rigs := []config.Rig{{Name: "frontend", Path: "rigs/frontend", Prefix: "fe"}}
 		activeEnv, err := sessionBackendEnvWithError(cityRoot, rigRoot, rigs)
 		if err != nil {
@@ -210,6 +217,31 @@ func TestK8sStoreAttachmentProjectsCityAndRigIndependently(t *testing.T) {
 			t.Fatalf("non-Dolt rig triggered attachment: %#v", env)
 		}
 	})
+}
+
+func writeK8sRouteTestKubeconfig(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "kubeconfig")
+	const kubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+- name: route-test
+  cluster:
+    server: https://127.0.0.1:6443
+contexts:
+- name: route-test
+  context:
+    cluster: route-test
+    user: route-test
+current-context: route-test
+users:
+- name: route-test
+  user: {}
+`
+	if err := os.WriteFile(path, []byte(kubeconfig), 0o600); err != nil {
+		t.Fatalf("write isolated K8s route kubeconfig: %v", err)
+	}
+	t.Setenv("KUBECONFIG", path)
 }
 
 func writeK8sAttachmentScope(t *testing.T, root string, metadata contract.MetadataState, cfg contract.ConfigState) {

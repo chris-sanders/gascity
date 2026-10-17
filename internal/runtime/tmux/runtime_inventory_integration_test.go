@@ -25,13 +25,14 @@ func TestTmuxRuntimeInventory_RealTmuxEmptyTrailingMarker(t *testing.T) {
 	cfg.SocketName = privateSocketName("inv")
 	p := NewProviderWithConfig(cfg)
 	t.Cleanup(func() { _ = p.tm.KillServer() })
+	if err := p.tm.NewSessionWithCommand("inv-a-asked", t.TempDir(), "sleep 300"); err != nil {
+		t.Fatalf("new session inv-a-asked: %v", err)
+	}
 	if _, err := p.tm.run("set-environment", "-g", "GC_RESTART_REQUESTED", "1700000001"); err != nil {
 		t.Fatalf("set stale global restart environment: %v", err)
 	}
-	for _, name := range []string{"inv-a-asked", "inv-z-quiet"} {
-		if err := p.tm.NewSessionWithCommand(name, t.TempDir(), "sleep 300"); err != nil {
-			t.Fatalf("new session %s: %v", name, err)
-		}
+	if err := p.tm.NewSessionWithCommand("inv-z-quiet", t.TempDir(), "sleep 300"); err != nil {
+		t.Fatalf("new session inv-z-quiet: %v", err)
 	}
 	if err := p.SetMeta("inv-a-asked", "GC_RESTART_REQUESTED", "1700000050"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
