@@ -78,6 +78,11 @@ func newTmuxMetadataTestOps(t *testing.T, podName string) (*tmuxMetadataTestOps,
 	}
 	run := func(args ...string) (string, error) {
 		command := exec.Command(tmuxBinary, append([]string{"-S", socket}, args...)...)
+		command.Env = append(os.Environ(),
+			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"GC_TEST_TMUX_BIN="+tmuxBinary,
+			"GC_TEST_TMUX_SOCKET="+socket,
+		)
 		output, err := command.CombinedOutput()
 		return string(output), err
 	}
@@ -451,6 +456,95 @@ func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.
 	}
 	if got, err := run("show-environment", "-t", tmuxSession, "GC_SESSION_ID"); err != nil || strings.TrimSpace(got) != "GC_SESSION_ID=legacy-session" {
 		t.Fatalf("backfilled identity in tmux = %q, %v", got, err)
+	}
+	if current, err := p.hasCurrentIdentityMetadataVersion(context.Background(), "legacy"); err != nil || current {
+		t.Fatalf("partial legacy backfill marker = %t, %v; want marker absent", current, err)
+	}
+}
+
+func TestK8sLegacyRelaunchIdentityReadPreservesNewGenerationWhenSessionIDMatchesGlobal(t *testing.T) {
+	ops, run := newTmuxMetadataTestOps(t, "worker")
+	city := t.TempDir()
+	t.Setenv("GC_CITY_PATH", city)
+	oldEnv := map[string]string{
+		"GC_SESSION_ID":         "stable-session",
+		"GC_INSTANCE_TOKEN":     "pod-instance",
+		"GC_RUNTIME_EPOCH":      "pod-runtime-epoch",
+		"GC_CONTINUATION_EPOCH": "pod-continuation-epoch",
+		"GC_PROVIDER":           "claude",
+	}
+	for key, value := range oldEnv {
+		t.Setenv(key, value)
+	}
+	if _, err := run("set-environment", "-g", "GC_SESSION_ID", "stable-session"); err != nil {
+		t.Fatalf("set matching global session ID: %v", err)
+	}
+	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
+		t.Fatalf("create warm tmux session: %v", err)
+	}
+
+	p := newProviderWithOps(ops)
+	p.cityPath = city
+	p.postStartSettle = 0
+	if err := p.seedStartMetadata(context.Background(), "worker", "worker", oldEnv); err != nil {
+		t.Fatalf("seed pod-creation identity: %v", err)
+	}
+	newEnv := map[string]string{
+		"GC_SESSION_ID":         "stable-session",
+		"GC_INSTANCE_TOKEN":     "relaunched-instance",
+		"GC_RUNTIME_EPOCH":      "relaunched-runtime-epoch",
+		"GC_CONTINUATION_EPOCH": "relaunched-continuation-epoch",
+		"GC_PROVIDER":           "codex",
+	}
+	if err := p.Relaunch(context.Background(), "worker", runtime.Config{Command: "sleep 300", Env: newEnv}); err != nil {
+		t.Fatalf("warm Relaunch: %v", err)
+	}
+	if _, err := run("set-environment", "-h", "-t", tmuxSession, "-r", identityMetadataVersionKey); err != nil {
+		t.Fatalf("remove identity version marker to model legacy relaunch: %v", err)
+	}
+	if current, err := p.hasCurrentIdentityMetadataVersion(context.Background(), "worker"); err != nil || current {
+		t.Fatalf("legacy relaunch marker = %t, %v; want marker absent", current, err)
+	}
+
+	for key, want := range map[string]string{
+		"GC_SESSION_ID":         "stable-session",
+		"GC_INSTANCE_TOKEN":     "relaunched-instance",
+		"BEADS_HOLDER_TOKEN":    "relaunched-instance",
+		"GC_RUNTIME_EPOCH":      "relaunched-runtime-epoch",
+		"GC_CONTINUATION_EPOCH": "relaunched-continuation-epoch",
+		"GC_PROVIDER":           "codex",
+	} {
+		got, err := p.GetMeta("worker", key)
+		if err != nil || got != want {
+			t.Fatalf("legacy relaunch identity GetMeta(%s) = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	if current, err := p.hasCurrentIdentityMetadataVersion(context.Background(), "worker"); err != nil || current {
+		t.Fatalf("legacy relaunch marker after read = %t, %v; want marker absent", current, err)
+	}
+}
+
+func TestK8sRuntimeOwnerBackfillPreservesExistingAndFillsMissingValues(t *testing.T) {
+	ops, run := newTmuxMetadataTestOps(t, "worker")
+	t.Setenv("GC_CITY_PATH", "/pod-creation/city")
+	t.Setenv("GT_PROCESS_NAMES", "claude,codex")
+	if _, err := run("set-environment", "-g", "GC_CITY_PATH", "/session/city"); err != nil {
+		t.Fatalf("set global runtime-owner path: %v", err)
+	}
+	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
+		t.Fatalf("create legacy tmux session: %v", err)
+	}
+	p := newProviderWithOps(ops)
+	p.cityPath = t.TempDir()
+
+	if got, err := p.GetMeta("worker", "GC_CITY_PATH"); err != nil || got != "/session/city" {
+		t.Fatalf("runtime-owner path after backfill = %q, %v; want existing session value", got, err)
+	}
+	if got, err := p.GetMeta("worker", "GT_PROCESS_NAMES"); err != nil || got != "claude,codex" {
+		t.Fatalf("missing runtime-owner backfill = %q, %v; want pod value", got, err)
+	}
+	if got, err := run("show-environment", "-t", tmuxSession, "GC_CITY_PATH"); err != nil || strings.TrimSpace(got) != "GC_CITY_PATH=/session/city" {
+		t.Fatalf("session runtime-owner path after backfill = %q, %v; want preserved value", got, err)
 	}
 }
 

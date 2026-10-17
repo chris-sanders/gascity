@@ -22,6 +22,7 @@ func TestClassifyProductMetricsCommandCanonicalMatrix(t *testing.T) {
 		{name: "bare root", args: nil, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},
 		{name: "deferred help group", args: []string{"analyze"}, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},
 		{name: "deferred unknown group", args: []string{"agent"}, wantID: productMetricsCommandUnknown, recording: productMetricsRecordingRecordable},
+		{name: "structural startup nudge group", args: []string{"startup-nudge"}, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},
 		{name: "startup nudge resolve", args: []string{"startup-nudge", "resolve"}, wantID: productMetricsGeneratedCommandID212, recording: productMetricsRecordingRecordable},
 		{name: "target help", args: []string{"session", "peek", "--help"}, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},
 		{name: "help after positional", args: []string{"session", "peek", "private-value", "--help"}, wantID: productMetricsCommandHelp, recording: productMetricsRecordingRecordable},

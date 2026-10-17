@@ -715,10 +715,46 @@ func (p *Provider) backfillMetadataFromPodEnv(ctx context.Context, podName, name
 		}
 		env[key] = value
 	}
-	if err := p.publishSessionMetadata(ctx, podName, name, env, publishIdentity, publishRuntimeOwner, false); err != nil {
+	if err := validateSessionMetadataValues(env, publishIdentity, publishRuntimeOwner); err != nil {
+		return fmt.Errorf("k8s compatibility backfill for session %q failed", name)
+	}
+	commands := backfillSessionMetadataCommands(env, publishIdentity)
+	if commands == "" {
+		return nil
+	}
+	if err := p.sourcePrivateTmuxFile(ctx, podName, commands); err != nil {
 		return fmt.Errorf("k8s compatibility backfill for session %q failed", name)
 	}
 	return nil
+}
+
+// backfillSessionMetadataCommands only fills keys absent from the session.
+// The checks run under sourcePrivateTmuxFile's exclusive metadata lock, so a
+// concurrent Relaunch or SetMeta cannot be overwritten between a read and a
+// compatibility write. Partial legacy repairs deliberately do not publish the
+// current identity-version marker.
+func backfillSessionMetadataCommands(env map[string]string, publishIdentity bool) string {
+	keys := runtimeOwnerEnvKeys
+	if publishIdentity {
+		keys = orderedSessionIdentityKeys
+	}
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value, ok := env[key]
+		if key == "BEADS_HOLDER_TOKEN" {
+			value, ok = env["GC_INSTANCE_TOKEN"]
+		}
+		if !ok || value == "" {
+			continue
+		}
+		condition := fmt.Sprintf("tmux has-session -t %s && ! tmux show-environment -t %s %s >/dev/null 2>&1", tmuxSession, tmuxSession, key)
+		set := tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value)
+		lines = append(lines, tmuxMetadataCommand("if-shell", condition, set))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func (p *Provider) readPodEnvValue(ctx context.Context, podName, key string) (string, error) {

@@ -4031,16 +4031,14 @@
       "hidden": false,
       "effective_hidden": false,
       "disable_flag_parsing": false,
-      "shape": "runnable-group",
+      "shape": "structural",
       "recording_policy": "recordable",
       "mode": "standard",
       "notice_policy": "eligible",
-      "classification": "unknown",
-      "canonical_target": "@unknown",
-      "owner": "deferred",
-      "resolver": "group-dispatch",
-      "deferred_default": "unknown",
-      "id": 3
+      "classification": "help",
+      "canonical_target": "@help",
+      "owner": "structural",
+      "id": 1
     },
     {
       "path": "gc startup-nudge resolve",

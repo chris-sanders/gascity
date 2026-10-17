@@ -20,3 +20,8 @@ UID 0 for account creation, sudoers setup, ownership changes, and `su`. Keep
 standalone use intact, but reject it when any UID, GID, or `fsGroup` is
 explicitly configured through TOML or `GC_K8S_*` environment overrides. Do not
 describe those Pods as Restricted-compatible.
+
+Legacy tmux metadata backfill may fill only keys missing from the session. It
+must preserve existing session-scoped identity and runtime-owner values, and a
+partial compatibility repair must not publish the current identity-version
+marker.
