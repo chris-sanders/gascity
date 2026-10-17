@@ -166,8 +166,8 @@ func TestStageCanonicalStoreFilesProjectsIdentityWithoutCredentials(t *testing.T
 	}
 	fake := newFakeK8sOps()
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
-		if len(cmd) > 0 && cmd[0] == "tar" {
-			return archiveExtractAck, nil
+		if len(cmd) > 2 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "tar xf -") {
+			return archiveExtractAck + "\n", nil
 		}
 		return "", nil
 	}
@@ -176,7 +176,7 @@ func TestStageCanonicalStoreFilesProjectsIdentityWithoutCredentials(t *testing.T
 	}
 	var archive []byte
 	for _, call := range fake.calls {
-		if call.method == "execInPod" && len(call.cmd) > 0 && call.cmd[0] == "tar" {
+		if call.method == "execInPod" && len(call.cmd) > 2 && call.cmd[0] == "sh" && strings.Contains(call.cmd[2], "tar xf -") {
 			archive = call.stdin
 		}
 	}
@@ -225,8 +225,8 @@ func TestStageCanonicalStoreFilesAllowsMissingIdentityForOwningStoreMigration(t 
 	}
 	fake := newFakeK8sOps()
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
-		if len(cmd) > 0 && cmd[0] == "tar" {
-			return archiveExtractAck, nil
+		if len(cmd) > 2 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "tar xf -") {
+			return archiveExtractAck + "\n", nil
 		}
 		return "", nil
 	}
@@ -234,7 +234,7 @@ func TestStageCanonicalStoreFilesAllowsMissingIdentityForOwningStoreMigration(t 
 		t.Fatalf("stageCanonicalStoreFilesInPod before identity migration: %v", err)
 	}
 	for _, call := range fake.calls {
-		if call.method != "execInPod" || len(call.cmd) == 0 || call.cmd[0] != "tar" {
+		if call.method != "execInPod" || len(call.cmd) < 3 || call.cmd[0] != "sh" || !strings.Contains(call.cmd[2], "tar xf -") {
 			continue
 		}
 		reader := tar.NewReader(bytes.NewReader(call.stdin))

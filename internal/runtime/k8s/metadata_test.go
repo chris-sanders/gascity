@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,80 @@ import (
 
 	"github.com/gastownhall/gascity/internal/runtime"
 )
+
+type tmuxMetadataTestOps struct {
+	*fakeK8sOps
+	tmuxBinary string
+	tmuxSocket string
+	tmuxPath   string
+}
+
+func (o *tmuxMetadataTestOps) execInPod(ctx context.Context, pod, container string, cmd []string, stdin io.Reader) (string, error) {
+	var input []byte
+	if stdin != nil {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", err
+		}
+		input = data
+	}
+	o.calls = append(o.calls, fakeCall{method: "execInPod", pod: pod, container: container, cmd: cmd, stdin: input})
+	binary := cmd[0]
+	command := cmd[1:]
+	if binary == "tmux" {
+		binary = o.tmuxPath
+	}
+	process := exec.CommandContext(ctx, binary, command...)
+	process.Env = append(os.Environ(),
+		"PATH="+filepath.Dir(o.tmuxPath)+":"+os.Getenv("PATH"),
+		"GC_TEST_TMUX_BIN="+o.tmuxBinary,
+		"GC_TEST_TMUX_SOCKET="+o.tmuxSocket,
+	)
+	if stdin != nil {
+		process.Stdin = strings.NewReader(string(input))
+	}
+	output, err := process.CombinedOutput()
+	if err == nil {
+		return string(output), nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		status := exitError.ExitCode()
+		return string(output), execerr.CodeExitError{Err: fmt.Errorf("exit %d: %s", status, strings.TrimSpace(string(output))), Code: status}
+	}
+	return string(output), err
+}
+
+func newTmuxMetadataTestOps(t *testing.T, podName string) (*tmuxMetadataTestOps, func(...string) (string, error)) {
+	t.Helper()
+	tmuxBinary, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is unavailable in this validation environment")
+	}
+	root := t.TempDir()
+	socket := filepath.Join(root, "tmux.sock")
+	binDir := filepath.Join(root, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tmuxPath := filepath.Join(binDir, "tmux")
+	wrapper := "#!/bin/sh\nexec \"$GC_TEST_TMUX_BIN\" -S \"$GC_TEST_TMUX_SOCKET\" \"$@\"\n"
+	if err := os.WriteFile(tmuxPath, []byte(wrapper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) (string, error) {
+		command := exec.Command(tmuxBinary, append([]string{"-S", socket}, args...)...)
+		output, err := command.CombinedOutput()
+		return string(output), err
+	}
+	if _, err := run("new-session", "-d", "-s", "metadata-seed", "sleep", "300"); err != nil {
+		t.Fatalf("start tmux test server: %v", err)
+	}
+	t.Cleanup(func() { _, _ = run("kill-server") })
+	fake := newFakeK8sOps()
+	addRunningPod(fake, podName, podName)
+	return &tmuxMetadataTestOps{fakeK8sOps: fake, tmuxBinary: tmuxBinary, tmuxSocket: socket, tmuxPath: tmuxPath}, run
+}
 
 func TestSeedStartMetadataUsesAllowlistAndSecureSourceFile(t *testing.T) {
 	fake := newFakeK8sOps()
@@ -72,14 +147,20 @@ func TestTmuxRemovalMarkerShadowsGlobalIdentityEnvironment(t *testing.T) {
 		return string(output), err
 	}
 	t.Cleanup(func() { _, _ = run("kill-server") })
+	if _, err := run("new-session", "-d", "-s", "metadata-seed"); err != nil {
+		t.Fatalf("start tmux server: %v", err)
+	}
 	if _, err := run("set-environment", "-g", "GC_SESSION_ID", "stale-global-session"); err != nil {
 		t.Fatalf("set global identity: %v", err)
 	}
 	if _, err := run("new-session", "-d", "-s", tmuxSession); err != nil {
 		t.Fatalf("new tmux session: %v", err)
 	}
-	if got, err := run("show-environment", "-t", tmuxSession, "GC_SESSION_ID"); err != nil || strings.TrimSpace(got) != "GC_SESSION_ID=stale-global-session" {
-		t.Fatalf("inherited identity = %q, %v; want stale global value before removal", got, err)
+	if _, err := run("kill-session", "-t", "metadata-seed"); err != nil {
+		t.Fatalf("remove seed session: %v", err)
+	}
+	if got, err := run("show-environment", "-g", "GC_SESSION_ID"); err != nil || strings.TrimSpace(got) != "GC_SESSION_ID=stale-global-session" {
+		t.Fatalf("global identity = %q, %v; want the stale global value", got, err)
 	}
 	if _, err := run("set-environment", "-t", tmuxSession, "-r", "GC_SESSION_ID"); err != nil {
 		t.Fatalf("remove session identity: %v", err)
@@ -133,10 +214,12 @@ func TestMetadataProtocolRoundTripKeepsOneTmuxAuthority(t *testing.T) {
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
 		joined := strings.Join(cmd, " ")
 		if strings.Contains(joined, "show-environment") {
-			for key, value := range metadata {
-				if strings.Contains(joined, key) {
-					return key + "=" + value + "\n", nil
-				}
+			key := cmd[len(cmd)-1]
+			if strings.Contains(joined, " -g ") {
+				return "-" + key + "\n", nil
+			}
+			if value, ok := metadata[key]; ok {
+				return key + "=" + value + "\n", nil
 			}
 			if strings.Contains(joined, "has-session") {
 				return "", nil
@@ -178,6 +261,124 @@ func TestMetadataProtocolRoundTripKeepsOneTmuxAuthority(t *testing.T) {
 	call := lastSourceFileCall(t, fake.calls)
 	if !strings.Contains(string(call.stdin), "'-r' 'GC_DRAIN_ACK'") {
 		t.Fatalf("protocol clear did not use tmux removal marker: %s", call.stdin)
+	}
+}
+
+func TestK8sMetadataProtocolAgentInteropAndGenerationRecycle(t *testing.T) {
+	ops, run := newTmuxMetadataTestOps(t, "worker")
+	if _, err := run("set-environment", "-g", "GC_DRAIN", "stale-global-drain"); err != nil {
+		t.Fatalf("set stale global protocol flag: %v", err)
+	}
+	if _, err := run("set-environment", "-g", "GC_SESSION_ID", "stale-global-session"); err != nil {
+		t.Fatalf("set stale global session ID: %v", err)
+	}
+	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
+		t.Fatalf("create protocol session: %v", err)
+	}
+	p := newProviderWithOps(ops)
+	p.cityPath = t.TempDir()
+	if err := p.seedStartMetadata(context.Background(), "worker", "worker", map[string]string{
+		"GC_SESSION_ID": "session-before", "GC_INSTANCE_TOKEN": "instance-before", "GC_PROVIDER": "claude",
+	}); err != nil {
+		t.Fatalf("seed initial identity: %v", err)
+	}
+
+	controllerFlags := map[string]string{
+		"GC_DRAIN": "operator", "GC_DRAIN_REASON": "handoff", "GC_DRAIN_GENERATION": "42",
+		"GC_DRAIN_ACK_REQUESTER_INSTANCE_TOKEN": "requester-instance",
+		"GC_RESTART_REQUESTED":                  "1700000000", "GC_DRIFT_RESTART": "1",
+	}
+	for key, value := range controllerFlags {
+		if err := p.SetMeta("worker", key, value); err != nil {
+			t.Fatalf("controller SetMeta(%s): %v", key, err)
+		}
+	}
+	if got, err := run("show-environment", "-t", tmuxSession, "GC_DRAIN"); err != nil || strings.TrimSpace(got) != "GC_DRAIN=operator" {
+		t.Fatalf("in-pod drain check = %q, %v; want controller's drain request", got, err)
+	}
+	for key, value := range map[string]string{"GC_DRAIN_ACK": "1", "GC_DRAIN_ACK_SOURCE": "agent"} {
+		if _, err := run("set-environment", "-t", tmuxSession, key, value); err != nil {
+			t.Fatalf("in-pod agent SetMeta(%s): %v", key, err)
+		}
+	}
+	for key, want := range map[string]string{
+		"GC_DRAIN": "operator", "GC_DRAIN_ACK": "1", "GC_DRAIN_ACK_SOURCE": "agent",
+		"GC_DRAIN_REASON": "handoff", "GC_DRAIN_GENERATION": "42",
+		"GC_DRAIN_ACK_REQUESTER_INSTANCE_TOKEN": "requester-instance",
+		"GC_RESTART_REQUESTED":                  "1700000000", "GC_DRIFT_RESTART": "1",
+	} {
+		got, err := p.GetMeta("worker", key)
+		if err != nil || got != want {
+			t.Fatalf("controller GetMeta(%s) = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	for _, key := range protocolMetadataKeys {
+		if err := p.RemoveMeta("worker", key); err != nil {
+			t.Fatalf("controller RemoveMeta(%s): %v", key, err)
+		}
+		if got, err := run("show-environment", "-t", tmuxSession, key); err != nil || strings.TrimSpace(got) != "-"+key {
+			t.Fatalf("agent-visible %s after controller clear = %q, %v; want removal marker", key, got, err)
+		}
+	}
+	if got, err := run("show-environment", "-g", "GC_DRAIN"); err != nil || strings.TrimSpace(got) != "GC_DRAIN=stale-global-drain" {
+		t.Fatalf("global drain test fixture = %q, %v; want stale global value to remain", got, err)
+	}
+	if got, err := run("show-environment", "-g", "GC_SESSION_ID"); err != nil || strings.TrimSpace(got) != "GC_SESSION_ID=stale-global-session" {
+		t.Fatalf("global identity test fixture = %q, %v; want stale global value to remain", got, err)
+	}
+
+	if err := p.seedStartMetadata(context.Background(), "worker", "worker", map[string]string{
+		"GC_SESSION_ID": "session-after", "GC_INSTANCE_TOKEN": "instance-after", "GC_PROVIDER": "codex",
+	}); err != nil {
+		t.Fatalf("seed replacement generation: %v", err)
+	}
+	for key, want := range map[string]string{"GC_SESSION_ID": "session-after", "GC_INSTANCE_TOKEN": "instance-after", "BEADS_HOLDER_TOKEN": "instance-after", "GC_PROVIDER": "codex"} {
+		if got, err := p.GetMeta("worker", key); err != nil || got != want {
+			t.Fatalf("replacement identity %s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	for _, key := range protocolMetadataKeys {
+		if got, err := p.GetMeta("worker", key); err != nil || got != "" {
+			t.Fatalf("replacement generation retained %s=%q: %v", key, got, err)
+		}
+	}
+	if err := p.seedStartMetadata(context.Background(), "worker", "worker", map[string]string{"GC_INSTANCE_TOKEN": "instance-without-session-id"}); err != nil {
+		t.Fatalf("seed generation with absent session ID: %v", err)
+	}
+	if got, err := p.GetMeta("worker", "GC_SESSION_ID"); err != nil || got != "" {
+		t.Fatalf("absent identity was restored from the global environment: %q, %v", got, err)
+	}
+	if got, err := run("show-environment", "-t", tmuxSession, "GC_SESSION_ID"); err != nil || strings.TrimSpace(got) != "-GC_SESSION_ID" {
+		t.Fatalf("absent session identity marker = %q, %v; want global-shadowing removal", got, err)
+	}
+}
+
+func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.T) {
+	ops, run := newTmuxMetadataTestOps(t, "legacy")
+	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
+		t.Fatalf("create legacy session: %v", err)
+	}
+	p := newProviderWithOps(ops)
+	p.cityPath = t.TempDir()
+	for key, value := range map[string]string{
+		"GC_SESSION_ID": "legacy-session", "GC_INSTANCE_TOKEN": "legacy-instance",
+		"GC_PROVIDER": "claude", "GC_CITY_PATH": "/legacy/city", "GT_PROCESS_NAMES": "claude,codex",
+	} {
+		t.Setenv(key, value)
+	}
+	if got, err := p.GetMeta("legacy", "GC_SESSION_ID"); err != nil || got != "legacy-session" {
+		t.Fatalf("legacy session identity backfill = %q, %v", got, err)
+	}
+	if got, err := p.GetMeta("legacy", "BEADS_HOLDER_TOKEN"); err != nil || got != "legacy-instance" {
+		t.Fatalf("legacy holder token backfill = %q, %v; want instance token", got, err)
+	}
+	for key, want := range map[string]string{"GC_CITY_PATH": "/legacy/city", "GT_PROCESS_NAMES": "claude,codex"} {
+		if got, err := p.GetMeta("legacy", key); err != nil || got != want {
+			t.Fatalf("legacy runtime owner %s backfill = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	if got, err := run("show-environment", "-t", tmuxSession, "GC_SESSION_ID"); err != nil || strings.TrimSpace(got) != "GC_SESSION_ID=legacy-session" {
+		t.Fatalf("backfilled identity in tmux = %q, %v", got, err)
 	}
 }
 

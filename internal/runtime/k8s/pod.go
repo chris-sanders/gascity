@@ -96,6 +96,10 @@ func projectedPodWorkDir(cfg runtime.Config) string {
 // Shared by buildPod (the pod entrypoint) and Relaunch (respawn over execInPod)
 // so the entrypoint launch and a relaunch produce a byte-identical command.
 func agentCommandB64(cfg runtime.Config) string {
+	return base64.StdEncoding.EncodeToString([]byte(agentCommand(cfg)))
+}
+
+func agentCommand(cfg runtime.Config) string {
 	cmd := cfg.Command
 	if cmd == "" {
 		cmd = "/bin/bash"
@@ -113,7 +117,7 @@ func agentCommandB64(cfg runtime.Config) string {
 	if ctrlCity := controllerCityPath(cfg.Env); ctrlCity != "" {
 		cmd = strings.ReplaceAll(cmd, ctrlCity, "/workspace")
 	}
-	return base64.StdEncoding.EncodeToString([]byte(cmd))
+	return cmd
 }
 
 func agentCommandChunks(cfg runtime.Config) []string {

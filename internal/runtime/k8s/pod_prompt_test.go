@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
@@ -52,6 +54,34 @@ func decodedAgentCommandChunks(t *testing.T, args []string, firstChunk int, cfg 
 		t.Fatalf("reconstructed command differs: got %d bytes, want %d", len(got), len(want))
 	}
 	return chunks
+}
+
+func decodedRespawnAgentCommand(t *testing.T, args []string, cfg runtime.Config) string {
+	t.Helper()
+	commandArgs := args
+	if len(args) >= 5 && args[0] == "su" && args[1] == "-" {
+		commandArgs = shellquote.Split(args[4])
+	}
+	marker := -1
+	for i, arg := range commandArgs {
+		if arg == agentCommandArg0 {
+			marker = i
+			break
+		}
+	}
+	if marker < 0 || marker+1 >= len(commandArgs) {
+		t.Fatalf("respawn command did not pass encoded command chunks: %v", args)
+	}
+	encoded := strings.Join(commandArgs[marker+1:], "")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("decode respawn command chunks: %v", err)
+	}
+	want := "exec sh -c " + shellquote.Quote(decodedAgentCommand(t, cfg))
+	if !strings.Contains(string(decoded), want) {
+		t.Fatalf("respawn payload does not launch the configured agent command %q: %s", want, decoded)
+	}
+	return string(decoded)
 }
 
 func TestAgentCommandIncludesPromptAsPositionalArg(t *testing.T) {
@@ -170,17 +200,17 @@ func TestStartAndRelaunchUseSamePromptCommand(t *testing.T) {
 		t.Fatal("Relaunch did not issue respawn-pane")
 	}
 	relaunchCommand := respawn[2]
-	relaunchChunks := decodedAgentCommandChunks(t, respawn, 4, cfg)
-	if !reflect.DeepEqual(startChunks, relaunchChunks) {
-		t.Fatal("Start and Relaunch passed different command chunks")
+	if len(startChunks) == 0 {
+		t.Fatal("Start did not pass command chunks")
 	}
+	decodedRespawnAgentCommand(t, respawn, cfg)
 	for name, script := range map[string]string{"Start": startCommand, "Relaunch": relaunchCommand} {
 		if strings.Contains(script, agentCommandB64(cfg)) {
 			t.Errorf("%s embedded the base64 command in its shell script", name)
 		}
-		if !strings.Contains(script, `printf '%s' "$@" | base64 -d`) {
-			t.Errorf("%s does not reconstruct the command from positional chunks", name)
-		}
+	}
+	if !strings.Contains(strings.Join(respawn, " "), `CMD=$(printf '%s' "$@" | base64 -d)`) {
+		t.Fatal("Relaunch does not reconstruct its wrapped command from positional chunks")
 	}
 }
 
@@ -236,6 +266,10 @@ func TestDynamicUserPromptMetacharactersStayInChunkPayload(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
 	addRunningPod(fake, "prompt-agent", SanitizeName("prompt-agent"))
+	fake.pods["prompt-agent"].Spec.Containers = []corev1.Container{{
+		Name: "agent",
+		Env:  []corev1.EnvVar{{Name: "LINUX_USERNAME", Value: "gcagent"}},
+	}}
 	hasSessionAlive(fake, SanitizeName("prompt-agent"))
 	if err := p.Relaunch(context.Background(), "prompt-agent", cfg); err != nil {
 		t.Fatalf("Relaunch: %v", err)
@@ -244,34 +278,29 @@ func TestDynamicUserPromptMetacharactersStayInChunkPayload(t *testing.T) {
 	if relaunchArgs == nil {
 		t.Fatal("Relaunch did not issue respawn-pane")
 	}
-	relaunchScript := relaunchArgs[2]
-	decodedAgentCommandChunks(t, relaunchArgs, 4, cfg)
+	if len(relaunchArgs) < 5 || relaunchArgs[0] != "su" || relaunchArgs[1] != "-" || relaunchArgs[2] != "gcagent" || relaunchArgs[3] != "-c" {
+		t.Fatalf("Relaunch did not execute through the configured tmux owner: %v", relaunchArgs)
+	}
+	relaunchShellArgs := shellquote.Split(relaunchArgs[4])
+	if len(relaunchShellArgs) < 3 {
+		t.Fatalf("Relaunch owner command could not be decoded: %v", relaunchArgs)
+	}
+	relaunchScript := relaunchShellArgs[2]
+	decodedRespawnAgentCommand(t, relaunchArgs, cfg)
 
-	for name, script := range map[string]string{"Start": startScript, "Relaunch": relaunchScript} {
+	for name, script := range map[string]string{"Start": startScript, "Relaunch": strings.Join(relaunchShellArgs, " ")} {
 		if strings.Contains(script, prompt) || strings.Contains(script, agentCommandB64(cfg)) {
 			t.Errorf("%s interpolated prompt data into its shell script", name)
 		}
-		marker := `printf '%s' "$@" | su - ` + shellquote.Quote("gcagent") + ` -c `
-		if !strings.Contains(script, marker) {
-			t.Errorf("%s does not pipe the encoded chunks into a static su command", name)
-			continue
-		}
-		suCommand := script[strings.Index(script, marker)+len(`printf '%s' "$@" | `):]
-		suArgs := shellquote.Split(suCommand)
-		if len(suArgs) < 5 {
-			t.Errorf("%s su command = %#v, want a static -c script", name, suArgs)
-			continue
-		}
-		userScript := suArgs[4]
-		if !strings.Contains(userScript, "CMD=$(base64 -d)") {
-			t.Errorf("%s inner su script does not decode the command from stdin", name)
-		}
-		if !strings.Contains(userScript, `cd `+shellquote.Quote(projectedPodWorkDir(cfg))+` &&`) {
-			t.Errorf("%s inner su script does not shell-quote the projected work directory", name)
-		}
-		if !strings.Contains(userScript, `"$CMD"`) {
-			t.Errorf("%s does not pass the decoded command as one quoted tmux argument", name)
-		}
+	}
+	if strings.Contains(relaunchScript, prompt) || strings.Contains(relaunchScript, agentCommandB64(cfg)) {
+		t.Fatal("Relaunch interpolated prompt data into its outer shell script")
+	}
+	if !strings.Contains(strings.Join(relaunchShellArgs, " "), `cd `+shellquote.Quote(projectedPodWorkDir(cfg))+` &&`) {
+		t.Errorf("Relaunch does not enter the shell-quoted projected work directory: %v", relaunchShellArgs)
+	}
+	if !strings.Contains(strings.Join(relaunchShellArgs, " "), `"$CMD"`) {
+		t.Errorf("Relaunch does not pass the decoded command as one quoted tmux argument: %v", relaunchShellArgs)
 	}
 }
 

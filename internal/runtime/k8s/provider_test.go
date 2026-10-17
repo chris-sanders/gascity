@@ -2,7 +2,6 @@ package k8s
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1649,6 +1648,7 @@ func TestVerifyBeadsInPodRunsForManagedProjection(t *testing.T) {
 	fake := newFakeK8sOps()
 	cfg := runtime.Config{
 		Env: map[string]string{
+			"GC_DOLT_HOST": "dolt.gc.svc.cluster.local",
 			"GC_DOLT_PORT": "31364",
 		},
 	}
@@ -1792,6 +1792,12 @@ func TestInitBeadsVerifiesCityAndActiveScopesOverSecureStdin(t *testing.T) {
 
 func TestInitBeadsReconcilesOwningStoreBeforeReadOnlyAttach(t *testing.T) {
 	fake := newFakeK8sOps()
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) > 2 && cmd[0] == "sh" && cmd[1] == "-c" && strings.Contains(cmd[2], "tar xf -") {
+			return archiveExtractAck + "\n", nil
+		}
+		return "", nil
+	}
 	city := t.TempDir()
 	writeK8sDoltScopeFixture(t, city, "city_canonical", "city-db.example", "3306", "city-user", "citydb", "")
 	cfg := runtime.Config{Env: map[string]string{
@@ -2117,7 +2123,8 @@ func TestStartSendsNudge(t *testing.T) {
 	p.cityPath = t.TempDir()
 	p.postStartSettle = 0
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
-		if len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "show-environment" {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "show-environment") {
 			key := cmd[len(cmd)-1]
 			values := map[string]string{
 				"GC_SESSION_ID":     "session-1",
@@ -2240,11 +2247,9 @@ func TestProvider_RelaunchRespawnsAgentInWarmPod(t *testing.T) {
 	if !strings.Contains(joined, `CMD=$(printf '%s' "$@" | base64 -d)`) {
 		t.Errorf("respawn command = %q, want it to reconstruct its command from positional chunks", joined)
 	}
-	// The command is base64-shipped in bounded positional chunks, not inlined.
-	wantB64 := base64.StdEncoding.EncodeToString([]byte("agent --resume"))
-	if !strings.Contains(joined, wantB64) {
-		t.Errorf("respawn command omitted base64 command %q: %s", wantB64, joined)
-	}
+	// The protected identity wrapper is base64-shipped in bounded positional
+	// chunks; decode those chunks and confirm the configured command is inside.
+	decodedRespawnAgentCommand(t, respawn, runtime.Config{Command: "agent --resume"})
 	if strings.Contains(joined, "agent --resume") {
 		t.Errorf("respawn command = %q leaked the raw command; it must be passed separately", joined)
 	}

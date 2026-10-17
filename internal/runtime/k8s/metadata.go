@@ -152,9 +152,11 @@ func buildRespawnCommandWithIdentityFile(cfg runtime.Config, identityPath, ident
 		"set +a",
 		"rm -f -- "+quotedPath,
 		": > "+shellquote.Quote(identityBoundPath),
-		"exec sh -c "+shellquote.Quote(cfg.Command),
+		"exec sh -c "+shellquote.Quote(agentCommand(cfg)),
 	)
 	wrapped.Command = strings.Join(parts, "; ")
+	wrapped.PromptFlag = ""
+	wrapped.PromptSuffix = ""
 	if cfg.Env["LINUX_USERNAME"] != "" {
 		return buildRespawnCommandAsTmuxOwner(wrapped)
 	}

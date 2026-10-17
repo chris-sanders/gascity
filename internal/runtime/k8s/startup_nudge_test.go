@@ -8,10 +8,19 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/gastownhall/gascity/internal/runtime"
 )
+
+func setStartupNudgePodGeneration(pod *corev1.Pod, uid, containerID string) {
+	pod.UID = types.UID(uid)
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "agent", ContainerID: containerID,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}}
+}
 
 func TestStartupNudgeIntentIsControllerPrivateAndDiagnosticOmitsMessage(t *testing.T) {
 	p := newProviderWithOps(newFakeK8sOps())
@@ -167,11 +176,12 @@ func TestInspectStartupComposerRequiresExactVisibleDraftAndCursor(t *testing.T) 
 func TestStartupNudgeRecoveryResumesOnlyExactRecognizedComposer(t *testing.T) {
 	fake := newFakeK8sOps()
 	addRunningPod(fake, "worker", "worker")
-	fake.pods["worker"].UID = types.UID("pod-generation-1")
+	setStartupNudgePodGeneration(fake.pods["worker"], "pod-generation-1", "containerd://test-worker")
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
-		if len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "show-environment" {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "show-environment") {
 			key := cmd[len(cmd)-1]
-			if len(cmd) > 2 && cmd[2] == "-g" {
+			if strings.Contains(joined, " -g ") {
 				return "-" + key + "\n", nil
 			}
 			values := map[string]string{
@@ -268,11 +278,12 @@ func TestStartupNudgeOperatorResolutionIsIncarnationFenced(t *testing.T) {
 func TestStartupNudgeDeliveryUsesPersistedProviderAndFencesPaneGeneration(t *testing.T) {
 	fake := newFakeK8sOps()
 	addRunningPod(fake, "worker", "worker")
-	fake.pods["worker"].UID = types.UID("pod-generation-1")
+	setStartupNudgePodGeneration(fake.pods["worker"], "pod-generation-1", "containerd://test-worker")
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
-		if len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "show-environment" {
+		joined := strings.Join(cmd, " ")
+		if strings.Contains(joined, "show-environment") {
 			key := cmd[len(cmd)-1]
-			if len(cmd) >= 3 && cmd[2] == "-g" {
+			if strings.Contains(joined, " -g ") {
 				return "-" + key + "\n", nil
 			}
 			values := map[string]string{
@@ -355,7 +366,7 @@ func TestStartupNudgeSubmitSequenceIsProviderSpecific(t *testing.T) {
 func TestStartupNudgePaneFenceIncludesContainerRestartGeneration(t *testing.T) {
 	fake := newFakeK8sOps()
 	addRunningPod(fake, "worker", "worker")
-	fake.pods["worker"].UID = types.UID("pod-generation-1")
+	setStartupNudgePodGeneration(fake.pods["worker"], "pod-generation-1", "containerd://test-worker")
 	fake.execFunc = func(_ string, cmd []string) (string, error) {
 		if len(cmd) >= 2 && cmd[0] == "tmux" && cmd[1] == "display-message" {
 			return "4242\n", nil

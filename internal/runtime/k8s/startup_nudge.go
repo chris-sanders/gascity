@@ -364,7 +364,7 @@ func inspectStartupComposer(provider, message, screen string, geometry startupCo
 		return false, "composer_cursor_outside_captured_screen"
 	}
 	line := strings.TrimRight(lines[geometry.CursorY], "\r")
-	if geometry.CursorY < geometry.Height*3/4 {
+	if geometry.CursorY < (geometry.Height+1)/2 {
 		return false, "composer_cursor_outside_bottom_prompt_region"
 	}
 	for _, prefix := range knownPrefixes {
