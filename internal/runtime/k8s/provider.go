@@ -447,7 +447,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 	}
 	if requiresPostStartLiveness {
-		_, tmuxErr := p.execTmuxOwner(ctx, podName, "agent",
+		_, tmuxErr := p.execTmuxOwner(ctx, podName,
 			[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
 		if tmuxErr != nil {
 			cleanup("session died immediately after startup")
@@ -476,7 +476,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 // run SessionLive (RunLive is a no-op), matching the pre-un-weld behavior.
 func (p *Provider) runPodPostLaunchSetup(ctx context.Context, podName string, cfg runtime.Config) {
 	// Enable pane logging for diagnostics.
-	_, _ = p.execTmuxOwner(ctx, podName, "agent",
+	_, _ = p.execTmuxOwner(ctx, podName,
 		[]string{"tmux", "pipe-pane", "-t", tmuxSession, "-o", "cat >> /tmp/agent-output.log"}, nil)
 
 	// Run session_setup commands inside the pod.
@@ -535,7 +535,7 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 	defer releaseGeneration()
 	// The tmux server + "main" session must be alive to respawn into; a dead
 	// session means the box is not warm enough — reprovision, don't respawn.
-	if _, err := p.execTmuxOwner(ctx, podName, "agent",
+	if _, err := p.execTmuxOwner(ctx, podName,
 		[]string{"tmux", "has-session", "-t", tmuxSession}, nil); err != nil {
 		return fmt.Errorf("%w: session %q (pod %s has no live tmux session)", runtime.ErrSessionNotFound, name, podName)
 	}
@@ -570,7 +570,7 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 			case <-timer.C:
 			}
 		}
-		if _, err := p.execTmuxOwner(ctx, podName, "agent",
+		if _, err := p.execTmuxOwner(ctx, podName,
 			[]string{"tmux", "has-session", "-t", tmuxSession}, nil); err != nil {
 			return fmt.Errorf("%w: session %q died immediately after relaunch: %w",
 				runtime.ErrSessionDiedDuringStartup, name, err)
@@ -646,7 +646,7 @@ func (p *Provider) IsRunning(name string) bool {
 		return false
 	}
 	// Pod Running + tmux session alive.
-	_, err = p.execTmuxOwner(ctx, podName, "agent",
+	_, err = p.execTmuxOwner(ctx, podName,
 		[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
 	return err == nil
 }
@@ -659,7 +659,7 @@ func (p *Provider) IsAttached(name string) bool {
 	if err != nil {
 		return false
 	}
-	output, err := p.execTmuxOwner(ctx, podName, "agent",
+	output, err := p.execTmuxOwner(ctx, podName,
 		[]string{"tmux", "display-message", "-t", tmuxSession, "-p", "#{session_attached}"}, nil)
 	if err != nil {
 		return false
@@ -675,7 +675,7 @@ func (p *Provider) Attach(name string) error {
 		return fmt.Errorf("attach: no running pod for session %q", name)
 	}
 
-	tmuxCommand, err := p.tmuxOwnerCommand(ctx, podName, "agent", []string{"tmux", "attach", "-t", tmuxSession})
+	tmuxCommand, err := p.tmuxOwnerCommand(ctx, podName, []string{"tmux", "attach", "-t", tmuxSession})
 	if err != nil {
 		return fmt.Errorf("attach: resolving tmux owner for session %q: %w", name, err)
 	}
@@ -940,7 +940,7 @@ func (p *Provider) GetLastActivity(name string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, nil
 	}
-	output, err := p.execTmuxOwner(ctx, podName, "agent",
+	output, err := p.execTmuxOwner(ctx, podName,
 		[]string{"tmux", "display-message", "-t", tmuxSession, "-p", "#{session_activity}"}, nil)
 	if err != nil {
 		return time.Time{}, nil
@@ -1025,7 +1025,7 @@ func (p *Provider) probeTmuxLiveness(ctx context.Context, pod *corev1.Pod) (aliv
 	}
 	podName := pod.Name
 	for attempt := 0; attempt < livenessProbeAttempts; attempt++ {
-		_, err = p.execTmuxOwner(ctx, podName, "agent",
+		_, err = p.execTmuxOwner(ctx, podName,
 			[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
 		if err == nil {
 			return true, true, nil
@@ -1078,7 +1078,7 @@ func (p *Provider) Exec(ctx context.Context, name string, argv []string) ([]byte
 	if err != nil {
 		return nil, -1, fmt.Errorf("k8s exec %q: %w", name, err)
 	}
-	out, err := p.execTmuxOwner(ctx, podName, "agent", argv, nil)
+	out, err := p.execTmuxOwner(ctx, podName, argv, nil)
 	if err != nil {
 		var exitErr execerr.ExitError
 		if errors.As(err, &exitErr) && exitErr.Exited() {
@@ -1104,19 +1104,6 @@ func (p *Provider) findRunningPod(ctx context.Context, name string) (string, err
 	}
 	if len(pods) == 0 {
 		return "", fmt.Errorf("%w: no running pod for session %q", runtime.ErrSessionNotFound, name)
-	}
-	return pods[0].Name, nil
-}
-
-// findPod finds a pod by session label (any phase).
-func (p *Provider) findPod(ctx context.Context, name string) (string, error) {
-	label := SanitizeLabel(name)
-	pods, err := p.ops.listPods(ctx, "gc-session="+label, "")
-	if err != nil {
-		return "", err
-	}
-	if len(pods) == 0 {
-		return "", fmt.Errorf("no pod for session %q", name)
 	}
 	return pods[0].Name, nil
 }
@@ -1209,7 +1196,7 @@ func (p *Provider) waitForTmux(ctx context.Context, name string, timeout time.Du
 			return ctx.Err()
 		default:
 		}
-		_, err := p.execTmuxOwner(ctx, name, "agent",
+		_, err := p.execTmuxOwner(ctx, name,
 			[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
 		if err == nil {
 			return nil

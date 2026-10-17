@@ -246,7 +246,7 @@ func (p *Provider) deliverStartupNudge(ctx context.Context, intent *startupNudge
 	if err := p.verifyStartupNudgeIncarnation(ctx, intent, podName); err != nil {
 		return p.markStartupNudgeUncertain(ctx, intent, startupNudgeState{Status: startupNudgeUncertain, Reason: "session_incarnation_mismatch", PodName: podName, PodUID: string(pod.UID)})
 	}
-	panePID, err := p.execTmuxOwner(ctx, podName, "agent", []string{"tmux", "display-message", "-p", "-t", intent.Target, "#{pane_pid}"}, nil)
+	panePID, err := p.execTmuxOwner(ctx, podName, []string{"tmux", "display-message", "-p", "-t", intent.Target, "#{pane_pid}"}, nil)
 	if err != nil || strings.TrimSpace(panePID) == "" {
 		return p.markStartupNudgeUncertain(ctx, intent, startupNudgeState{Status: startupNudgeUncertain, Reason: "pane_generation_unavailable", PodName: podName, PodUID: string(pod.UID)})
 	}
@@ -262,7 +262,7 @@ func (p *Provider) deliverStartupNudge(ctx context.Context, intent *startupNudge
 		_ = p.updateStartupNudgeStateBounded(intent, state)
 		return errors.New("startup nudge target pane generation changed")
 	}
-	if _, err := p.execTmuxOwner(ctx, podName, "agent", append([]string{"tmux", "send-keys", "-t", intent.Target, "-l"}, runtime.TmuxLiteralArgs(intent.Message)...), nil); err != nil {
+	if _, err := p.execTmuxOwner(ctx, podName, append([]string{"tmux", "send-keys", "-t", intent.Target, "-l"}, runtime.TmuxLiteralArgs(intent.Message)...), nil); err != nil {
 		state.Status, state.Reason = startupNudgeUncertain, "paste_result_ambiguous"
 		_ = p.updateStartupNudgeStateBounded(intent, state)
 		return errors.New("startup nudge paste result is uncertain")
@@ -311,7 +311,7 @@ func (p *Provider) submitStartupNudgeWithDebounce(ctx context.Context, intent *s
 			_ = p.updateStartupNudgeStateBounded(intent, state)
 			return errors.New("startup nudge submit checkpoint could not be persisted")
 		}
-		if _, err := p.execTmuxOwner(ctx, state.PodName, "agent", []string{"tmux", "send-keys", "-t", intent.Target, keys[i]}, nil); err != nil {
+		if _, err := p.execTmuxOwner(ctx, state.PodName, []string{"tmux", "send-keys", "-t", intent.Target, keys[i]}, nil); err != nil {
 			state.Status, state.Reason = startupNudgeUncertain, "submit_result_ambiguous"
 			_ = p.updateStartupNudgeStateBounded(intent, state)
 			return errors.New("startup nudge submit result is uncertain")
@@ -401,7 +401,7 @@ func isASCII(value string) bool {
 }
 
 func (p *Provider) inspectStartupComposer(ctx context.Context, intent *startupNudgeIntent, state startupNudgeState) (bool, string) {
-	geometryOutput, err := p.execTmuxOwner(ctx, state.PodName, "agent", []string{
+	geometryOutput, err := p.execTmuxOwner(ctx, state.PodName, []string{
 		"tmux", "display-message", "-p", "-t", intent.Target,
 		"#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}",
 	}, nil)
@@ -412,7 +412,7 @@ func (p *Provider) inspectStartupComposer(ctx context.Context, intent *startupNu
 	if _, err := fmt.Sscanf(strings.TrimSpace(geometryOutput), "%d %d %d %d", &geometry.Width, &geometry.Height, &geometry.CursorX, &geometry.CursorY); err != nil {
 		return false, "composer_geometry_unavailable"
 	}
-	screen, err := p.execTmuxOwner(ctx, state.PodName, "agent", []string{
+	screen, err := p.execTmuxOwner(ctx, state.PodName, []string{
 		"tmux", "capture-pane", "-p", "-N", "-t", intent.Target,
 	}, nil)
 	if err != nil {
@@ -526,7 +526,7 @@ func (p *Provider) verifyStartupNudgePane(ctx context.Context, podName, target, 
 	if !ok || containerID != expectedContainerID || restartCount != expectedContainerRestart {
 		return errors.New("startup nudge container generation changed")
 	}
-	panePID, err := p.execTmuxOwner(ctx, podName, "agent", []string{"tmux", "display-message", "-p", "-t", target, "#{pane_pid}"}, nil)
+	panePID, err := p.execTmuxOwner(ctx, podName, []string{"tmux", "display-message", "-p", "-t", target, "#{pane_pid}"}, nil)
 	if err != nil || strings.TrimSpace(panePID) != expectedPID {
 		return errors.New("startup nudge pane generation changed")
 	}
@@ -584,6 +584,8 @@ func (p *Provider) RecoverStartupNudges(ctx context.Context) []runtime.StartupNu
 	return p.recoverStartupNudges(ctx, "", "")
 }
 
+// StartupNudgeSessionNames returns the session names with outstanding durable
+// startup delivery intents owned by this provider.
 func (p *Provider) StartupNudgeSessionNames(ctx context.Context) []string {
 	targets := p.StartupNudgeLeaseTargets(ctx)
 	ordered := make([]string, 0, len(targets))
@@ -593,6 +595,8 @@ func (p *Provider) StartupNudgeSessionNames(ctx context.Context) []string {
 	return ordered
 }
 
+// StartupNudgeLeaseTargets returns the newest pending intent for each session
+// so the controller can acquire the owning session row's runtime lease.
 func (p *Provider) StartupNudgeLeaseTargets(ctx context.Context) []runtime.StartupNudgeLeaseTarget {
 	if ctx == nil || ctx.Err() != nil {
 		return nil
@@ -652,10 +656,14 @@ func startupNudgeNeedsRecovery(root string, intent startupNudgeIntent) bool {
 	}
 }
 
+// RecoverStartupNudgesForSession recovers pending startup delivery intents for
+// one session after its current route has been resolved.
 func (p *Provider) RecoverStartupNudgesForSession(ctx context.Context, sessionName string) []runtime.StartupNudgeStatus {
 	return p.recoverStartupNudges(ctx, sessionName, "")
 }
 
+// RecoverStartupNudgesForLeasedSession recovers pending startup delivery
+// intents only when they match the session row held by the controller lease.
 func (p *Provider) RecoverStartupNudgesForLeasedSession(ctx context.Context, sessionName, sessionID string) []runtime.StartupNudgeStatus {
 	return p.recoverStartupNudges(ctx, sessionName, sessionID)
 }

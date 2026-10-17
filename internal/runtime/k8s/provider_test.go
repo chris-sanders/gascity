@@ -2314,7 +2314,7 @@ func TestControllerTmuxExecUsesLinuxUsernameAndPreservesStdin(t *testing.T) {
 	addRunningPod(fake, "s", "s")
 	fake.pods["s"].Spec.Containers = []corev1.Container{{Name: "agent", Env: []corev1.EnvVar{{Name: "LINUX_USERNAME", Value: "gcagent"}}}}
 	secret := "synthetic-source-file-value"
-	if _, err := p.execTmuxOwner(context.Background(), "s", "agent", []string{"sh", "-c", "tmux source-file \"$file\""}, strings.NewReader(secret)); err != nil {
+	if _, err := p.execTmuxOwner(context.Background(), "s", []string{"sh", "-c", "tmux source-file \"$file\""}, strings.NewReader(secret)); err != nil {
 		t.Fatalf("execTmuxOwner: %v", err)
 	}
 	var call *fakeCall

@@ -284,7 +284,7 @@ while [ "$attempt" -lt 100 ]; do
 done
 exit 75`
 	argv := append([]string{"sh", "-c", script, "sh", dir, identityBoundPath}, respawnCommand...)
-	_, err := p.execTmuxOwner(ctx, podName, "agent", argv, strings.NewReader(identityFile))
+	_, err := p.execTmuxOwner(ctx, podName, argv, strings.NewReader(identityFile))
 	if err != nil {
 		return fmt.Errorf("k8s relaunch %q: replacement pane did not bind", sessionName)
 	}
@@ -330,7 +330,7 @@ trap cleanup EXIT HUP INT TERM
 ( set -C; cat > "$file" )
 chmod 600 "$file"
 tmux source-file "$file"`
-	_, err := p.execTmuxOwner(ctx, podName, "agent", []string{"sh", "-c", script}, strings.NewReader(commandFile))
+	_, err := p.execTmuxOwner(ctx, podName, []string{"sh", "-c", script}, strings.NewReader(commandFile))
 	if err != nil {
 		return fmt.Errorf("private tmux metadata command failed")
 	}
@@ -348,7 +348,7 @@ exec 9>"$lockdir/tmux-metadata.lock"
 flock -s -w 10 9
 exec tmux "$@"`
 	cmd := append([]string{"sh", "-c", script, "sh"}, args...)
-	return p.execTmuxOwner(ctx, podName, "agent", cmd, nil)
+	return p.execTmuxOwner(ctx, podName, cmd, nil)
 }
 
 func (p *Provider) setPrivateMetadata(ctx context.Context, sessionName, key, value string) error {
@@ -643,7 +643,7 @@ func (p *Provider) readPodEnvValue(ctx context.Context, podName, key string) (st
 set -eu
 value=$(printenv "$1" 2>/dev/null) || exit 44
 printf '%s' "$value"`
-	value, err := p.execTmuxOwner(ctx, podName, "agent", []string{"sh", "-c", script, "sh", key}, nil)
+	value, err := p.execTmuxOwner(ctx, podName, []string{"sh", "-c", script, "sh", key}, nil)
 	if err != nil && isExecExitStatus(err, k8sMetaReadMissing) {
 		return "", nil
 	}

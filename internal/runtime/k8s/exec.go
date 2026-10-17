@@ -37,26 +37,26 @@ type realK8sOps struct {
 	namespace  string
 }
 
-// execTmuxOwner runs controller commands as the account that owns the pod's
-// tmux server. Ordinary Pods already execute as their configured container
-// identity; the legacy LINUX_USERNAME path starts tmux after su and must use
-// the same login user for every later tmux command.
-func (p *Provider) execTmuxOwner(ctx context.Context, pod, container string, cmd []string, stdin io.Reader) (string, error) {
-	ownerCommand, err := p.tmuxOwnerCommand(ctx, pod, container, cmd)
+// execTmuxOwner runs controller commands in the agent container as the
+// account that owns the pod's tmux server. Ordinary Pods already execute as
+// their configured container identity; the legacy LINUX_USERNAME path starts
+// tmux after su and must use the same login user for every later tmux command.
+func (p *Provider) execTmuxOwner(ctx context.Context, pod string, cmd []string, stdin io.Reader) (string, error) {
+	ownerCommand, err := p.tmuxOwnerCommand(ctx, pod, cmd)
 	if err != nil {
 		return "", err
 	}
-	return p.ops.execInPod(ctx, pod, container, ownerCommand, stdin)
+	return p.ops.execInPod(ctx, pod, "agent", ownerCommand, stdin)
 }
 
-func (p *Provider) tmuxOwnerCommand(ctx context.Context, pod, container string, cmd []string) ([]string, error) {
+func (p *Provider) tmuxOwnerCommand(ctx context.Context, pod string, cmd []string) ([]string, error) {
 	podSpec, err := p.ops.getPod(ctx, pod)
 	if err != nil {
 		return nil, err
 	}
 	username := ""
 	for _, candidate := range podSpec.Spec.Containers {
-		if candidate.Name != container {
+		if candidate.Name != "agent" {
 			continue
 		}
 		for _, env := range candidate.Env {
