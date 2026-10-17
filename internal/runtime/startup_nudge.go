@@ -42,6 +42,8 @@ type StartupNudgeLeasedSessionProvider interface {
 	RecoverStartupNudgesForLeasedSession(context.Context, string, string) []StartupNudgeStatus
 }
 
+// StartupNudgeLeaseTarget identifies the newest startup intent for a session
+// so recovery can acquire the owning session row's runtime lease first.
 type StartupNudgeLeaseTarget struct {
 	SessionName string
 	SessionID   string
