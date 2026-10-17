@@ -334,12 +334,13 @@ func ensureManagedDoltProjectIDAtTargetTLS(metadataPath string, target contract.
 	// roots cannot be lost in or leak through the process-wide pool.
 	var db *sql.DB
 	ownedDB := false
-	if target.Socket != "" {
+	switch {
+	case target.Socket != "":
 		if tlsEnabled || strings.TrimSpace(tlsCA) != "" {
 			return managedDoltProjectIDReport{}, fmt.Errorf("TLS is not supported for a Unix socket identity target")
 		}
 		db, err = managedDoltOpenDatabaseSocket(target.Socket, target.User, database)
-	} else if tlsEnabled {
+	case tlsEnabled:
 		config, configErr := verifiedDoltTLSConfig(target.Host, tlsCA)
 		if configErr != nil {
 			return managedDoltProjectIDReport{}, fmt.Errorf("resolved TLS trust configuration is invalid")
@@ -359,7 +360,7 @@ func ensureManagedDoltProjectIDAtTargetTLS(metadataPath string, target contract.
 		db = sql.OpenDB(connector)
 		db.SetMaxOpenConns(1)
 		ownedDB = true
-	} else {
+	default:
 		if strings.TrimSpace(tlsCA) != "" {
 			return managedDoltProjectIDReport{}, fmt.Errorf("TLS CA was supplied while TLS is disabled")
 		}
