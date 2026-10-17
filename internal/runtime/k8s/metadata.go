@@ -76,6 +76,14 @@ var orderedSessionIdentityKeys = []string{
 	"GC_SESSION_ID",
 }
 
+var generationBoundMetadataKeys = []string{
+	"GC_INSTANCE_TOKEN",
+	"BEADS_HOLDER_TOKEN",
+	"GC_RUNTIME_EPOCH",
+	"GC_CONTINUATION_EPOCH",
+	"GC_SESSION_ID",
+}
+
 var protocolMetadataKeys = []string{
 	"GC_DRAIN",
 	"GC_DRAIN_ACK",
@@ -757,10 +765,11 @@ func (p *Provider) hasLegacyMetadataBackfill(ctx context.Context, podName, key s
 
 // backfillSessionMetadataCommands fills only values absent from the session.
 // Generation-bound identity is evaluated and written as one coherent group:
-// an existing instance token, runtime epoch, or session ID fences the old
-// generation's epoch/token values. The hidden completion marker is last, so a
-// failed source-file operation can be retried. It is distinct from the current
-// identity-version marker and never promotes legacy metadata to that version.
+// any existing value or explicit removal marker for an instance token, holder
+// token, runtime epoch, continuation epoch, or session ID fences the entire
+// group. The hidden completion marker is last, so a failed source-file
+// operation can be retried. It is distinct from the current identity-version
+// marker and never promotes legacy metadata to that version.
 func backfillSessionMetadataCommands(env map[string]string, publishIdentity bool, markerKey string) string {
 	lines := make([]string, 0, len(orderedSessionIdentityKeys)+len(runtimeOwnerEnvKeys)+1)
 	if publishIdentity {
@@ -779,8 +788,11 @@ func backfillSessionMetadataCommands(env map[string]string, publishIdentity bool
 			}
 		}
 		if len(generation) > 0 {
-			condition := fmt.Sprintf("tmux has-session -t %s && ! tmux show-environment -t %s GC_INSTANCE_TOKEN >/dev/null 2>&1 && ! tmux show-environment -t %s GC_RUNTIME_EPOCH >/dev/null 2>&1 && ! tmux show-environment -t %s GC_SESSION_ID >/dev/null 2>&1", tmuxSession, tmuxSession, tmuxSession, tmuxSession)
-			lines = append(lines, tmuxMetadataCommand("if-shell", condition, strings.Join(generation, " ; ")))
+			conditions := []string{fmt.Sprintf("tmux has-session -t %s", tmuxSession)}
+			for _, key := range generationBoundMetadataKeys {
+				conditions = append(conditions, fmt.Sprintf("! tmux show-environment -t %s %s >/dev/null 2>&1", tmuxSession, key))
+			}
+			lines = append(lines, tmuxMetadataCommand("if-shell", strings.Join(conditions, " && "), strings.Join(generation, " ; ")))
 		}
 		for _, key := range []string{"GC_SESSION_NAME", "GC_ALIAS", "GC_AGENT", "BEADS_ACTOR", "GC_TEMPLATE", "GC_SESSION_ORIGIN", "GC_PROVIDER"} {
 			if value := env[key]; value != "" {

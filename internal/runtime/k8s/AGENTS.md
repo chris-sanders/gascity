@@ -27,6 +27,8 @@ successful compatibility repair uses a separate hidden completion marker so
 later metadata reads do not repeatedly inspect the pod environment. A partial
 compatibility repair must not publish the current identity-version marker.
 Instance and holder tokens are filled together only when both are absent.
-Runtime and continuation epochs are filled as a generation group only when
-instance token, runtime epoch, and session ID are all absent; descriptive
-identity and runtime-owner values may be filled independently.
+Instance token, holder token, runtime epoch, continuation epoch, and session ID
+are filled as a generation group only when all five keys are absent from the
+session. Any existing value or explicit removal marker for one of those keys
+fences the entire group; descriptive identity and runtime-owner values may be
+filled independently.

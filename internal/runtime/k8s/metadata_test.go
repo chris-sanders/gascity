@@ -477,6 +477,9 @@ func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.
 	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
 		t.Fatalf("create legacy session: %v", err)
 	}
+	if _, err := run("set-environment", "-t", tmuxSession, "GC_PROVIDER", "session-provider"); err != nil {
+		t.Fatalf("seed session-local provider: %v", err)
+	}
 	if _, err := run("set-environment", "-t", tmuxSession, "-r", "GC_ALIAS"); err != nil {
 		t.Fatalf("mark legacy alias explicitly removed: %v", err)
 	}
@@ -492,8 +495,8 @@ func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.
 	}
 	t.Setenv("GC_TEMPLATE", "")
 	ops.calls = nil
-	if got, err := p.GetMeta("legacy", "GC_PROVIDER"); err != nil || got != "pod-provider" {
-		t.Fatalf("legacy global identity read = %q, %v", got, err)
+	if got, err := p.GetMeta("legacy", "GC_SESSION_ID"); err != nil || got != "legacy-session" {
+		t.Fatalf("legacy session identity read = %q, %v; want backfilled value", got, err)
 	}
 	firstReadExecs := len(tmuxMetadataPodExecs(ops.calls))
 	if current, err := p.hasCurrentIdentityMetadataVersion(context.Background(), "legacy"); err != nil || current {
@@ -503,21 +506,18 @@ func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.
 		t.Fatalf("legacy compatibility completion marker = %q, %v", marker, err)
 	}
 	ops.calls = nil
-	if got, err := p.GetMeta("legacy", "GC_PROVIDER"); err != nil || got != "pod-provider" {
-		t.Fatalf("second legacy identity read = %q, %v", got, err)
+	if got, err := p.GetMeta("legacy", "GC_PROVIDER"); err != nil || got != "session-provider" {
+		t.Fatalf("second legacy identity read = %q, %v; want preserved session value", got, err)
 	}
 	secondExecs := tmuxMetadataPodExecs(ops.calls)
-	if len(secondExecs) >= firstReadExecs {
-		t.Fatalf("second identity read used %d pod execs; first repair used %d", len(secondExecs), firstReadExecs)
-	}
 	for _, call := range secondExecs {
 		joined := strings.Join(call.cmd, " ")
 		if strings.Contains(joined, `printenv "$1"`) || strings.Contains(joined, "tmux source-file") {
 			t.Fatalf("second identity read repeated compatibility repair exec: %q", call.cmd)
 		}
 	}
-	if len(secondExecs) != 4 {
-		t.Fatalf("second identity read used %d pod execs, want four metadata reads and no repair", len(secondExecs))
+	if len(secondExecs) != 2 || len(secondExecs) >= firstReadExecs {
+		t.Fatalf("second identity read used %d pod execs; want two reads without repair (first repair used %d)", len(secondExecs), firstReadExecs)
 	}
 	if got, err := p.GetMeta("legacy", "GC_SESSION_ID"); err != nil || got != "legacy-session" {
 		t.Fatalf("legacy session identity backfill = %q, %v", got, err)
@@ -533,7 +533,7 @@ func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.
 	if got, err := run("show-environment", "-t", tmuxSession, "GC_SESSION_ID"); err != nil || strings.TrimSpace(got) != "GC_SESSION_ID=legacy-session" {
 		t.Fatalf("backfilled identity in tmux = %q, %v", got, err)
 	}
-	if got, err := run("show-environment", "-t", tmuxSession, "GC_PROVIDER"); err != nil || strings.TrimSpace(got) != "GC_PROVIDER=pod-provider" {
+	if got, err := run("show-environment", "-t", tmuxSession, "GC_PROVIDER"); err != nil || strings.TrimSpace(got) != "GC_PROVIDER=session-provider" {
 		t.Fatalf("backfill overwrote existing session identity = %q, %v", got, err)
 	}
 	if got, err := run("show-environment", "-t", tmuxSession, "GC_ALIAS"); err != nil || strings.TrimSpace(got) != "-GC_ALIAS" {
@@ -544,6 +544,68 @@ func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.
 	}
 	if current, err := p.hasCurrentIdentityMetadataVersion(context.Background(), "legacy"); err != nil || current {
 		t.Fatalf("partial legacy backfill marker = %t, %v; want marker absent", current, err)
+	}
+}
+
+func TestK8sLegacyBackfillGenerationGroupRequiresAllFiveMetadataKeysAbsent(t *testing.T) {
+	podEnv := map[string]string{
+		"GC_INSTANCE_TOKEN":     "pod-instance",
+		"BEADS_HOLDER_TOKEN":    "pod-holder",
+		"GC_RUNTIME_EPOCH":      "pod-runtime",
+		"GC_CONTINUATION_EPOCH": "pod-continuation",
+		"GC_SESSION_ID":         "pod-session",
+	}
+	tests := []struct {
+		name      string
+		seedKey   string
+		seedValue string
+		removed   bool
+	}{
+		{name: "continuation value survives", seedKey: "GC_CONTINUATION_EPOCH", seedValue: "session-continuation"},
+		{name: "continuation removal survives", seedKey: "GC_CONTINUATION_EPOCH", removed: true},
+		{name: "holder value fences generation", seedKey: "BEADS_HOLDER_TOKEN", seedValue: "adopted-holder"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ops, run := newTmuxMetadataTestOps(t, "worker")
+			if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
+				t.Fatalf("create legacy tmux session: %v", err)
+			}
+			if tt.removed {
+				if _, err := run("set-environment", "-t", tmuxSession, "-r", tt.seedKey); err != nil {
+					t.Fatalf("mark %s explicitly removed: %v", tt.seedKey, err)
+				}
+			} else if _, err := run("set-environment", "-t", tmuxSession, tt.seedKey, tt.seedValue); err != nil {
+				t.Fatalf("seed session-local %s: %v", tt.seedKey, err)
+			}
+			for key, value := range podEnv {
+				t.Setenv(key, value)
+			}
+			t.Setenv("GC_PROVIDER", "pod-provider")
+			p := newProviderWithOps(ops)
+			p.cityPath = t.TempDir()
+			if got, err := p.GetMeta("worker", "GC_PROVIDER"); err != nil || got != "pod-provider" {
+				t.Fatalf("descriptive identity backfill = %q, %v; want pod-provider", got, err)
+			}
+
+			for _, key := range generationBoundMetadataKeys {
+				output, err := run("show-environment", "-t", tmuxSession, key)
+				if key != tt.seedKey {
+					if err == nil {
+						t.Fatalf("generation group filled %s=%q despite existing %s", key, strings.TrimSpace(output), tt.seedKey)
+					}
+					continue
+				}
+				want := key + "=" + tt.seedValue
+				if tt.removed {
+					want = "-" + key
+				}
+				if err != nil || strings.TrimSpace(output) != want {
+					t.Fatalf("session %s = %q, %v; want %q", key, strings.TrimSpace(output), err, want)
+				}
+			}
+		})
 	}
 }
 
