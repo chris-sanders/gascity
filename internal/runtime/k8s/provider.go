@@ -788,10 +788,18 @@ func (p *Provider) SetMeta(name, key, value string) error {
 
 func (p *Provider) sharedMetadataSetCommands(ctx context.Context, podName, name, key, value string) (string, error) {
 	class := classifyMetadataKey(key)
+	if value != "" {
+		if err := validateTmuxMetadataValue(key, value); err != nil {
+			return "", fmt.Errorf("k8s set metadata key %q for session %q: control characters are not supported", key, name)
+		}
+	}
 	if class == metadataIdentity && key == "GC_SESSION_ID" {
 		token, err := p.getMetaFromPod(ctx, podName, name, "GC_INSTANCE_TOKEN")
 		if err != nil {
 			return "", fmt.Errorf("k8s set session identity for %q failed: runtime token could not be read", name)
+		}
+		if token != "" && validateTmuxMetadataValue("GC_INSTANCE_TOKEN", token) != nil {
+			return "", fmt.Errorf("k8s set session identity for %q failed: runtime token is invalid", name)
 		}
 		commands := tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "GC_SESSION_ID") + "\n"
 		if token != "" {
@@ -817,6 +825,9 @@ func (p *Provider) sharedMetadataSetCommands(ctx context.Context, podName, name,
 		if err != nil {
 			return "", fmt.Errorf("k8s set runtime identity for session %q failed: session identity could not be read", name)
 		}
+		if sessionID != "" && validateTmuxMetadataValue("GC_SESSION_ID", sessionID) != nil {
+			return "", fmt.Errorf("k8s set runtime identity for session %q failed: session identity is invalid", name)
+		}
 		commands := tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "GC_SESSION_ID") + "\n"
 		if value == "" {
 			commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "GC_INSTANCE_TOKEN") + "\n"
@@ -831,9 +842,19 @@ func (p *Provider) sharedMetadataSetCommands(ctx context.Context, podName, name,
 		return commands, nil
 	}
 	if class != metadataControllerPrivate && value == "" {
-		return tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", key) + "\n", nil
+		commands := tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", key) + "\n"
+		if key == "GC_RESTART_REQUESTED" {
+			commands += tmuxMetadataCommand("set-option", "-t", tmuxSession, restartRequestedOption, "") + "\n"
+		}
+		return commands, nil
 	}
-	return tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value) + "\n", nil
+	commands := tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value) + "\n"
+	if key == "GC_RESTART_REQUESTED" {
+		// The environment remains the protocol authority. This option is the
+		// existing in-pod batched-inventory index and must track each write.
+		commands += tmuxMetadataCommand("set-option", "-t", tmuxSession, restartRequestedOption, value) + "\n"
+	}
+	return commands, nil
 }
 
 // GetMeta retrieves identity and interoperable protocol values from tmux;
@@ -888,6 +909,9 @@ func (p *Provider) RemoveMeta(name, key string) error {
 	lines := make([]string, 0, len(keys))
 	for _, removeKey := range keys {
 		lines = append(lines, tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", removeKey))
+	}
+	if key == "GC_RESTART_REQUESTED" {
+		lines = append(lines, tmuxMetadataCommand("set-option", "-t", tmuxSession, restartRequestedOption, ""))
 	}
 	if err := p.sourcePrivateTmuxFile(ctx, podName, strings.Join(lines, "\n")+"\n"); err != nil {
 		return fmt.Errorf("k8s remove metadata key %q for session %q failed", key, name)

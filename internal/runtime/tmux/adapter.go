@@ -1077,7 +1077,9 @@ func (p *Provider) RemoveMeta(name, key string) error {
 	if err := p.tm.RemoveEnvironment(name, key); err != nil || key != "GC_RESTART_REQUESTED" {
 		return err
 	}
-	_, err := p.tm.run("set-option", "-t", paneTarget(name), "-u", restartRequestedOption)
+	// An empty session override masks a same-named server-global option; -u
+	// would expose that stale value again in the batched runtime inventory.
+	_, err := p.tm.run("set-option", "-t", paneTarget(name), restartRequestedOption, "")
 	return err
 }
 

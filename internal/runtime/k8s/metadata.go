@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	execerr "k8s.io/client-go/util/exec"
 
@@ -22,9 +24,10 @@ import (
 )
 
 const (
-	k8sMetaReadMissing = 44
-	k8sMetaOpTimeout   = 15 * time.Second
-	identityUnboundKey = "__gc_identity_unbound"
+	k8sMetaReadMissing     = 44
+	k8sMetaOpTimeout       = 15 * time.Second
+	identityUnboundKey     = "__gc_identity_unbound"
+	restartRequestedOption = "@GC_RESTART_REQUESTED"
 )
 
 func processCityPath() string {
@@ -175,6 +178,9 @@ func (p *Provider) seedStartMetadata(ctx context.Context, podName, sessionName s
 }
 
 func (p *Provider) publishSessionMetadata(ctx context.Context, podName, sessionName string, env map[string]string, publishIdentity, publishRuntimeOwner, clearProtocol bool) error {
+	if err := validateSessionMetadataValues(env, publishIdentity, publishRuntimeOwner); err != nil {
+		return fmt.Errorf("k8s runtime metadata for session %q is invalid", sessionName)
+	}
 	commands := sessionMetadataCommands(env, publishIdentity, publishRuntimeOwner, clearProtocol)
 	if commands == "" {
 		return nil
@@ -201,6 +207,7 @@ func sessionMetadataCommands(env map[string]string, publishIdentity, publishRunt
 		for _, key := range protocolMetadataKeys {
 			lines = append(lines, tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", key))
 		}
+		lines = append(lines, tmuxMetadataCommand("set-option", "-t", tmuxSession, restartRequestedOption, ""))
 	}
 	if publishIdentity {
 		for _, key := range orderedSessionIdentityKeys {
@@ -240,6 +247,9 @@ func sessionMetadataCommands(env map[string]string, publishIdentity, publishRunt
 // publishes the tmux session identity. The controller-side tombstone stays in
 // place through the subsequent post-launch liveness check.
 func (p *Provider) respawnWithStagedIdentity(ctx context.Context, podName, sessionName string, env map[string]string, cfg runtime.Config) error {
+	if err := validateSessionMetadataValues(env, true, true); err != nil {
+		return fmt.Errorf("k8s relaunch %q: runtime identity contains unsupported characters", sessionName)
+	}
 	identityFile := sessionMetadataEnvironmentFile(env)
 	nonce := make([]byte, 12)
 	if _, err := rand.Read(nonce); err != nil {
@@ -292,6 +302,47 @@ exit 75`
 	}
 	if err := p.publishSessionMetadata(ctx, podName, sessionName, env, true, true, false); err != nil {
 		return fmt.Errorf("k8s relaunch %q: replacement pane bound but identity publication failed", sessionName)
+	}
+	return nil
+}
+
+func validateSessionMetadataValues(env map[string]string, validateIdentity, validateRuntimeOwner bool) error {
+	if validateIdentity {
+		for _, key := range orderedSessionIdentityKeys {
+			if key == "BEADS_HOLDER_TOKEN" {
+				continue
+			}
+			if value := env[key]; value != "" {
+				if err := validateTmuxMetadataValue(key, value); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if validateRuntimeOwner {
+		for _, key := range runtimeOwnerEnvKeys {
+			if value := env[key]; value != "" {
+				if err := validateTmuxMetadataValue(key, value); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// tmux environment values cannot represent control characters faithfully:
+// tmux 3.6, for example, rewrites newlines to underscores. Reject them before
+// either shell staging or tmux publication so identity cannot be silently
+// changed and a staged value cannot inject shell syntax.
+func validateTmuxMetadataValue(key, value string) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("metadata value for %q is not valid UTF-8", key)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("metadata value for %q contains a control character", key)
+		}
 	}
 	return nil
 }
@@ -702,7 +753,37 @@ func isExecExitStatus(err error, status int) bool {
 func tmuxMetadataCommand(args ...string) string {
 	quoted := make([]string, len(args))
 	for i, arg := range args {
-		quoted[i] = "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+		quoted[i] = tmuxConfigQuote(arg)
 	}
 	return strings.Join(quoted, " ")
+}
+
+func tmuxConfigQuote(value string) string {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '\\':
+			quoted.WriteString(`\\`)
+		case '"':
+			quoted.WriteString(`\"`)
+		case '$':
+			quoted.WriteString(`\$`)
+		case '\n':
+			quoted.WriteString(`\n`)
+		case '\r':
+			quoted.WriteString(`\r`)
+		case '\t':
+			quoted.WriteString(`\t`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&quoted, `\%03o`, r)
+			} else {
+				quoted.WriteRune(r)
+			}
+		}
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
 }

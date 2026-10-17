@@ -4618,9 +4618,10 @@ func (t *Tmux) SetEnvironment(session, key, value string) error {
 	return t.runFromCommandFile(args)
 }
 
-// RemoveEnvironment removes an environment variable from the session.
+// RemoveEnvironment marks an environment variable removed from the session so
+// a same-named server-global value cannot reappear in panes or metadata reads.
 func (t *Tmux) RemoveEnvironment(session, key string) error {
-	_, err := t.run("set-environment", "-t", sessionTarget(session), "-u", key)
+	_, err := t.run("set-environment", "-t", sessionTarget(session), "-r", key)
 	return err
 }
 

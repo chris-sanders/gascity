@@ -12,9 +12,10 @@ import (
 // lists sessions by name) ends the executor-trimmed list-panes output, so its
 // empty marker field loses its tab. Before and after #7893's marker clear
 // (RemoveMeta unsets the option mirror), the batched inventory must still read
-// every session, with only the marked one marked. The server is private to
-// this test (its own -L socket under the package's private TMUX_TMPDIR) and
-// only it is torn down.
+// every session, with only the marked one marked. A stale server-global option
+// also must not reappear after the session marker is cleared. The server is
+// private to this test (its own -L socket under the package's private
+// TMUX_TMPDIR) and only it is torn down.
 // Kills: an inventory parse that needs the trailing empty marker's tab.
 func TestTmuxRuntimeInventory_RealTmuxEmptyTrailingMarker(t *testing.T) {
 	if !hasTmux() {
@@ -24,6 +25,9 @@ func TestTmuxRuntimeInventory_RealTmuxEmptyTrailingMarker(t *testing.T) {
 	cfg.SocketName = privateSocketName("inv")
 	p := NewProviderWithConfig(cfg)
 	t.Cleanup(func() { _ = p.tm.KillServer() })
+	if _, err := p.tm.run("set-option", "-g", restartRequestedOption, "stale-global"); err != nil {
+		t.Fatalf("set stale global inventory option: %v", err)
+	}
 	for _, name := range []string{"inv-a-asked", "inv-z-quiet"} {
 		if err := p.tm.NewSessionWithCommand(name, t.TempDir(), "sleep 300"); err != nil {
 			t.Fatalf("new session %s: %v", name, err)
@@ -69,4 +73,7 @@ func TestTmuxRuntimeInventory_RealTmuxEmptyTrailingMarker(t *testing.T) {
 		t.Fatalf("RemoveMeta: %v", err)
 	}
 	check("marker cleared", map[string]bool{"inv-a-asked": false, "inv-z-quiet": false})
+	if got, err := p.tm.run("show-options", "-gv", restartRequestedOption); err != nil || strings.TrimSpace(got) != "stale-global" {
+		t.Fatalf("global inventory fixture = %q, %v; want stale global option to remain", got, err)
+	}
 }

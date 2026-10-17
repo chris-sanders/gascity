@@ -78,6 +78,7 @@ gc [flags]
 | [gc skill](#gc-skill) | List visible skills |
 | [gc sling](#gc-sling) | Route work to a session config or agent |
 | [gc start](#gc-start) | Start the city under the machine-wide supervisor |
+| [gc startup-nudge](#gc-startup-nudge) | inspect and resolve durable startup prompt deliveries |
 | [gc status](#gc-status) | Show city-wide status overview |
 | [gc stop](#gc-stop) | Stop all agent sessions in the city |
 | [gc storage](#gc-storage) | Inspect and migrate this city's storage-class layout |
@@ -4834,6 +4835,33 @@ gc supervisor run
 | `--json` | bool |  | emit JSONL summary |
 | `--no-auto-restart` | bool |  | detect supervisor binary drift but do not auto-restart; exits non-zero on drift |
 | `--verbose` | bool |  | disable warning deduplication and print every supervisor warning |
+
+## gc startup-nudge
+
+inspect and resolve durable startup prompt deliveries
+
+```
+gc startup-nudge
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc startup-nudge resolve](#gc-startup-nudge-resolve) | confirm delivery or explicitly authorize one retry for an immutable intent |
+
+## gc startup-nudge resolve
+
+confirm delivery or explicitly authorize one retry for an immutable intent
+
+```
+gc startup-nudge resolve [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--city-path` | string |  | owning city directory |
+| `--decision` | string |  | delivered or retry (retry asserts the prior prompt was not consumed) |
+| `--incarnation` | string |  | exact session incarnation reported by gc doctor |
+| `--intent` | string |  | immutable 128-bit startup intent ID |
 
 ## gc status
 
