@@ -514,9 +514,8 @@ func TestTmuxRuntimeInventory_ActivityDiscountsAPoke(t *testing.T) {
 }
 
 // Kills a restart marker lost from the batched read, or one read off a
-// session that has none (CONTRACT v5.10q, C7a-2b): the session's
-// @GC_RESTART_REQUESTED user option, carried on every pane line, sets
-// RestartRequested; a blank one leaves it unset.
+// session that has none: the session's GC_RESTART_REQUESTED environment value,
+// carried on every pane line, sets RestartRequested; a blank one leaves it unset.
 func TestTmuxRuntimeInventory_ReadsTheRestartMarker(t *testing.T) {
 	got, err := runtimeInventoryFrom(t, &fakeExecutor{out: inventoryLines(
 		"asked\t$1\t1700000001\t0\t0.0\t0\t101\t1700000100\t1700000050",
@@ -529,8 +528,8 @@ func TestTmuxRuntimeInventory_ReadsTheRestartMarker(t *testing.T) {
 	if !got["asked"].RestartRequested || got["quiet"].RestartRequested {
 		t.Fatalf("RestartRequested asked=%t quiet=%t, want only asked", got["asked"].RestartRequested, got["quiet"].RestartRequested)
 	}
-	if !strings.HasSuffix(runtimeInventoryFormat, "\t#{@GC_RESTART_REQUESTED}") {
-		t.Fatalf("format %q does not read the marker's option", runtimeInventoryFormat)
+	if !strings.HasSuffix(runtimeInventoryFormat, "\t#{E:GC_RESTART_REQUESTED}") {
+		t.Fatalf("format %q does not read the session environment marker", runtimeInventoryFormat)
 	}
 }
 
@@ -589,10 +588,9 @@ func TestTmuxRuntimeInventory_ExecutorTrimmedEmptyMarker(t *testing.T) {
 	}
 }
 
-// Kills a restart marker the batched read cannot see (C7a-2b): SetMeta and
-// RemoveMeta of GC_RESTART_REQUESTED write its user-option mirror beside the
-// environment, and no other key gets one.
-func TestTmuxRestartMarkerIsMirroredToAnOption(t *testing.T) {
+// The shared protocol has one writable authority: the session environment.
+// Inventory reads that value directly instead of keeping a second option copy.
+func TestTmuxRestartMarkerHasNoOptionMirror(t *testing.T) {
 	fe := &fakeExecutor{}
 	p := NewProviderWithConfig(Config{})
 	p.tm.exec = fe
@@ -602,23 +600,13 @@ func TestTmuxRestartMarkerIsMirroredToAnOption(t *testing.T) {
 	if err := p.RemoveMeta("s", "GC_RESTART_REQUESTED"); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.SetMeta("s", "GC_OTHER", "v"); err != nil {
-		t.Fatal(err)
-	}
 	var options []string
 	for _, call := range fe.calls {
 		if slices.Contains(call, "set-option") {
 			options = append(options, strings.Join(call, " "))
 		}
 	}
-	if len(options) != 2 || !strings.Contains(options[0], "@GC_RESTART_REQUESTED 1700000050") || !strings.HasSuffix(options[1], "@GC_RESTART_REQUESTED ") {
-		t.Fatalf("option writes %q, want the marker set then an empty shadow, and nothing else", options)
-	}
-	// set-option's -t is a target-pane: tmux 3.4 answers "no such session"
-	// for a bare "=s", so the session is fenced as "=s:" (paneTarget).
-	for _, option := range options {
-		if !strings.Contains(option, "-t =s: ") {
-			t.Errorf("option write %q, want the session fenced as a pane target (-t =s:)", option)
-		}
+	if len(options) != 0 {
+		t.Fatalf("protocol marker wrote a second option authority: %q", options)
 	}
 }

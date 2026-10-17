@@ -300,9 +300,6 @@ func TestK8sMetadataProtocolAgentInteropAndGenerationRecycle(t *testing.T) {
 	if _, err := run("set-environment", "-g", "GC_RESTART_REQUESTED", "stale-global-restart"); err != nil {
 		t.Fatalf("set stale global restart request: %v", err)
 	}
-	if _, err := run("set-option", "-g", restartRequestedOption, "stale-global-option"); err != nil {
-		t.Fatalf("set stale global restart option: %v", err)
-	}
 	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
 		t.Fatalf("create protocol session: %v", err)
 	}
@@ -327,10 +324,7 @@ func TestK8sMetadataProtocolAgentInteropAndGenerationRecycle(t *testing.T) {
 			t.Fatalf("controller SetMeta(%s): %v", key, err)
 		}
 	}
-	if got, err := run("show-options", "-qv", "-t", tmuxSession, restartRequestedOption); err != nil || strings.TrimSpace(got) != "1700000000" {
-		t.Fatalf("in-pod restart inventory option = %q, %v; want controller marker", got, err)
-	}
-	if got, err := run("list-panes", "-t", tmuxSession, "-F", "#{@GC_RESTART_REQUESTED}"); err != nil || strings.TrimSpace(got) != "1700000000" {
+	if got, err := run("list-panes", "-t", tmuxSession, "-F", "#{E:GC_RESTART_REQUESTED}"); err != nil || strings.TrimSpace(got) != "1700000000" {
 		t.Fatalf("in-pod batched inventory marker = %q, %v; want controller marker", got, err)
 	}
 	if got, err := run("show-environment", "-t", tmuxSession, "GC_DRAIN"); err != nil || strings.TrimSpace(got) != "GC_DRAIN=operator" {
@@ -360,10 +354,7 @@ func TestK8sMetadataProtocolAgentInteropAndGenerationRecycle(t *testing.T) {
 			t.Fatalf("agent-visible %s after controller clear = %q, %v; want removal marker", key, got, err)
 		}
 	}
-	if got, err := run("show-options", "-gv", restartRequestedOption); err != nil || strings.TrimSpace(got) != "stale-global-option" {
-		t.Fatalf("global restart option fixture = %q, %v; want stale global value to remain", got, err)
-	}
-	if got, err := run("list-panes", "-t", tmuxSession, "-F", "#{@GC_RESTART_REQUESTED}"); err != nil || strings.TrimSpace(got) != "" {
+	if got, err := run("list-panes", "-t", tmuxSession, "-F", "#{E:GC_RESTART_REQUESTED}"); err != nil || strings.TrimSpace(got) != "" {
 		t.Fatalf("in-pod batched inventory after clear = %q, %v; want no stale restart marker", got, err)
 	}
 	if got, err := run("show-environment", "-g", "GC_DRAIN"); err != nil || strings.TrimSpace(got) != "GC_DRAIN=stale-global-drain" {
@@ -375,17 +366,13 @@ func TestK8sMetadataProtocolAgentInteropAndGenerationRecycle(t *testing.T) {
 	if got, err := run("show-environment", "-g", "GC_RESTART_REQUESTED"); err != nil || strings.TrimSpace(got) != "GC_RESTART_REQUESTED=stale-global-restart" {
 		t.Fatalf("global restart fixture = %q, %v; want stale global value to remain", got, err)
 	}
-	if _, err := run("set-option", "-t", tmuxSession, restartRequestedOption, "stale-option"); err != nil {
-		t.Fatalf("seed stale restart inventory option: %v", err)
-	}
-
 	if err := p.seedStartMetadata(context.Background(), "worker", "worker", map[string]string{
 		"GC_SESSION_ID": "session-after", "GC_INSTANCE_TOKEN": "instance-after", "GC_PROVIDER": "codex",
 	}); err != nil {
 		t.Fatalf("seed replacement generation: %v", err)
 	}
-	if got, err := run("show-options", "-qv", "-t", tmuxSession, restartRequestedOption); err != nil || strings.TrimSpace(got) != "" {
-		t.Fatalf("replacement generation restart option = %q, %v; want empty shadow", got, err)
+	if got, err := run("list-panes", "-t", tmuxSession, "-F", "#{E:GC_RESTART_REQUESTED}"); err != nil || strings.TrimSpace(got) != "" {
+		t.Fatalf("replacement generation restart marker = %q, %v; want no inherited value", got, err)
 	}
 	for key, want := range map[string]string{"GC_SESSION_ID": "session-after", "GC_INSTANCE_TOKEN": "instance-after", "BEADS_HOLDER_TOKEN": "instance-after", "GC_PROVIDER": "codex"} {
 		if got, err := p.GetMeta("worker", key); err != nil || got != want {

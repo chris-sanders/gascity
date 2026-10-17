@@ -24,10 +24,9 @@ import (
 )
 
 const (
-	k8sMetaReadMissing     = 44
-	k8sMetaOpTimeout       = 15 * time.Second
-	identityUnboundKey     = "__gc_identity_unbound"
-	restartRequestedOption = "@GC_RESTART_REQUESTED"
+	k8sMetaReadMissing = 44
+	k8sMetaOpTimeout   = 15 * time.Second
+	identityUnboundKey = "__gc_identity_unbound"
 )
 
 func processCityPath() string {
@@ -207,7 +206,6 @@ func sessionMetadataCommands(env map[string]string, publishIdentity, publishRunt
 		for _, key := range protocolMetadataKeys {
 			lines = append(lines, tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", key))
 		}
-		lines = append(lines, tmuxMetadataCommand("set-option", "-t", tmuxSession, restartRequestedOption, ""))
 	}
 	if publishIdentity {
 		for _, key := range orderedSessionIdentityKeys {

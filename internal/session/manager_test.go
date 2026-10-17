@@ -84,6 +84,21 @@ type startOverrideProvider struct {
 	startErr error
 }
 
+type identityReadFailureLiveProvider struct {
+	*runtime.Fake
+}
+
+func (p *identityReadFailureLiveProvider) GetMeta(name, key string) (string, error) {
+	if key == "GC_SESSION_ID" || key == "GC_INSTANCE_TOKEN" {
+		return "", errors.New("injected metadata transport failure")
+	}
+	return p.Fake.GetMeta(name, key)
+}
+
+func (*identityReadFailureLiveProvider) ObserveLivenessWithError(string, []string) (runtime.Liveness, error) {
+	return runtime.Liveness{Running: true, Alive: true}, nil
+}
+
 type noImmediateProvider struct {
 	runtime.Provider
 }
@@ -1369,6 +1384,29 @@ func TestCreateSessionNamedWithTransport_FailedStartDoesNotBurnExplicitName(t *t
 	}
 	if info.SessionName != "sky" {
 		t.Fatalf("SessionName = %q, want sky", info.SessionName)
+	}
+}
+
+func TestCreateSessionRetainsPendingBeadWhenRuntimeIdentityCannotBeRead(t *testing.T) {
+	store := beads.NewMemStore()
+	fake := runtime.NewFake()
+	fake.StartErrors["sky"] = errors.New("startup nudge transport failure")
+	sp := &identityReadFailureLiveProvider{Fake: fake}
+	mgr := newTestManager(t, store, sp)
+
+	_, err := mgr.CreateSession(context.Background(), CreateOptions{
+		ExplicitName: "sky", Template: "helper", Title: "pending", Command: "claude", WorkDir: "/tmp",
+		Provider: "claude", ExtraMeta: map[string]string{"session_origin": "manual"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "runtime identity could not be confirmed") {
+		t.Fatalf("CreateSession error = %v, want retained pending-start identity uncertainty", err)
+	}
+	open, listErr := store.ListOpen()
+	if listErr != nil {
+		t.Fatalf("ListOpen: %v", listErr)
+	}
+	if len(open) != 1 || open[0].Metadata["session_name"] != "sky" {
+		t.Fatalf("pending session rows after identity read failure = %+v, want one retained row for sky", open)
 	}
 }
 

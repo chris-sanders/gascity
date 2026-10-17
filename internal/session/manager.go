@@ -1066,12 +1066,24 @@ func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, 
 			return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 		}
 		if err := m.sp.Start(ctx, sessName, cfg); err != nil {
-			if runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"]) {
+			matches, identityErr := runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"])
+			if matches {
 				if metaErr := m.confirmStartedRuntimeMetadata(b.ID, sessName, &b); metaErr != nil {
 					return metaErr
 				}
 				info = m.infoFromBead(b)
 				return nil
+			}
+			if identityErr != nil {
+				if _, supportsErrorLiveness := m.sp.(runtime.LivenessObserverWithError); supportsErrorLiveness {
+					observation, observeErr := runtime.ObserveLivenessWithError(m.sp, sessName, nil)
+					if observeErr != nil || observation.Present() {
+						// Keep the creating bead for the reconciler to re-attribute. A
+						// failed identity read cannot authorize rollback of a possibly
+						// live provider session.
+						return fmt.Errorf("starting session: %w (runtime identity could not be confirmed: %w)", err, identityErr)
+					}
+				}
 			}
 			if errors.Is(err, runtime.ErrSessionExists) && m.sp.IsRunning(sessName) {
 				if rbErr := rollbackFailedCreate(); rbErr != nil {
@@ -1133,25 +1145,29 @@ func (m *Manager) startedRuntimeBindingPatch(sessName string) MetadataPatch {
 	return patch
 }
 
-func runtimeSessionMatchesBead(sp runtime.Provider, sessionName, beadID, instanceToken string) bool {
+func runtimeSessionMatchesBead(sp runtime.Provider, sessionName, beadID, instanceToken string) (bool, error) {
 	if sp == nil {
-		return false
+		return false, nil
 	}
-	if liveID, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
+	liveID, idErr := sp.GetMeta(sessionName, "GC_SESSION_ID")
+	if idErr == nil {
 		liveID = strings.TrimSpace(liveID)
 		if liveID != "" {
-			return liveID == beadID
+			return liveID == beadID, nil
 		}
 	}
 	instanceToken = strings.TrimSpace(instanceToken)
 	if instanceToken == "" {
-		return false
+		return false, idErr
 	}
-	liveToken, err := sp.GetMeta(sessionName, "GC_INSTANCE_TOKEN")
-	if err != nil {
-		return false
+	liveToken, tokenErr := sp.GetMeta(sessionName, "GC_INSTANCE_TOKEN")
+	if tokenErr != nil {
+		return false, errors.Join(idErr, tokenErr)
 	}
-	return strings.TrimSpace(liveToken) == instanceToken
+	if strings.TrimSpace(liveToken) == instanceToken {
+		return true, nil
+	}
+	return false, idErr
 }
 
 func (m *Manager) createBeadOnly(spec CreateOptions) (Info, error) {
