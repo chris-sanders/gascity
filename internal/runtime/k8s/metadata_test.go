@@ -395,6 +395,36 @@ func TestK8sMetadataProtocolAgentInteropAndGenerationRecycle(t *testing.T) {
 	}
 }
 
+func TestK8sSessionIDSetClearsStaleHolderWithoutInstanceToken(t *testing.T) {
+	ops, run := newTmuxMetadataTestOps(t, "worker")
+	if _, err := run("set-environment", "-g", "BEADS_HOLDER_TOKEN", "stale-global-holder"); err != nil {
+		t.Fatalf("set stale global holder: %v", err)
+	}
+	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
+		t.Fatalf("create metadata session: %v", err)
+	}
+	if _, err := run("set-environment", "-t", tmuxSession, "GC_INSTANCE_TOKEN", "old-instance"); err != nil {
+		t.Fatalf("set old instance token: %v", err)
+	}
+	if _, err := run("set-environment", "-t", tmuxSession, "BEADS_HOLDER_TOKEN", "stale-session-holder"); err != nil {
+		t.Fatalf("set stale session holder: %v", err)
+	}
+	if _, err := run("set-environment", "-t", tmuxSession, "-r", "GC_INSTANCE_TOKEN"); err != nil {
+		t.Fatalf("remove instance token: %v", err)
+	}
+	p := newProviderWithOps(ops)
+	p.cityPath = t.TempDir()
+	if err := p.SetMeta("worker", "GC_SESSION_ID", "replacement-session"); err != nil {
+		t.Fatalf("set replacement session ID: %v", err)
+	}
+	if got, err := run("show-environment", "-t", tmuxSession, "BEADS_HOLDER_TOKEN"); err != nil || strings.TrimSpace(got) != "-BEADS_HOLDER_TOKEN" {
+		t.Fatalf("holder after session transition = %q, %v; want removal marker", got, err)
+	}
+	if got, err := run("show-environment", "-t", tmuxSession, "GC_SESSION_ID"); err != nil || strings.TrimSpace(got) != "GC_SESSION_ID=replacement-session" {
+		t.Fatalf("session ID after transition = %q, %v", got, err)
+	}
+}
+
 func TestK8sMetadataBackfillsLegacyIdentityAndRuntimeOwnerFromPodEnv(t *testing.T) {
 	ops, run := newTmuxMetadataTestOps(t, "legacy")
 	if _, err := run("new-session", "-d", "-s", tmuxSession, "sleep", "300"); err != nil {
