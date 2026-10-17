@@ -79,29 +79,29 @@ func TestSeamsK8sCapabilitiesAndTransport(t *testing.T) {
 // TestSeamsK8sMetaStore proves the MetaStore seam round-trips through the tmux
 // session environment (set-environment / show-environment over execInPod).
 func TestSeamsK8sMetaStore(t *testing.T) {
+	t.Setenv("GC_CITY_PATH", t.TempDir())
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)
-	addRunningPod(fake, "s", "s")
 	rt, _ := p.Seams()
 
 	ms, ok := rt.(runtime.MetaStore)
 	if !ok {
 		t.Fatal("k8s Runtime should implement runtime.MetaStore")
 	}
-	fake.setExecResult("s", []string{"tmux", "set-environment", "-t", tmuxSession, "k", "v"}, "", nil)
 	if err := ms.SetMeta("s", "k", "v"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
 	}
-	fake.setExecResult("s", []string{"tmux", "show-environment", "-t", tmuxSession, "k"}, "k=v", nil)
 	if got, err := ms.GetMeta("s", "k"); err != nil || got != "v" {
 		t.Fatalf("GetMeta = %q, %v; want v, nil", got, err)
 	}
-	// An explicitly-unset key (tmux prints "-KEY") parses to empty.
-	fake.setExecResult("s", []string{"tmux", "show-environment", "-t", tmuxSession, "missing"}, "-missing", nil)
+	// Controller-private metadata is durable controller state and remains
+	// readable even when the pod is absent.
+	if len(fake.calls) != 0 {
+		t.Fatalf("private metadata used pod exec: %+v", fake.calls)
+	}
 	if got, err := ms.GetMeta("s", "missing"); err != nil || got != "" {
 		t.Fatalf("GetMeta(unset) = %q, %v; want empty, nil", got, err)
 	}
-	fake.setExecResult("s", []string{"tmux", "set-environment", "-t", tmuxSession, "-u", "k"}, "", nil)
 	if err := ms.RemoveMeta("s", "k"); err != nil {
 		t.Fatalf("RemoveMeta: %v", err)
 	}

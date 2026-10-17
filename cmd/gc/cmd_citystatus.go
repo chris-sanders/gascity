@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/k8s"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/worker"
@@ -31,12 +32,13 @@ type StatusJSON struct {
 	Health        HealthJSON             `json:"health"`
 	Beads         *beads.BeadsDiagnostic `json:"beads,omitempty"`
 	// ConditionalWrites mirrors the API status block verbatim (§12.5).
-	ConditionalWrites *api.StatusConditionalWrites `json:"conditional_writes,omitempty"`
-	Agents            []StatusAgentJSON            `json:"agents"`
-	Rigs              []StatusRigJSON              `json:"rigs"`
-	Summary           StatusSummaryJSON            `json:"summary"`
-	Partial           bool                         `json:"partial,omitempty"`
-	PartialErrors     []string                     `json:"partial_errors,omitempty"`
+	ConditionalWrites      *api.StatusConditionalWrites `json:"conditional_writes,omitempty"`
+	Agents                 []StatusAgentJSON            `json:"agents"`
+	Rigs                   []StatusRigJSON              `json:"rigs"`
+	StartupNudgeDeliveries []runtime.StartupNudgeStatus `json:"startup_nudge_deliveries,omitempty"`
+	Summary                StatusSummaryJSON            `json:"summary"`
+	Partial                bool                         `json:"partial,omitempty"`
+	PartialErrors          []string                     `json:"partial_errors,omitempty"`
 }
 
 type WorkspaceJSON struct {
@@ -301,6 +303,7 @@ func routeCityStatus(
 // controllerStatusForCity — same call the fallback path makes).
 func renderCityStatusFromAPI(cityPath string, cr api.CachedRead[api.StatusView], dops drainOps, jsonOutput bool, stdout io.Writer) int {
 	snapshot := snapshotFromStatusView(cityPath, cr.Body)
+	includeStartupNudgeDiagnostics(&snapshot, cityPath)
 	if jsonOutput {
 		writeCityStatusJSONWithCache(snapshot, snapshot.Summary, cr.AgeSeconds, stdout)
 		return 0
@@ -598,6 +601,7 @@ func doCityStatusWithStoreAndSnapshot(
 	stdout, stderr io.Writer,
 ) int {
 	snapshot := collectCityStatusSnapshotFromStoreSnapshot(sp, cfg, cityPath, store, statusSnapshot, stderr)
+	includeStartupNudgeDiagnostics(&snapshot, cityPath)
 	renderCityStatusText(snapshot, dops, stdout)
 
 	// Track session-snapshot degradation so we can render the textual report
@@ -648,6 +652,7 @@ func doCityStatusJSONWithDiagnosticAndSnapshot(
 	stdout, stderr io.Writer,
 ) int {
 	snapshot := collectCityStatusSnapshotFromStoreSnapshot(sp, cfg, cityPath, store, statusSnapshot, stderr)
+	includeStartupNudgeDiagnostics(&snapshot, cityPath)
 	snapshot.Beads = diagnostic
 	// Track session-snapshot degradation so we can emit the JSON payload AND
 	// signal the failure via exit code. Restores the pre-#2005 contract that
@@ -674,6 +679,16 @@ func doCityStatusJSONWithDiagnosticAndSnapshot(
 		return 1
 	}
 	return 0
+}
+
+func includeStartupNudgeDiagnostics(snapshot *cityStatusSnapshot, cityPath string) {
+	deliveries, err := k8s.StartupNudgeDiagnostics(cityPath)
+	if err != nil {
+		snapshot.Partial = true
+		snapshot.PartialErrors = append(snapshot.PartialErrors, startupNudgeDeliveryReadError)
+		return
+	}
+	snapshot.StartupNudgeDeliveries = deliveries
 }
 
 func controllerStatusForCity(cityPath string) ControllerJSON {

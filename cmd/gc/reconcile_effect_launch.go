@@ -460,13 +460,19 @@ func commitStep(v txView) txStep {
 		return txStep{Refuse: causeHeldDead}
 	case out.err != nil && !errors.Is(out.err, runtime.ErrSessionExists) && cause == causeAttribution && v.Row.PendingCreateClaim:
 		return failStart(v, out, causeAttribution, out.err) // deferred, with its #46 accrual
-	case out.err != nil && !errors.Is(out.err, runtime.ErrSessionExists):
+	case out.err != nil && !errors.Is(out.err, runtime.ErrSessionExists) && !errors.Is(out.err, runtime.ErrStartupNudgeDegraded):
 		return failStart(v, out, causeStartError, out.err)
 	default:
 		return txStep{Refuse: cause}
 	}
 	patch := startCommit(out.prepared, v.Row, v.Now)
 	maps.Copy(patch, out.mcp)
+	var nudgeDegraded *runtime.StartupNudgeDegradedError
+	if errors.As(out.err, &nudgeDegraded) {
+		patch["startup_nudge_status"] = nudgeDegraded.Status
+		patch["startup_nudge_intent_id"] = nudgeDegraded.IntentID
+		patch["startup_nudge_reason"] = nudgeDegraded.Reason
+	}
 	if out.accrued {
 		patch[startupHealthActiveCountMetadataKey], patch[startupHealthActiveKindMetadataKey] = "0", ""
 	}
@@ -539,6 +545,10 @@ func afterStart(ctx context.Context, c txCaps, in startEnd) (startFailureRead, e
 	if in.landed.out.accrued {
 		_ = c.episode.clear(in.landed.out.health)
 	}
-	telemetry.RecordAgentStart(context.Background(), in.landed.name, in.landed.display, nil)
+	startErr := in.landed.out.err
+	if errors.Is(startErr, runtime.ErrStartupNudgeDegraded) {
+		startErr = nil // the pane is live; its startup state is separately marked degraded
+	}
+	telemetry.RecordAgentStart(context.Background(), in.landed.name, in.landed.display, startErr)
 	return startFailureRead{}, nil
 }

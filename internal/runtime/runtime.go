@@ -72,6 +72,29 @@ var ErrInterruptNotSettled = errors.New("interrupt did not settle the session's 
 // process, but it exited before startup completed successfully.
 var ErrSessionDiedDuringStartup = errors.New("session died during startup")
 
+// ErrStartupNudgeDegraded marks a launch whose process is alive but whose
+// required startup prompt could not be confirmed. Reconciliation may commit
+// the live runtime while exposing a degraded session status; it must not
+// treat this as a dead start or launch a second pane.
+var ErrStartupNudgeDegraded = errors.New("startup nudge delivery is unresolved")
+
+// StartupNudgeDegradedError reports an unresolved durable startup intent. It
+// deliberately carries identifiers and state only, never the prompt text.
+type StartupNudgeDegradedError struct {
+	IntentID string
+	Status   string
+	Reason   string
+}
+
+func (e *StartupNudgeDegradedError) Error() string {
+	if e == nil {
+		return ErrStartupNudgeDegraded.Error()
+	}
+	return fmt.Sprintf("%s: intent=%s status=%s reason=%s", ErrStartupNudgeDegraded, e.IntentID, e.Status, e.Reason)
+}
+
+func (e *StartupNudgeDegradedError) Unwrap() error { return ErrStartupNudgeDegraded }
+
 // ExitCodeTempFail is sysexits.h EX_TEMPFAIL. A launched agent command that
 // exits with it before startup completes declares a retryable, endpoint-wide
 // refusal rather than a session-specific crash. It is the same convention gate

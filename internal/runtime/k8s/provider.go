@@ -273,13 +273,22 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	if p.image == "" {
 		return fmt.Errorf("starting session %q: GC_K8S_IMAGE is required", name)
 	}
+	releaseGeneration, err := p.acquireControllerGenerationLock(ctx, name)
+	if err != nil {
+		return fmt.Errorf("starting session %q: generation fence unavailable", name)
+	}
+	defer releaseGeneration()
 	podName := SanitizeName(name)
 	label := SanitizeLabel(name)
+	var startupNudge *startupNudgeIntent
 
 	// Check for existing pod (any phase).
 	existing, err := p.ops.listPods(ctx, "gc-session="+label, "")
-	if err == nil && len(existing) > 0 {
-		pod := &existing[0]
+	if err != nil {
+		return fmt.Errorf("listing existing pods for session %q: %w", name, err)
+	}
+	for i := range existing {
+		pod := &existing[i]
 		if pod.Status.Phase == corev1.PodRunning {
 			// Stale-pod detection: is the session's tmux server alive?
 			alive, definitive, probeErr := p.probeTmuxLiveness(ctx, pod)
@@ -300,14 +309,39 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 				// destroys a live agent's box and the work in it. Report the
 				// established "I could not tell" signal so the caller defers
 				// instead of recreating.
+				if probeErr == nil {
+					probeErr = errors.New("tmux liveness was inconclusive")
+				}
 				return fmt.Errorf("%w: tmux liveness probe for session %q (pod: %s) could not answer: %w",
 					runtime.ErrRuntimeUnavailable, name, pod.Name, probeErr)
 			}
 			// Stale pod — tmux definitively dead and past grace period, recreate.
+		} else if pod.Status.Phase == corev1.PodPending && time.Since(pod.CreationTimestamp.Time) < startupGracePeriod {
+			return fmt.Errorf("%w: session %q (pod: %s)", runtime.ErrSessionInitializing, name, pod.Name)
 		}
-		// Clean up existing pod.
-		_ = p.ops.deletePod(ctx, pod.Name, 5)
-		_ = waitForDeletion(ctx, p.ops, pod.Name, 30*time.Second)
+	}
+	if len(existing) > 0 {
+		if cfg.Nudge != "" {
+			startupNudge, err = p.persistStartupNudgeIntent(ctx, name, cfg)
+			if err != nil {
+				return fmt.Errorf("persisting startup nudge intent for session %q: %w", name, err)
+			}
+		}
+		for i := range existing {
+			pod := &existing[i]
+			if err := p.ops.deletePod(ctx, pod.Name, 5); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("deleting stale pod %q for session %q: %w", pod.Name, name, err)
+			}
+			if err := waitForDeletion(ctx, p.ops, pod.Name, 30*time.Second); err != nil {
+				return fmt.Errorf("waiting for stale pod %q deletion for session %q: %w", pod.Name, name, err)
+			}
+		}
+	}
+	if cfg.Nudge != "" && startupNudge == nil {
+		startupNudge, err = p.persistStartupNudgeIntent(ctx, name, cfg)
+		if err != nil {
+			return fmt.Errorf("persisting startup nudge intent for session %q: %w", name, err)
+		}
 	}
 
 	// Build and create pod.
@@ -421,10 +455,16 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 				runtime.ErrSessionDiedDuringStartup, name, tmuxErr)
 		}
 	}
+	if err := p.removePrivateMetadata(ctx, name, identityUnboundKey); err != nil {
+		return fmt.Errorf("k8s start %q: replacement pane is live but identity fence could not be cleared", name)
+	}
 
-	// Send initial nudge if configured (matches tmux adapter step 6).
-	if cfg.Nudge != "" {
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+	// Deliver from the immutable controller-owned intent. A failed paste or
+	// submit remains durably uncertain and is not retried from current config.
+	if startupNudge != nil {
+		if err := p.deliverStartupNudge(ctx, startupNudge); err != nil {
+			return p.startupNudgeDegradedError(ctx, startupNudge)
+		}
 	}
 
 	return nil
@@ -488,17 +528,32 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 	if err != nil {
 		return fmt.Errorf("%w: session %q (no running pod to relaunch into)", runtime.ErrSessionNotFound, name)
 	}
+	releaseGeneration, err := p.acquireControllerGenerationLock(ctx, name)
+	if err != nil {
+		return fmt.Errorf("k8s relaunch %q: cannot acquire controller generation fence", name)
+	}
+	defer releaseGeneration()
 	// The tmux server + "main" session must be alive to respawn into; a dead
 	// session means the box is not warm enough — reprovision, don't respawn.
-	if _, err := p.ops.execInPod(ctx, podName, "agent",
+	if _, err := p.execTmuxOwner(ctx, podName, "agent",
 		[]string{"tmux", "has-session", "-t", tmuxSession}, nil); err != nil {
 		return fmt.Errorf("%w: session %q (pod %s has no live tmux session)", runtime.ErrSessionNotFound, name, podName)
 	}
-
-	// Respawn the agent in the warm "main" session.
-	if _, err := p.ops.execInPod(ctx, podName, "agent",
-		buildRespawnCommand(cfg), nil); err != nil {
-		return fmt.Errorf("k8s relaunch %q: respawn-pane: %w", name, err)
+	var startupNudge *startupNudgeIntent
+	if cfg.Nudge != "" {
+		startupNudge, err = p.persistStartupNudgeIntent(ctx, name, cfg)
+		if err != nil {
+			return fmt.Errorf("persisting relaunch nudge intent for session %q: %w", name, err)
+		}
+	}
+	// Fence controller reads before staging the next identity. A failed or
+	// ambiguous exec leaves this marker in controller-owned city state, so the
+	// old pane can never be reported as the requested new incarnation.
+	if err := p.setPrivateMetadata(ctx, name, identityUnboundKey, "1"); err != nil {
+		return fmt.Errorf("k8s relaunch %q: cannot establish identity fence", name)
+	}
+	if err := p.respawnWithStagedIdentity(ctx, podName, name, sessionMetadataEnvForConfig(cfg), cfg); err != nil {
+		return err
 	}
 
 	// Re-run the post-launch setup tail (pipe-pane logging + session_setup[/script]).
@@ -515,15 +570,20 @@ func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config
 			case <-timer.C:
 			}
 		}
-		if _, err := p.ops.execInPod(ctx, podName, "agent",
+		if _, err := p.execTmuxOwner(ctx, podName, "agent",
 			[]string{"tmux", "has-session", "-t", tmuxSession}, nil); err != nil {
 			return fmt.Errorf("%w: session %q died immediately after relaunch: %w",
 				runtime.ErrSessionDiedDuringStartup, name, err)
 		}
 	}
+	if err := p.removePrivateMetadata(ctx, name, identityUnboundKey); err != nil {
+		return fmt.Errorf("k8s relaunch %q: replacement is live but identity fence could not be cleared", name)
+	}
 
-	if cfg.Nudge != "" {
-		_ = p.Nudge(name, runtime.TextContent(cfg.Nudge))
+	if startupNudge != nil {
+		if err := p.deliverStartupNudge(ctx, startupNudge); err != nil {
+			return p.startupNudgeDegradedError(ctx, startupNudge)
+		}
 	}
 	return nil
 }
@@ -544,7 +604,13 @@ func k8sRequiresPostStartLiveness(cfg runtime.Config) bool {
 // genuine Kubernetes NotFound (the pod raced to gone) is treated as idempotent.
 // This mirrors the ssh provider's Stop discrimination.
 func (p *Provider) Stop(name string) error {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), k8sMetaOpTimeout)
+	defer cancel()
+	releaseGeneration, err := p.acquireControllerGenerationLock(ctx, name)
+	if err != nil {
+		return fmt.Errorf("k8s stop %q: generation fence unavailable", name)
+	}
+	defer releaseGeneration()
 	label := SanitizeLabel(name)
 
 	pods, err := p.ops.listPods(ctx, "gc-session="+label, "")
@@ -1065,8 +1131,11 @@ func waitForDeletion(ctx context.Context, ops k8sOps, name string, timeout time.
 		default:
 		}
 		_, err := ops.getPod(ctx, name)
-		if err != nil {
+		if apierrors.IsNotFound(err) {
 			return nil // gone
+		}
+		if err != nil {
+			return fmt.Errorf("checking pod %s deletion: %w", name, err)
 		}
 		select {
 		case <-ctx.Done():

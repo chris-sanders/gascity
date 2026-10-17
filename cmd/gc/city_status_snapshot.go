@@ -67,14 +67,17 @@ type cityStatusSnapshot struct {
 	Beads           *beads.BeadsDiagnostic
 	// ConditionalWrites is the daemon's latched §12.5 snapshot; nil on the
 	// local fallback path (a stopped controller has no latched state to show).
-	ConditionalWrites *api.StatusConditionalWrites
-	Agents            []cityStatusAgentRow
-	Rigs              []StatusRigJSON
-	NamedSessions     []cityStatusNamedSession
-	Partial           bool
-	PartialErrors     []string
-	Summary           StatusSummaryJSON
+	ConditionalWrites      *api.StatusConditionalWrites
+	Agents                 []cityStatusAgentRow
+	Rigs                   []StatusRigJSON
+	NamedSessions          []cityStatusNamedSession
+	StartupNudgeDeliveries []runtime.StartupNudgeStatus
+	Partial                bool
+	PartialErrors          []string
+	Summary                StatusSummaryJSON
 }
+
+const startupNudgeDeliveryReadError = "startup nudge delivery state could not be read"
 
 type cityStatusAgentRow struct {
 	Agent       StatusAgentJSON
@@ -460,6 +463,15 @@ func cityStatusJSONFromSnapshot(snapshot cityStatusSnapshot, summary StatusSumma
 	if !snapshot.Controller.Running {
 		signals = append(signals, "controller_not_running")
 	}
+	if len(snapshot.StartupNudgeDeliveries) > 0 {
+		signals = append(signals, "startup_nudge_delivery_unresolved")
+	}
+	for _, partialError := range snapshot.PartialErrors {
+		if partialError == startupNudgeDeliveryReadError {
+			signals = append(signals, "startup_nudge_delivery_state_unknown")
+			break
+		}
+	}
 	// A running count of zero is a fact about the agents only when the probe
 	// answered for all of them. During partial status the count is zero
 	// because nothing was observed, so no_agents_running reports a live city
@@ -485,22 +497,23 @@ func cityStatusJSONFromSnapshot(snapshot cityStatusSnapshot, summary StatusSumma
 	degraded := len(signals) > 0
 	running := snapshot.Controller.Running
 	return StatusJSON{
-		SchemaVersion:     "1",
-		OK:                true,
-		CityName:          snapshot.CityName,
-		Workspace:         WorkspaceJSON{Name: snapshot.CityName, Path: snapshot.CityPath},
-		CityPath:          snapshot.CityPath,
-		Controller:        snapshot.Controller,
-		Running:           running,
-		Suspended:         snapshot.Suspended,
-		Partial:           snapshot.Partial,
-		PartialErrors:     append([]string(nil), snapshot.PartialErrors...),
-		Health:            HealthJSON{Usable: running && !snapshot.Suspended, Degraded: degraded, Signals: signals},
-		Beads:             snapshot.Beads,
-		ConditionalWrites: snapshot.ConditionalWrites,
-		Agents:            agents,
-		Rigs:              rigs,
-		Summary:           summary,
+		SchemaVersion:          "1",
+		OK:                     true,
+		CityName:               snapshot.CityName,
+		Workspace:              WorkspaceJSON{Name: snapshot.CityName, Path: snapshot.CityPath},
+		CityPath:               snapshot.CityPath,
+		Controller:             snapshot.Controller,
+		Running:                running,
+		Suspended:              snapshot.Suspended,
+		Partial:                snapshot.Partial,
+		PartialErrors:          append([]string(nil), snapshot.PartialErrors...),
+		Health:                 HealthJSON{Usable: running && !snapshot.Suspended, Degraded: degraded, Signals: signals},
+		Beads:                  snapshot.Beads,
+		ConditionalWrites:      snapshot.ConditionalWrites,
+		Agents:                 agents,
+		Rigs:                   rigs,
+		StartupNudgeDeliveries: append([]runtime.StartupNudgeStatus(nil), snapshot.StartupNudgeDeliveries...),
+		Summary:                summary,
 	}
 }
 
@@ -577,6 +590,12 @@ func renderCityStatusText(snapshot cityStatusSnapshot, dops drainOps, stdout io.
 	} else {
 		fmt.Fprintf(stdout, "  Suspended:  no\n") //nolint:errcheck // best-effort stdout
 	}
+	for _, partialError := range snapshot.PartialErrors {
+		if partialError == startupNudgeDeliveryReadError {
+			fmt.Fprintln(stdout, "  Startup prompt delivery state is unavailable; run gc doctor after checking controller metadata permissions.") //nolint:errcheck // best-effort stdout
+			break
+		}
+	}
 
 	if len(snapshot.Agents) > 0 {
 		fmt.Fprintln(stdout) //nolint:errcheck // best-effort stdout
@@ -614,6 +633,18 @@ func renderCityStatusText(snapshot cityStatusSnapshot, dops drainOps, stdout io.
 		fmt.Fprintln(stdout, "Named sessions:")
 		for _, named := range snapshot.NamedSessions {
 			fmt.Fprintf(stdout, "  %-24s%s (%s)\n", named.Identity, named.Status, named.Mode) //nolint:errcheck // best-effort stdout
+		}
+	}
+
+	if len(snapshot.StartupNudgeDeliveries) > 0 {
+		fmt.Fprintln(stdout)                                             //nolint:errcheck // best-effort stdout
+		fmt.Fprintln(stdout, "Startup prompt delivery needs attention:") //nolint:errcheck // best-effort stdout
+		for _, delivery := range snapshot.StartupNudgeDeliveries {
+			fmt.Fprintf(stdout, "  %s intent=%s incarnation=%s status=%s", delivery.SessionName, delivery.IntentID, delivery.Incarnation, delivery.Status) //nolint:errcheck // best-effort stdout
+			if delivery.Reason != "" {
+				fmt.Fprintf(stdout, " reason=%s", delivery.Reason) //nolint:errcheck // best-effort stdout
+			}
+			fmt.Fprintln(stdout) //nolint:errcheck // best-effort stdout
 		}
 	}
 

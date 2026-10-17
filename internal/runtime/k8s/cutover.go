@@ -18,10 +18,15 @@ type seamBackedProvider struct {
 }
 
 var (
-	_ runtime.Provider                = (*seamBackedProvider)(nil)
-	_ runtime.SleepCapabilityProvider = (*seamBackedProvider)(nil)
-	_ runtime.RelaunchProvider        = (*seamBackedProvider)(nil)
-	_ runtime.ListingAttestation      = (*seamBackedProvider)(nil)
+	_ runtime.Provider                          = (*seamBackedProvider)(nil)
+	_ runtime.SleepCapabilityProvider           = (*seamBackedProvider)(nil)
+	_ runtime.RelaunchProvider                  = (*seamBackedProvider)(nil)
+	_ runtime.ListingAttestation                = (*seamBackedProvider)(nil)
+	_ runtime.K8sStoreAttachmentProvider        = (*seamBackedProvider)(nil)
+	_ runtime.StartupNudgeRecoveryProvider      = (*seamBackedProvider)(nil)
+	_ runtime.StartupNudgeSessionProvider       = (*seamBackedProvider)(nil)
+	_ runtime.StartupNudgeLeasedSessionProvider = (*seamBackedProvider)(nil)
+	_ runtime.StartupNudgeLeaseTargetProvider   = (*seamBackedProvider)(nil)
 )
 
 // NewSeamBacked constructs a k8s provider served through the seams.
@@ -44,7 +49,13 @@ func NewSeamBackedWithSecurityConfig(config PodSecurityConfig) (runtime.Provider
 // NewSeamBackedWithConfig constructs a K8s provider with Secret projections
 // and optional pod-level identity configuration.
 func NewSeamBackedWithConfig(secretEnv []runtime.K8sSecretEnv, secretMounts []runtime.K8sSecretMount, config PodSecurityConfig) (runtime.Provider, error) {
-	raw, err := NewProviderWithConfig(secretEnv, secretMounts, config)
+	return NewSeamBackedWithConfigAndCityPath(secretEnv, secretMounts, config, processCityPath())
+}
+
+// NewSeamBackedWithConfigAndCityPath binds controller-owned runtime metadata
+// to the selected city even when --city was supplied without process env.
+func NewSeamBackedWithConfigAndCityPath(secretEnv []runtime.K8sSecretEnv, secretMounts []runtime.K8sSecretMount, config PodSecurityConfig, cityPath string) (runtime.Provider, error) {
+	raw, err := NewProviderWithConfigAndCityPath(secretEnv, secretMounts, config, cityPath)
 	if err != nil {
 		return nil, err
 	}
@@ -67,4 +78,32 @@ func (s *seamBackedProvider) Relaunch(ctx context.Context, name string, cfg runt
 // through; the seams route ListRunning to the same raw listing.
 func (s *seamBackedProvider) ListRunningComplete() bool {
 	return s.raw.ListRunningComplete()
+}
+
+// RequiresK8sStoreAttachment preserves the leaf capability through the seam
+// wrapper so composite routing can select it by the actual backend.
+func (s *seamBackedProvider) RequiresK8sStoreAttachment() bool {
+	return s.raw.RequiresK8sStoreAttachment()
+}
+
+// RecoverStartupNudges keeps controller-owned startup delivery recovery
+// reachable through the runtime seam wrapper.
+func (s *seamBackedProvider) RecoverStartupNudges(ctx context.Context) []runtime.StartupNudgeStatus {
+	return s.raw.RecoverStartupNudges(ctx)
+}
+
+func (s *seamBackedProvider) StartupNudgeSessionNames(ctx context.Context) []string {
+	return s.raw.StartupNudgeSessionNames(ctx)
+}
+
+func (s *seamBackedProvider) RecoverStartupNudgesForSession(ctx context.Context, name string) []runtime.StartupNudgeStatus {
+	return s.raw.RecoverStartupNudgesForSession(ctx, name)
+}
+
+func (s *seamBackedProvider) RecoverStartupNudgesForLeasedSession(ctx context.Context, name, sessionID string) []runtime.StartupNudgeStatus {
+	return s.raw.RecoverStartupNudgesForLeasedSession(ctx, name, sessionID)
+}
+
+func (s *seamBackedProvider) StartupNudgeLeaseTargets(ctx context.Context) []runtime.StartupNudgeLeaseTarget {
+	return s.raw.StartupNudgeLeaseTargets(ctx)
 }

@@ -1383,6 +1383,7 @@ func (cr *CityRuntime) tick(
 	if ctx.Err() != nil {
 		return
 	}
+	cr.recoverStartupNudges(ctx)
 	traceTrigger := trigger
 	traceDetail := "controller_tick"
 	if cr.runsV2() {
@@ -1913,6 +1914,7 @@ var legacyStartupPhases = []tickPhase{
 // loaded and ends on every exit, panic included. Under v2 it runs the
 // maintenance phases, then boots the v2 runtime on ctx (bootV2).
 func (cr *CityRuntime) startupReconcile(ctx context.Context) bool {
+	cr.recoverStartupNudges(ctx)
 	p := &tickPass{ctx: ctx}
 	defer func() {
 		if p.trace != nil {

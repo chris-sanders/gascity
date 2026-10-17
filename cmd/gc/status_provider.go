@@ -28,6 +28,8 @@ var (
 	_ runtime.RelaunchProvider            = (*statusProvider)(nil)
 	_ runtime.LivenessObserverWithError   = (*statusProvider)(nil)
 	_ runtime.AttachmentObserverWithError = (*statusProvider)(nil)
+	_ runtime.BackendsProvider            = (*statusProvider)(nil)
+	_ runtime.Router                      = (*statusProvider)(nil)
 )
 
 func statusProviderPartial(sp any) bool {
@@ -43,6 +45,22 @@ func markStatusProviderPartial(sp any) {
 
 func (p *statusProvider) StatusPartial() bool {
 	return p.partial.Load()
+}
+
+// Backends preserves route-aware optional runtime capabilities through the
+// status facade instead of hiding the selected leaves.
+func (p *statusProvider) Backends() []runtime.Backend {
+	if provider, ok := p.base.(runtime.BackendsProvider); ok {
+		return provider.Backends()
+	}
+	return []runtime.Backend{{Label: "base", Provider: p.base}}
+}
+
+func (p *statusProvider) RouteFor(name string) runtime.Route {
+	if router, ok := p.base.(runtime.Router); ok {
+		return router.RouteFor(name)
+	}
+	return runtime.Route{Backend: runtime.Backend{Label: "base", Provider: p.base}, Known: true}
 }
 
 func newBoundedStatusProvider(base runtime.Provider) runtime.Provider {

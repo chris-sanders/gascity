@@ -182,6 +182,10 @@ func (f *fakeK8sOps) createPod(_ context.Context, pod *corev1.Pod) (*corev1.Pod,
 	}
 	p := pod.DeepCopy()
 	p.Status.Phase = corev1.PodRunning
+	p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "agent", ContainerID: "containerd://test-" + pod.Name,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}}
 	if p.UID == "" {
 		p.UID = types.UID("test-generation-" + pod.Name)
 	}
