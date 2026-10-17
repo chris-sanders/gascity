@@ -23,5 +23,10 @@ describe those Pods as Restricted-compatible.
 
 Legacy tmux metadata backfill may fill only keys missing from the session. It
 must preserve existing session-scoped identity and runtime-owner values, and a
-partial compatibility repair must not publish the current identity-version
-marker.
+successful compatibility repair uses a separate hidden completion marker so
+later metadata reads do not repeatedly inspect the pod environment. A partial
+compatibility repair must not publish the current identity-version marker.
+Instance and holder tokens are filled together only when both are absent.
+Runtime and continuation epochs are filled as a generation group only when
+instance token, runtime epoch, and session ID are all absent; descriptive
+identity and runtime-owner values may be filled independently.

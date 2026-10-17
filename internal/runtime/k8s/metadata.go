@@ -29,6 +29,8 @@ const (
 	identityUnboundKey         = "__gc_identity_unbound"
 	identityMetadataVersionKey = "__gc_k8s_identity_metadata_version"
 	identityMetadataVersion    = "1"
+	legacyIdentityBackfillKey  = "__gc_k8s_identity_legacy_backfilled"
+	legacyRuntimeBackfillKey   = "__gc_k8s_runtime_legacy_backfilled"
 )
 
 func processCityPath() string {
@@ -631,7 +633,7 @@ func (p *Provider) getMetaFromPod(ctx context.Context, podName, name, key string
 		if !isBackfillableMetadataKey(key) {
 			return "", nil
 		}
-		if err := p.backfillMetadataFromPodEnv(ctx, podName, name, key); err != nil {
+		if _, err := p.backfillMetadataFromPodEnv(ctx, podName, name, key); err != nil {
 			return "", err
 		}
 		output, err = read()
@@ -662,16 +664,19 @@ func (p *Provider) getMetaFromPod(ctx context.Context, podName, name, key string
 				legacyIdentity = !current
 			}
 			if legacyIdentity {
-				if err := p.backfillMetadataFromPodEnv(ctx, podName, name, key); err != nil {
+				backfilled, err := p.backfillMetadataFromPodEnv(ctx, podName, name, key)
+				if err != nil {
 					return "", err
 				}
-				output, err = read()
-				if err != nil {
-					return "", fmt.Errorf("k8s read repaired metadata key %q for session %q: %w", key, name, err)
-				}
-				value, _, err = parseTmuxMetadataOutput(output, key)
-				if err != nil {
-					return "", fmt.Errorf("k8s read repaired metadata key %q for session %q: %w", key, name, err)
+				if backfilled {
+					output, err = read()
+					if err != nil {
+						return "", fmt.Errorf("k8s read repaired metadata key %q for session %q: %w", key, name, err)
+					}
+					value, _, err = parseTmuxMetadataOutput(output, key)
+					if err != nil {
+						return "", fmt.Errorf("k8s read repaired metadata key %q for session %q: %w", key, name, err)
+					}
 				}
 			}
 		}
@@ -694,15 +699,24 @@ func (p *Provider) hasCurrentIdentityMetadataVersion(ctx context.Context, podNam
 	return !explicitlyRemoved && value == identityMetadataVersion, nil
 }
 
-func (p *Provider) backfillMetadataFromPodEnv(ctx context.Context, podName, name, requestedKey string) error {
+func (p *Provider) backfillMetadataFromPodEnv(ctx context.Context, podName, name, requestedKey string) (bool, error) {
 	class := classifyMetadataKey(requestedKey)
 	keys := runtimeOwnerEnvKeys
+	markerKey := legacyRuntimeBackfillKey
 	publishIdentity, publishRuntimeOwner := false, false
 	if class == metadataIdentity {
 		keys = orderedSessionIdentityKeys
+		markerKey = legacyIdentityBackfillKey
 		publishIdentity = true
 	} else {
 		publishRuntimeOwner = true
+	}
+	complete, err := p.hasLegacyMetadataBackfill(ctx, podName, markerKey)
+	if err != nil {
+		return false, fmt.Errorf("k8s verify legacy metadata backfill for session %q failed", name)
+	}
+	if complete {
+		return false, nil
 	}
 	env := make(map[string]string, len(keys))
 	for _, key := range keys {
@@ -711,49 +725,80 @@ func (p *Provider) backfillMetadataFromPodEnv(ctx context.Context, podName, name
 		}
 		value, err := p.readPodEnvValue(ctx, podName, key)
 		if err != nil {
-			return fmt.Errorf("k8s compatibility backfill for session %q failed", name)
+			return false, fmt.Errorf("k8s compatibility backfill for session %q failed", name)
 		}
 		env[key] = value
 	}
 	if err := validateSessionMetadataValues(env, publishIdentity, publishRuntimeOwner); err != nil {
-		return fmt.Errorf("k8s compatibility backfill for session %q failed", name)
+		return false, fmt.Errorf("k8s compatibility backfill for session %q failed", name)
 	}
-	commands := backfillSessionMetadataCommands(env, publishIdentity)
-	if commands == "" {
-		return nil
-	}
+	commands := backfillSessionMetadataCommands(env, publishIdentity, markerKey)
 	if err := p.sourcePrivateTmuxFile(ctx, podName, commands); err != nil {
-		return fmt.Errorf("k8s compatibility backfill for session %q failed", name)
+		return false, fmt.Errorf("k8s compatibility backfill for session %q failed", name)
 	}
-	return nil
+	return true, nil
 }
 
-// backfillSessionMetadataCommands only fills keys absent from the session.
-// The checks run under sourcePrivateTmuxFile's exclusive metadata lock, so a
-// concurrent Relaunch or SetMeta cannot be overwritten between a read and a
-// compatibility write. Partial legacy repairs deliberately do not publish the
-// current identity-version marker.
-func backfillSessionMetadataCommands(env map[string]string, publishIdentity bool) string {
-	keys := runtimeOwnerEnvKeys
+func (p *Provider) hasLegacyMetadataBackfill(ctx context.Context, podName, key string) (bool, error) {
+	output, err := p.execTmuxMetadataRead(ctx, podName, "show-environment", "-h", "-t", tmuxSession, key)
+	if err != nil {
+		if isExecExitStatus(err, 1) {
+			return false, nil
+		}
+		return false, err
+	}
+	value, explicitlyRemoved, err := parseTmuxMetadataOutput(output, key)
+	if err != nil {
+		return false, err
+	}
+	// A removal marker is an explicit decision to suppress compatibility repair.
+	return explicitlyRemoved || value == "1", nil
+}
+
+// backfillSessionMetadataCommands fills only values absent from the session.
+// Generation-bound identity is evaluated and written as one coherent group:
+// an existing instance token, runtime epoch, or session ID fences the old
+// generation's epoch/token values. The hidden completion marker is last, so a
+// failed source-file operation can be retried. It is distinct from the current
+// identity-version marker and never promotes legacy metadata to that version.
+func backfillSessionMetadataCommands(env map[string]string, publishIdentity bool, markerKey string) string {
+	lines := make([]string, 0, len(orderedSessionIdentityKeys)+len(runtimeOwnerEnvKeys)+1)
 	if publishIdentity {
-		keys = orderedSessionIdentityKeys
-	}
-	lines := make([]string, 0, len(keys))
-	for _, key := range keys {
-		value, ok := env[key]
-		if key == "BEADS_HOLDER_TOKEN" {
-			value, ok = env["GC_INSTANCE_TOKEN"]
+		generation := make([]string, 0, 5)
+		if instance := env["GC_INSTANCE_TOKEN"]; instance != "" {
+			pairCondition := fmt.Sprintf("tmux has-session -t %s && ! tmux show-environment -t %s GC_INSTANCE_TOKEN >/dev/null 2>&1 && ! tmux show-environment -t %s BEADS_HOLDER_TOKEN >/dev/null 2>&1", tmuxSession, tmuxSession, tmuxSession)
+			pair := strings.Join([]string{
+				tmuxMetadataCommand("set-environment", "-t", tmuxSession, "GC_INSTANCE_TOKEN", instance),
+				tmuxMetadataCommand("set-environment", "-t", tmuxSession, "BEADS_HOLDER_TOKEN", instance),
+			}, " ; ")
+			generation = append(generation, tmuxMetadataCommand("if-shell", pairCondition, pair))
 		}
-		if !ok || value == "" {
-			continue
+		for _, key := range []string{"GC_RUNTIME_EPOCH", "GC_CONTINUATION_EPOCH", "GC_SESSION_ID"} {
+			if value := env[key]; value != "" {
+				generation = append(generation, tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value))
+			}
 		}
-		condition := fmt.Sprintf("tmux has-session -t %s && ! tmux show-environment -t %s %s >/dev/null 2>&1", tmuxSession, tmuxSession, key)
-		set := tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value)
-		lines = append(lines, tmuxMetadataCommand("if-shell", condition, set))
+		if len(generation) > 0 {
+			condition := fmt.Sprintf("tmux has-session -t %s && ! tmux show-environment -t %s GC_INSTANCE_TOKEN >/dev/null 2>&1 && ! tmux show-environment -t %s GC_RUNTIME_EPOCH >/dev/null 2>&1 && ! tmux show-environment -t %s GC_SESSION_ID >/dev/null 2>&1", tmuxSession, tmuxSession, tmuxSession, tmuxSession)
+			lines = append(lines, tmuxMetadataCommand("if-shell", condition, strings.Join(generation, " ; ")))
+		}
+		for _, key := range []string{"GC_SESSION_NAME", "GC_ALIAS", "GC_AGENT", "BEADS_ACTOR", "GC_TEMPLATE", "GC_SESSION_ORIGIN", "GC_PROVIDER"} {
+			if value := env[key]; value != "" {
+				condition := fmt.Sprintf("tmux has-session -t %s && ! tmux show-environment -t %s %s >/dev/null 2>&1", tmuxSession, tmuxSession, key)
+				set := tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value)
+				lines = append(lines, tmuxMetadataCommand("if-shell", condition, set))
+			}
+		}
+	} else {
+		for _, key := range runtimeOwnerEnvKeys {
+			if value := env[key]; value != "" {
+				condition := fmt.Sprintf("tmux has-session -t %s && ! tmux show-environment -t %s %s >/dev/null 2>&1", tmuxSession, tmuxSession, key)
+				set := tmuxMetadataCommand("set-environment", "-t", tmuxSession, key, value)
+				lines = append(lines, tmuxMetadataCommand("if-shell", condition, set))
+			}
+		}
 	}
-	if len(lines) == 0 {
-		return ""
-	}
+	lines = append(lines, tmuxMetadataCommand("set-environment", "-h", "-t", tmuxSession, markerKey, "1"))
 	return strings.Join(lines, "\n") + "\n"
 }
 
