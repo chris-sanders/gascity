@@ -88,13 +88,33 @@ func (cr *CityRuntime) recordStartupNudgeRecovery(statuses []runtime.StartupNudg
 			continue
 		}
 		if cr.rec != nil {
-			cr.rec.Record(events.Event{
+			event := events.Event{
 				Type:    eventType,
 				Actor:   "gc",
 				Subject: status.SessionName,
 				Message: status.Reason,
 				Payload: payload,
-			})
+			}
+			ackRecorder, canAcknowledge := cr.rec.(events.AckRecorder)
+			if !canAcknowledge {
+				cr.rec.Record(event)
+				fmt.Fprintf(cr.stderr, "%s: startup nudge event for %s was not durably acknowledged; it will be retried\n", cr.logPrefix, status.IntentID) //nolint:errcheck
+				continue
+			}
+			if err := ackRecorder.RecordAck(event); err != nil {
+				fmt.Fprintf(cr.stderr, "%s: startup nudge event for %s could not be persisted; it will be retried\n", cr.logPrefix, status.IntentID) //nolint:errcheck
+				continue
+			}
+			ackCtx, cancel := context.WithTimeout(context.Background(), startupNudgeControllerScanTimeout)
+			err := runtime.AcknowledgeStartupNudgeEvent(ackCtx, cr.sp, status.SessionName, status.IntentID, status.CheckpointRevision)
+			cancel()
+			if err != nil {
+				fmt.Fprintf(cr.stderr, "%s: startup nudge event for %s is persisted but its checkpoint acknowledgement failed\n", cr.logPrefix, status.IntentID) //nolint:errcheck
+				continue
+			}
+		} else {
+			fmt.Fprintf(cr.stderr, "%s: startup nudge event for %s was not recorded; it will be retried\n", cr.logPrefix, status.IntentID) //nolint:errcheck
+			continue
 		}
 		fmt.Fprintf(cr.stderr, "%s: startup nudge %s for %s status=%s: %s\n", cr.logPrefix, status.IntentID, status.SessionName, status.Status, status.Reason) //nolint:errcheck
 	}

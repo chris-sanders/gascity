@@ -788,12 +788,23 @@ func (p *Provider) SetMeta(name, key, value string) error {
 
 func (p *Provider) sharedMetadataSetCommands(ctx context.Context, podName, name, key, value string) (string, error) {
 	class := classifyMetadataKey(key)
+	if value != "" {
+		if err := validateTmuxMetadataValue(key, value); err != nil {
+			return "", fmt.Errorf("k8s set metadata key %q for session %q: control characters are not supported", key, name)
+		}
+	}
 	if class == metadataIdentity && key == "GC_SESSION_ID" {
 		token, err := p.getMetaFromPod(ctx, podName, name, "GC_INSTANCE_TOKEN")
 		if err != nil {
 			return "", fmt.Errorf("k8s set session identity for %q failed: runtime token could not be read", name)
 		}
+		if token != "" && validateTmuxMetadataValue("GC_INSTANCE_TOKEN", token) != nil {
+			return "", fmt.Errorf("k8s set session identity for %q failed: runtime token is invalid", name)
+		}
 		commands := tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "GC_SESSION_ID") + "\n"
+		// A session ID transition must not leave a holder token from an older
+		// incarnation behind when its instance token is absent or tombstoned.
+		commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "BEADS_HOLDER_TOKEN") + "\n"
 		if token != "" {
 			commands += tmuxMetadataCommand("set-environment", "-t", tmuxSession, "BEADS_HOLDER_TOKEN", token) + "\n"
 		}
@@ -816,6 +827,9 @@ func (p *Provider) sharedMetadataSetCommands(ctx context.Context, podName, name,
 		sessionID, err := p.getMetaFromPod(ctx, podName, name, "GC_SESSION_ID")
 		if err != nil {
 			return "", fmt.Errorf("k8s set runtime identity for session %q failed: session identity could not be read", name)
+		}
+		if sessionID != "" && validateTmuxMetadataValue("GC_SESSION_ID", sessionID) != nil {
+			return "", fmt.Errorf("k8s set runtime identity for session %q failed: session identity is invalid", name)
 		}
 		commands := tmuxMetadataCommand("set-environment", "-t", tmuxSession, "-r", "GC_SESSION_ID") + "\n"
 		if value == "" {

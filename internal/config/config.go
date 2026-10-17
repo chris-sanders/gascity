@@ -1953,7 +1953,9 @@ type K8sConfig struct {
 	// MemLimit is the pod memory limit. Default: "4Gi".
 	MemLimit string `toml:"mem_limit,omitempty" jsonschema:"default=4Gi"`
 	// Prebaked skips init container staging and EmptyDir volumes when true.
-	// Use with images built by `gc build-image` that have city content baked in.
+	// Use with images built by `gc build-image` that have initialized city and
+	// rig store metadata baked in; each pod still reconciles live scope identity
+	// before starting its agent or reporting Ready.
 	Prebaked bool `toml:"prebaked,omitempty"`
 	// SecretEnv projects Kubernetes Secret keys into named container env vars.
 	// A non-empty list replaces the default GITHUB_TOKEN projection.

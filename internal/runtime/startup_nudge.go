@@ -2,21 +2,32 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"time"
+)
+
+var (
+	// ErrStartupNudgeCheckpointUnavailable reports that a durable delivery
+	// checkpoint could not be acknowledged.
+	ErrStartupNudgeCheckpointUnavailable = errors.New("startup nudge checkpoint cannot be acknowledged")
+	// ErrStartupNudgeRouteUnknown reports that the current execution backend
+	// could not be resolved for a startup nudge.
+	ErrStartupNudgeRouteUnknown = errors.New("startup nudge runtime route is unknown")
 )
 
 // StartupNudgeStatus is a durable delivery observation reported by a runtime
 // that owns startup prompt delivery. Transport submission does not imply that
 // the application consumed the prompt.
 type StartupNudgeStatus struct {
-	SessionName    string `json:"session_name"`
-	IntentID       string `json:"intent_id"`
-	ProviderFamily string `json:"provider_family"`
-	Incarnation    string `json:"incarnation"`
-	Status         string `json:"status"`
-	Reason         string `json:"reason,omitempty"`
-	Changed        bool   `json:"changed,omitempty"`
+	SessionName        string `json:"session_name"`
+	IntentID           string `json:"intent_id"`
+	ProviderFamily     string `json:"provider_family"`
+	Incarnation        string `json:"incarnation"`
+	Status             string `json:"status"`
+	Reason             string `json:"reason,omitempty"`
+	CheckpointRevision uint64 `json:"checkpoint_revision,omitempty"`
+	Changed            bool   `json:"changed,omitempty"`
 }
 
 // StartupNudgeRecoveryProvider scans controller-owned delivery intents for
@@ -55,6 +66,30 @@ type StartupNudgeLeaseTarget struct {
 // runtime lease before route resolution or recovery.
 type StartupNudgeLeaseTargetProvider interface {
 	StartupNudgeLeaseTargets(context.Context) []StartupNudgeLeaseTarget
+}
+
+// StartupNudgeEventAcknowledger clears a durable report-pending checkpoint
+// only after the controller has appended the matching event.
+type StartupNudgeEventAcknowledger interface {
+	AcknowledgeStartupNudgeEvent(context.Context, string, string, uint64) error
+}
+
+// AcknowledgeStartupNudgeEvent marks one exact checkpoint revision as
+// reported on the currently routed runtime owner. A stale revision cannot
+// acknowledge a newer delivery transition.
+func AcknowledgeStartupNudgeEvent(ctx context.Context, provider Provider, sessionName, intentID string, revision uint64) error {
+	if ctx == nil || ctx.Err() != nil || provider == nil || sessionName == "" || intentID == "" || revision == 0 {
+		return ErrStartupNudgeCheckpointUnavailable
+	}
+	leaf, _, known := ResolveBackend(provider, sessionName)
+	if !known {
+		return ErrStartupNudgeRouteUnknown
+	}
+	acknowledger, ok := leaf.(StartupNudgeEventAcknowledger)
+	if !ok {
+		return ErrStartupNudgeCheckpointUnavailable
+	}
+	return acknowledger.AcknowledgeStartupNudgeEvent(ctx, sessionName, intentID, revision)
 }
 
 // RecoverStartupNudges walks composite providers to their leaves and asks

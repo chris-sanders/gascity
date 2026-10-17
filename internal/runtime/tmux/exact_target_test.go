@@ -225,7 +225,7 @@ func TestEnvironmentOpsTargetExactSession(t *testing.T) {
 		},
 		{
 			"RemoveEnvironment", "", func(tm *Tmux) error { return tm.RemoveEnvironment("worker-1", "GC_K") },
-			[]string{"-u", "set-environment", "-t", "=worker-1", "-u", "GC_K"},
+			[]string{"-u", "set-environment", "-t", "=worker-1", "-r", "GC_K"},
 		},
 		{
 			"GetEnvironment", "GC_K=v", func(tm *Tmux) error { _, err := tm.GetEnvironment("worker-1", "GC_K"); return err },

@@ -600,7 +600,6 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 	defer func() { _ = tm.KillSession(sessionName) }()
-
 	// Verify exists
 	has, err := tm.HasSession(sessionName)
 	if err != nil {
@@ -2359,6 +2358,10 @@ func TestSetGetRemoveEnvironment(t *testing.T) {
 	sessionName := "gt-test-envops-" + t.Name()
 
 	_ = tm.KillSession(sessionName)
+	if _, err := tm.run("set-environment", "-g", "GC_TEST_VAR", "stale-global"); err != nil {
+		t.Fatalf("set global fixture: %v", err)
+	}
+	defer func() { _, _ = tm.run("set-environment", "-g", "-u", "GC_TEST_VAR") }()
 	if err := tm.NewSession(sessionName, ""); err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -2387,6 +2390,9 @@ func TestSetGetRemoveEnvironment(t *testing.T) {
 	_, err = tm.GetEnvironment(sessionName, "GC_TEST_VAR")
 	if err == nil {
 		t.Error("GetEnvironment after RemoveEnvironment should return error")
+	}
+	if got, err := tm.run("show-environment", "-t", sessionTarget(sessionName), "GC_TEST_VAR"); err != nil || got != "-GC_TEST_VAR" {
+		t.Errorf("removed value = %q, %v; want a removal marker that shadows stale global state", got, err)
 	}
 
 	// Removing a variable that doesn't exist should not error.

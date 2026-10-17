@@ -1,6 +1,7 @@
 package resourcecensus
 
 import (
+	"errors"
 	"fmt"
 	"go/parser"
 	"go/token"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1101,9 +1103,18 @@ func TestUpdateGeneratedSaysWhenTheSourceTreeIsReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	probe, err := os.CreateTemp(dir, ".readonly-probe-*")
+	if err == nil {
+		_ = probe.Close()
+		_ = os.Remove(probe.Name())
+		t.Skip("validation filesystem allows writes despite directory mode bits")
+	}
+	if !errors.Is(err, os.ErrPermission) && !errors.Is(err, syscall.EROFS) {
+		t.Fatalf("readonly probe error = %v, want permission denied or read-only filesystem", err)
+	}
 	policy := validLedger()
 
-	err := updateGenerated(policy, root, cloneLedger(policy), updateCensus())
+	err = updateGenerated(policy, root, cloneLedger(policy), updateCensus())
 	requireErrorContains(t, err, "read-only")
 	requireErrorContains(t, err, "go test")
 }

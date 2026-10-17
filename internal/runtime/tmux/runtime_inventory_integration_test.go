@@ -10,11 +10,12 @@ import (
 
 // Regression (#7871), on real tmux: an unmarked session listed LAST (tmux
 // lists sessions by name) ends the executor-trimmed list-panes output, so its
-// empty marker field loses its tab. Before and after #7893's marker clear
-// (RemoveMeta unsets the option mirror), the batched inventory must still read
-// every session, with only the marked one marked. The server is private to
-// this test (its own -L socket under the package's private TMUX_TMPDIR) and
-// only it is torn down.
+// empty marker field loses its tab. Before and after marker clear (RemoveMeta
+// marks the session environment key removed), the batched inventory must still
+// read every session, with only the marked one marked. A stale server-global
+// environment value must not reappear after clear. The server is
+// private to this test (its own -L socket under the package's private
+// TMUX_TMPDIR) and only it is torn down.
 // Kills: an inventory parse that needs the trailing empty marker's tab.
 func TestTmuxRuntimeInventory_RealTmuxEmptyTrailingMarker(t *testing.T) {
 	if !hasTmux() {
@@ -24,13 +25,20 @@ func TestTmuxRuntimeInventory_RealTmuxEmptyTrailingMarker(t *testing.T) {
 	cfg.SocketName = privateSocketName("inv")
 	p := NewProviderWithConfig(cfg)
 	t.Cleanup(func() { _ = p.tm.KillServer() })
-	for _, name := range []string{"inv-a-asked", "inv-z-quiet"} {
-		if err := p.tm.NewSessionWithCommand(name, t.TempDir(), "sleep 300"); err != nil {
-			t.Fatalf("new session %s: %v", name, err)
-		}
+	if err := p.tm.NewSessionWithCommand("inv-a-asked", t.TempDir(), "sleep 300"); err != nil {
+		t.Fatalf("new session inv-a-asked: %v", err)
+	}
+	if _, err := p.tm.run("set-environment", "-g", "GC_RESTART_REQUESTED", "1700000001"); err != nil {
+		t.Fatalf("set stale global restart environment: %v", err)
+	}
+	if err := p.tm.NewSessionWithCommand("inv-z-quiet", t.TempDir(), "sleep 300"); err != nil {
+		t.Fatalf("new session inv-z-quiet: %v", err)
 	}
 	if err := p.SetMeta("inv-a-asked", "GC_RESTART_REQUESTED", "1700000050"); err != nil {
 		t.Fatalf("SetMeta: %v", err)
+	}
+	if err := p.RemoveMeta("inv-z-quiet", "GC_RESTART_REQUESTED"); err != nil {
+		t.Fatalf("RemoveMeta quiet session: %v", err)
 	}
 
 	// The hazard is real: the executor's output ends without the last
@@ -69,4 +77,7 @@ func TestTmuxRuntimeInventory_RealTmuxEmptyTrailingMarker(t *testing.T) {
 		t.Fatalf("RemoveMeta: %v", err)
 	}
 	check("marker cleared", map[string]bool{"inv-a-asked": false, "inv-z-quiet": false})
+	if got, err := p.tm.run("show-environment", "-g", "GC_RESTART_REQUESTED"); err != nil || strings.TrimSpace(got) != "GC_RESTART_REQUESTED=1700000001" {
+		t.Fatalf("global restart fixture = %q, %v; want stale global value to remain", got, err)
+	}
 }

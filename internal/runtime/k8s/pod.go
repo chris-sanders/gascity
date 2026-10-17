@@ -39,6 +39,8 @@ const (
 	agentCommandArg0      = "gc-agent-command"
 )
 
+var linuxUsernamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,31}\$?$`)
+
 func controllerCityPath(cfgEnv map[string]string) string {
 	ctrlCity := strings.TrimSpace(cfgEnv["GC_CITY"])
 	if ctrlCity == "" {
@@ -352,20 +354,28 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	// as root (see securityContext below), creates the user, sets up workspace
 	// ownership, then drops privileges via su for the tmux session.
 	linuxUsername := cfg.Env["LINUX_USERNAME"]
+	if linuxUsername != "" && !linuxUsernamePattern.MatchString(linuxUsername) {
+		return nil, fmt.Errorf("LINUX_USERNAME %q is not a valid Linux account name", linuxUsername)
+	}
 	if linuxUsername != "" && hasConfiguredPodIdentity(p.podSecurity) {
 		return nil, fmt.Errorf("LINUX_USERNAME cannot be combined with explicit Kubernetes pod identity (session.k8s.run_as_user/run_as_group/fs_group or GC_K8S_RUN_AS_USER/GC_K8S_RUN_AS_GROUP/GC_K8S_FS_GROUP)")
 	}
 	var userSetup string
 	if linuxUsername != "" {
+		quotedUser := shellquote.Quote(linuxUsername)
+		quotedHome := shellquote.Quote(filepath.Join("/home", linuxUsername))
+		quotedSudoersFile := shellquote.Quote(filepath.Join("/etc/sudoers.d", linuxUsername))
+		quotedSudoersLine := shellquote.Quote(linuxUsername + " ALL=(ALL) NOPASSWD:ALL")
+		quotedWorkDir := shellquote.Quote(podWorkDir)
 		userSetup = fmt.Sprintf(
-			`id "%s" >/dev/null 2>&1 || useradd -m -s /bin/bash "%s"; `+
-				`echo "%s ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/"%s" && chmod 0440 /etc/sudoers.d/"%s"; `+
-				`mkdir -p "%s" && chown -R "%s" "%s"; `+
-				`export HOME="/home/%s"; `,
-			linuxUsername, linuxUsername,
-			linuxUsername, linuxUsername, linuxUsername,
-			podWorkDir, linuxUsername, podWorkDir,
-			linuxUsername,
+			`id %s >/dev/null 2>&1 || useradd -m -s /bin/bash %s; `+
+				`printf '%%s\n' %s > %s && chmod 0440 %s; `+
+				`mkdir -p %s && chown -R %s %s; `+
+				`export HOME=%s; `,
+			quotedUser, quotedUser,
+			quotedSudoersLine, quotedSudoersFile, quotedSudoersFile,
+			quotedWorkDir, quotedUser, quotedWorkDir,
+			quotedHome,
 		)
 	}
 	requiredClaudeSecret := false
@@ -375,10 +385,16 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 			break
 		}
 	}
-	credCopy := `umask 077; if [ -d /tmp/claude-secret ]; then mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || true; fi; git config --global --add safe.directory '*' 2>/dev/null || true; `
-	if requiredClaudeSecret {
-		credCopy = `umask 077; if [ -d /tmp/claude-secret ]; then mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || { echo 'gc: required credential copy failed' >&2; exit 1; }; else echo 'gc: required credential mount missing' >&2; exit 1; fi; git config --global --add safe.directory '*' 2>/dev/null || true; `
+	credCopy := claudeCredentialCopyCommand(requiredClaudeSecret)
+	if linuxUsername != "" {
+		quotedUser := shellquote.Quote(linuxUsername)
+		if requiredClaudeSecret {
+			credCopy += `if [ -d "$HOME/.claude" ]; then chown -R ` + quotedUser + ` "$HOME/.claude" 2>/dev/null || { echo 'gc: required credential ownership setup failed' >&2; exit 1; }; fi; `
+		} else {
+			credCopy += `if [ -d "$HOME/.claude" ]; then chown -R ` + quotedUser + ` "$HOME/.claude" 2>/dev/null || true; fi; `
+		}
 	}
+	credCopy += gitSafeDirectoryCommand(linuxUsername)
 	wsWait := `while [ ! -f /workspace/.gc-workspace-ready ]; do sleep 0.5; done; `
 
 	// The pod spec's WorkingDir names the workspace root, because the kubelet
@@ -620,6 +636,23 @@ func cloneInt64Ptr(value *int64) *int64 {
 // and remaps pod-visible ones.
 func buildPodEnv(cfgEnv map[string]string, podWorkDir, managedServiceHost, managedServicePort string) ([]corev1.EnvVar, error) {
 	return buildPodEnvWithSecretEnv(cfgEnv, podWorkDir, managedServiceHost, managedServicePort, nil)
+}
+
+func claudeCredentialCopyCommand(required bool) string {
+	const prepare = `credential_umask=$(umask); umask 077; `
+	const restore = `umask "$credential_umask"; `
+	if required {
+		return prepare + `if [ -d /tmp/claude-secret ]; then mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || { echo 'gc: required credential copy failed' >&2; exit 1; }; else echo 'gc: required credential mount missing' >&2; exit 1; fi; ` + restore
+	}
+	return prepare + `if [ -d /tmp/claude-secret ]; then mkdir -p "$HOME/.claude" && chmod 0700 "$HOME/.claude" && cp -rL /tmp/claude-secret/. "$HOME/.claude/" 2>/dev/null || true; fi; ` + restore
+}
+
+func gitSafeDirectoryCommand(linuxUsername string) string {
+	if linuxUsername == "" {
+		return `git config --global --add safe.directory '*' 2>/dev/null || true; `
+	}
+	command := shellquote.Quote("git config --global --add safe.directory '*'")
+	return `su - ` + shellquote.Quote(linuxUsername) + ` -c ` + command + ` 2>/dev/null || true; `
 }
 
 func buildPodEnvWithSecretEnv(cfgEnv map[string]string, podWorkDir, managedServiceHost, managedServicePort string, secretEnv []runtime.K8sSecretEnv) ([]corev1.EnvVar, error) {

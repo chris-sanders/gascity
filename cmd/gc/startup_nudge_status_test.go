@@ -2,12 +2,25 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
+
+type startupNudgeEventAckProvider struct {
+	runtime.Provider
+	acks []uint64
+	err  error
+}
+
+func (p *startupNudgeEventAckProvider) AcknowledgeStartupNudgeEvent(_ context.Context, _, _ string, revision uint64) error {
+	p.acks = append(p.acks, revision)
+	return p.err
+}
 
 func TestCityStatusExposesUnresolvedStartupNudgeWithoutPromptText(t *testing.T) {
 	snapshot := cityStatusSnapshot{
@@ -55,4 +68,44 @@ func containsExactString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestRecordStartupNudgeRecoveryAcknowledgesOnlyAfterEventAppend(t *testing.T) {
+	status := runtime.StartupNudgeStatus{
+		SessionName: "worker", IntentID: "intent-1", ProviderFamily: "claude",
+		Incarnation: "instance-42", Status: "uncertain", Reason: "submit_result_ambiguous",
+		CheckpointRevision: 9, Changed: true,
+	}
+
+	t.Run("event append succeeds", func(t *testing.T) {
+		provider := &startupNudgeEventAckProvider{}
+		recorder := events.NewFake()
+		var stderr bytes.Buffer
+		cr := &CityRuntime{sp: provider, rec: recorder, stderr: &stderr}
+
+		cr.recordStartupNudgeRecovery([]runtime.StartupNudgeStatus{status})
+
+		if len(recorder.Events) != 1 || recorder.Events[0].Type != startupNudgeUncertainEvent {
+			t.Fatalf("events = %+v, want one uncertainty event", recorder.Events)
+		}
+		if len(provider.acks) != 1 || provider.acks[0] != status.CheckpointRevision {
+			t.Fatalf("checkpoint acknowledgements = %v, want revision %d", provider.acks, status.CheckpointRevision)
+		}
+	})
+
+	t.Run("event append fails", func(t *testing.T) {
+		provider := &startupNudgeEventAckProvider{}
+		recorder := events.NewFailFake()
+		var stderr bytes.Buffer
+		cr := &CityRuntime{sp: provider, rec: recorder, stderr: &stderr}
+
+		cr.recordStartupNudgeRecovery([]runtime.StartupNudgeStatus{status})
+
+		if len(provider.acks) != 0 {
+			t.Fatalf("checkpoint acknowledgements = %v, want none after failed event append", provider.acks)
+		}
+		if !strings.Contains(stderr.String(), "could not be persisted; it will be retried") {
+			t.Fatalf("stderr = %q, want visible retry diagnostic", stderr.String())
+		}
+	})
 }

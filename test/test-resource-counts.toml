@@ -863,6 +863,11 @@ resource = "subprocess"
 calls = 2
 
 [[count]]
+path = "cmd/gc/k8s_store_attachment_route_test.go"
+resource = "net_listen"
+calls = 1
+
+[[count]]
 path = "cmd/gc/live_submit_probe_test.go"
 resource = "fixed_sleep"
 calls = 5
@@ -2194,12 +2199,12 @@ calls = 1
 [[count]]
 path = "internal/runtime/k8s/metadata_test.go"
 resource = "subprocess"
-calls = 1
+calls = 3
 
 [[count]]
 path = "internal/runtime/k8s/metadata_test.go"
 resource = "tmux"
-calls = 1
+calls = 2
 
 [[count]]
 path = "internal/runtime/k8s/pod_prompt_test.go"
