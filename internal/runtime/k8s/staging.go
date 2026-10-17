@@ -37,7 +37,7 @@ func stageFiles(ctx context.Context, ops k8sOps, podName string, cfg runtime.Con
 	}
 
 	// Copy rig work_dir into the pod.
-	podWorkDir := "/workspace"
+	podWorkDir := projectedPodWorkDir(cfg)
 	workDirRel, workDirIsNested := relativeCityWorkDir(ctrlCity, cfg.WorkDir)
 	if workDirIsNested {
 		podWorkDir = filepath.Join("/workspace", workDirRel)
@@ -243,6 +243,51 @@ func copyDirToPod(ctx context.Context, ops k8sOps, podName, container, srcDir, d
 func copyDirToPodSkipping(ctx context.Context, ops k8sOps, podName, container, srcDir, dstDir, skipRel string) error {
 	_, err := copyDirToPodInternal(ctx, ops, podName, container, srcDir, dstDir, skipRel)
 	return err
+}
+
+// stageCanonicalStoreFilesInPod projects only the canonical local identity and
+// attachment inputs that `gc init --from` intentionally excludes. It does not
+// copy scope-local credentials or mutable beads state.
+func stageCanonicalStoreFilesInPod(ctx context.Context, ops k8sOps, podName, controllerRoot, podRoot string) error {
+	controllerRoot = strings.TrimSpace(controllerRoot)
+	if controllerRoot == "" || strings.TrimSpace(podRoot) == "" {
+		return errors.New("canonical store root is missing")
+	}
+	source := filepath.Join(controllerRoot, ".beads")
+	stageRoot, err := os.MkdirTemp("", "gc-k8s-store-files-")
+	if err != nil {
+		return fmt.Errorf("prepare canonical store projection: %w", err)
+	}
+	defer os.RemoveAll(stageRoot) //nolint:errcheck
+	stageBeads := filepath.Join(stageRoot, ".beads")
+	if err := os.Mkdir(stageBeads, 0o700); err != nil {
+		return fmt.Errorf("prepare canonical store projection: %w", err)
+	}
+	for _, name := range []string{"config.yaml", "metadata.json", "identity.toml"} {
+		path := filepath.Join(source, name)
+		info, err := os.Lstat(path)
+		if name == "identity.toml" && os.IsNotExist(err) {
+			// The controller may still need the owning-store migration to
+			// establish a missing canonical project identity. Project the
+			// other read-only inputs first; the post-migration staging pass
+			// will include identity.toml before attach.
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() {
+			return errors.New("canonical store attachment files are incomplete")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return errors.New("canonical store attachment files are unreadable")
+		}
+		if err := os.WriteFile(filepath.Join(stageBeads, name), data, info.Mode().Perm()); err != nil {
+			return errors.New("canonical store attachment files are unreadable")
+		}
+	}
+	if err := copyDirToPod(ctx, ops, podName, "agent", stageBeads, filepath.Join(podRoot, ".beads")); err != nil {
+		return errors.New("canonical store attachment files could not be projected")
+	}
+	return nil
 }
 
 // copyDirToPodInternal reports copied=true only when srcDir was a directory

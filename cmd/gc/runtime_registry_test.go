@@ -13,8 +13,9 @@ import (
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
-	sessionk8s "github.com/gastownhall/gascity/internal/runtime/k8s"
 	sessionacp "github.com/gastownhall/gascity/internal/runtime/acp"
+	sessionhybrid "github.com/gastownhall/gascity/internal/runtime/hybrid"
+	sessionk8s "github.com/gastownhall/gascity/internal/runtime/k8s"
 	"github.com/gastownhall/gascity/internal/testutil"
 )
 
@@ -26,6 +27,26 @@ func assertProviderPkg(t *testing.T, sp any, pkg string) {
 	t.Helper()
 	if got := fmt.Sprintf("%T", sp); !strings.HasPrefix(got, "*"+pkg+".") {
 		t.Fatalf("provider type = %s, want a *%s.* provider", got, pkg)
+	}
+}
+
+type k8sAttachmentRouteTestProvider struct {
+	runtime.Provider
+	required bool
+}
+
+func (p k8sAttachmentRouteTestProvider) RequiresK8sStoreAttachment() bool { return p.required }
+
+func TestK8sStoreAttachmentFollowsResolvedHybridLeaf(t *testing.T) {
+	local := k8sAttachmentRouteTestProvider{Provider: runtime.NewFake(), required: false}
+	remote := k8sAttachmentRouteTestProvider{Provider: runtime.NewFake(), required: true}
+	provider := sessionhybrid.New(local, remote, func(name string) bool { return name == "remote-worker" })
+
+	if runtimeLeafRequiresK8sStoreAttachment(provider, "local-worker") {
+		t.Fatal("hybrid local session was treated as a K8s store attachment")
+	}
+	if !runtimeLeafRequiresK8sStoreAttachment(provider, "remote-worker") {
+		t.Fatal("hybrid remote K8s session did not select its store attachment")
 	}
 }
 
@@ -470,8 +491,11 @@ func TestK8sSecretProjectionReachesBuiltinAndHybridProviders(t *testing.T) {
 	wantMounts := []runtime.K8sSecretMount{{Secret: "service-files", MountPath: "/run/service"}}
 	uid, gid, fsGroup := int64(23456), int64(2000), int64(34567)
 	var calls int
-	newSeamBackedK8sProvider = func(env []runtime.K8sSecretEnv, mounts []runtime.K8sSecretMount, security sessionk8s.PodSecurityConfig) (runtime.Provider, error) {
+	newSeamBackedK8sProvider = func(env []runtime.K8sSecretEnv, mounts []runtime.K8sSecretMount, security sessionk8s.PodSecurityConfig, cityPath string) (runtime.Provider, error) {
 		calls++
+		if cityPath == "" {
+			t.Errorf("K8s constructor call %d city path is empty", calls)
+		}
 		if len(env) != len(wantEnv) || env[0] != wantEnv[0] {
 			t.Errorf("K8s constructor call %d secret env = %#v, want %#v", calls, env, wantEnv)
 		}

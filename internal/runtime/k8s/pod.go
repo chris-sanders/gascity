@@ -1,7 +1,9 @@
 package k8s
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"path"
@@ -69,6 +71,19 @@ func projectedPodWorkDir(cfg runtime.Config) string {
 	if ctrlCity != "" && cfg.WorkDir != "" && cfg.WorkDir != ctrlCity {
 		if rel, ok := strings.CutPrefix(cfg.WorkDir, ctrlCity+"/"); ok {
 			podWorkDir = podWorkspaceRoot + "/" + rel
+		} else if !pathutil.PathWithin(ctrlCity, cfg.WorkDir) {
+			root, err := controllerStoreRoot(cfg.Env)
+			if err != nil || root == "" {
+				root = cfg.WorkDir
+			}
+			podRoot := externalScopePodRoot(root)
+			if pathutil.PathWithin(root, cfg.WorkDir) {
+				rel, _ := filepath.Rel(filepath.Clean(root), filepath.Clean(cfg.WorkDir))
+				if rel != "." {
+					podRoot = filepath.Join(podRoot, rel)
+				}
+			}
+			podWorkDir = podRoot
 		}
 	}
 	return podWorkDir
@@ -161,19 +176,63 @@ func buildRespawnCommand(cfg runtime.Config) []string {
 	return append(args, agentCommandShellArgs(script, cfg)...)
 }
 
-func projectedPodStoreRoot(cfg runtime.Config, podWorkDir string) string {
-	storeRoot := strings.TrimSpace(cfg.Env["GC_STORE_ROOT"])
+func projectedPodStoreRoot(cfg runtime.Config, podWorkDir string) (string, error) {
+	storeRoot, err := controllerStoreRoot(cfg.Env)
+	if err != nil {
+		return "", err
+	}
+	ctrlCity := controllerCityPath(cfg.Env)
 	if storeRoot == "" {
 		storeRoot = strings.TrimSpace(cfg.WorkDir)
 	}
 	if storeRoot == "" {
-		storeRoot = controllerCityPath(cfg.Env)
+		storeRoot = ctrlCity
 	}
-	storeRoot = remapControllerPathToPod(storeRoot, controllerCityPath(cfg.Env))
 	if storeRoot == "" {
-		return podWorkDir
+		return podWorkDir, nil
 	}
-	return storeRoot
+	if pathutil.PathWithin(ctrlCity, storeRoot) {
+		return remapControllerPathToPod(storeRoot, ctrlCity), nil
+	}
+	return externalScopePodRoot(storeRoot), nil
+}
+
+func controllerStoreRoot(env map[string]string) (string, error) {
+	canonical, canonicalPresent := env["GC_BEADS_SCOPE_ROOT"]
+	canonical = strings.TrimSpace(canonical)
+	legacy := strings.TrimSpace(env["GC_STORE_ROOT"])
+	if canonicalPresent {
+		if canonical != "" && legacy != "" && pathutil.NormalizePathForCompare(canonical) != pathutil.NormalizePathForCompare(legacy) {
+			return "", fmt.Errorf("conflicting GC_BEADS_SCOPE_ROOT and legacy GC_STORE_ROOT declarations")
+		}
+		if canonical == "" && legacy != "" {
+			return "", fmt.Errorf("empty GC_BEADS_SCOPE_ROOT conflicts with legacy GC_STORE_ROOT declaration")
+		}
+		return canonical, nil
+	}
+	return legacy, nil
+}
+
+func externalScopePodRoot(controllerRoot string) string {
+	sum := sha256.Sum256([]byte(filepath.Clean(strings.TrimSpace(controllerRoot))))
+	return filepath.Join(podWorkspaceRoot, ".gc", "external-scopes", hex.EncodeToString(sum[:]))
+}
+
+func remapControllerScopePathToPod(value string, cfgEnv map[string]string) string {
+	value = strings.TrimSpace(value)
+	cityRoot := controllerCityPath(cfgEnv)
+	if remapped := remapControllerPathToPod(value, cityRoot); remapped != value {
+		return remapped
+	}
+	storeRoot, err := controllerStoreRoot(cfgEnv)
+	if err != nil || storeRoot == "" || !pathutil.PathWithin(storeRoot, value) {
+		return value
+	}
+	rel, err := filepath.Rel(filepath.Clean(storeRoot), filepath.Clean(value))
+	if err != nil || rel == "." {
+		return externalScopePodRoot(storeRoot)
+	}
+	return filepath.Join(externalScopePodRoot(storeRoot), rel)
 }
 
 func projectedPodRuntimeDir(cfgEnv map[string]string, ctrlCity string) string {
@@ -211,27 +270,13 @@ func projectControllerRuntimePathToPod(path, ctrlCity, ctrlRuntimeDir, podRuntim
 	return path
 }
 
-// projectedPodDoltEnv adapts the controller projection to a pod-visible Dolt
-// target. Managed-local controller projections intentionally omit GC_DOLT_HOST
-// and use a host-local runtime port; pods translate that blank-host managed
-// shape to the provider-configured in-cluster alias at this adapter edge so
-// agents still consume one GC_DOLT_* connection contract. Explicit
-// GC_DOLT_HOST values are preserved as written.
-// BEADS_DOLT_SERVER_HOST/PORT are compatibility mirrors derived from the GC
-// projection, not independent input authorities.
-func controllerLocalDoltHost(host string) bool {
-	host = strings.TrimSpace(strings.ToLower(host))
-	switch host {
-	case "", "127.0.0.1", "localhost", "0.0.0.0", "::1", "::":
-		return true
-	default:
-		return false
-	}
-}
-
+// projectedPodDoltEnv adapts only a provenance-authorized managed-local
+// controller target to the in-cluster alias. External endpoints, including
+// explicitly configured loopback addresses, keep their resolved host and port.
 func projectedPodDoltEnv(cfgEnv map[string]string, managedHost, managedPort string) (map[string]string, error) {
 	host := strings.TrimSpace(cfgEnv["GC_DOLT_HOST"])
 	port := strings.TrimSpace(cfgEnv["GC_DOLT_PORT"])
+	managedLocal := strings.TrimSpace(cfgEnv["GC_K8S_DOLT_MANAGED_LOCAL"]) == "1"
 	managedHost = strings.TrimSpace(managedHost)
 	managedPort = strings.TrimSpace(managedPort)
 	if managedHost == "" {
@@ -240,15 +285,18 @@ func projectedPodDoltEnv(cfgEnv map[string]string, managedHost, managedPort stri
 	if managedPort == "" {
 		managedPort = podManagedDoltPort
 	}
+	if managedLocal {
+		if port == "" {
+			return nil, fmt.Errorf("managed-local Dolt attachment is missing its resolved controller port")
+		}
+		host, port = managedHost, managedPort
+	}
 
 	switch {
 	case host == "" && port == "":
 		return map[string]string{}, nil
-	case host != "" && port == "":
-		return nil, fmt.Errorf("requires both GC_DOLT_HOST and GC_DOLT_PORT when GC_DOLT_HOST is set")
-	case controllerLocalDoltHost(host):
-		host = managedHost
-		port = managedPort
+	case host == "" || port == "":
+		return nil, fmt.Errorf("requires both GC_DOLT_HOST and GC_DOLT_PORT for a projected Dolt target")
 	}
 
 	projected := map[string]string{
@@ -567,15 +615,26 @@ func buildPodEnvWithSecretEnv(cfgEnv map[string]string, podWorkDir, managedServi
 	// Start with cfg.Env, removing controller-only vars.
 	// Auth creds (GC_DOLT_USER, GC_DOLT_PASSWORD, BEADS_DOLT_*_USER/PASSWORD) intentionally pass through.
 	skip := map[string]bool{
-		"GC_BEADS":               true,
-		"GC_SESSION":             true,
-		"GC_EVENTS":              true,
-		"GC_K8S_DOLT_HOST":       true,
-		"GC_K8S_DOLT_PORT":       true,
-		"GC_DOLT_HOST":           true,
-		"GC_DOLT_PORT":           true,
-		"BEADS_DOLT_SERVER_HOST": true,
-		"BEADS_DOLT_SERVER_PORT": true,
+		"GC_BEADS":                            true,
+		"GC_SESSION":                          true,
+		"GC_EVENTS":                           true,
+		"GC_K8S_DOLT_HOST":                    true,
+		"GC_K8S_DOLT_PORT":                    true,
+		"GC_DOLT_HOST":                        true,
+		"GC_DOLT_PORT":                        true,
+		"BEADS_DOLT_SERVER_HOST":              true,
+		"BEADS_DOLT_SERVER_PORT":              true,
+		"GC_K8S_DOLT_MANAGED_LOCAL":           true,
+		"GC_K8S_CITY_DOLT_MANAGED_LOCAL":      true,
+		"GC_K8S_ATTACH_REQUIRED":              true,
+		"GC_K8S_CITY_ATTACH_REQUIRED":         true,
+		"GC_K8S_CITY_DOLT_HOST":               true,
+		"GC_K8S_CITY_DOLT_PORT":               true,
+		"GC_K8S_CITY_DOLT_USER":               true,
+		"GC_K8S_CITY_DOLT_PASSWORD":           true,
+		"GC_K8S_CITY_DOLT_TLS":                true,
+		"GC_K8S_CITY_DOLT_CA":                 true,
+		"GC_K8S_CITY_DOLT_CREDENTIAL_COMMAND": true,
 	}
 
 	ctrlCity := controllerCityPath(cfgEnv)
@@ -592,6 +651,10 @@ func buildPodEnvWithSecretEnv(cfgEnv map[string]string, podWorkDir, managedServi
 		switch k {
 		case "GC_CITY", "GC_CITY_PATH", "GC_CITY_ROOT":
 			val = "/workspace"
+		case "BEADS_DOLT_SERVER_CA":
+			if strings.TrimSpace(val) != "" {
+				val = podDoltCAPath(val)
+			}
 		case "GC_DIR":
 			val = podWorkDir
 		case "GC_CITY_RUNTIME_DIR":
@@ -599,7 +662,7 @@ func buildPodEnvWithSecretEnv(cfgEnv map[string]string, podWorkDir, managedServi
 		case "GC_CONTROL_DISPATCHER_TRACE_DEFAULT", "GC_PACK_STATE_DIR":
 			val = projectControllerRuntimePathToPod(val, ctrlCity, ctrlRuntimeDir, podRuntimeDir)
 		case "GC_STORE_ROOT", "GC_BEADS_SCOPE_ROOT", "GC_RIG_ROOT", "BEADS_DIR", "GT_ROOT", "GC_PACK_DIR":
-			val = remapControllerPathToPod(val, ctrlCity)
+			val = remapControllerScopePathToPod(val, cfgEnv)
 		}
 		env = append(env, corev1.EnvVar{Name: k, Value: val})
 	}

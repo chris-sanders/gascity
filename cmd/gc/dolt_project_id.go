@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +23,7 @@ import (
 	"github.com/gastownhall/gascity/internal/doltpool"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 )
 
@@ -75,6 +79,8 @@ func newEnsureProjectIDCmd(stdout, stderr io.Writer) *cobra.Command {
 		user         string
 		database     string
 		cityPath     string
+		tlsCA        string
+		tlsEnabled   bool
 	)
 	cmd := &cobra.Command{
 		Use:    "ensure-project-id",
@@ -95,7 +101,7 @@ func newEnsureProjectIDCmd(stdout, stderr io.Writer) *cobra.Command {
 					return errExit
 				}
 			}
-			report, err := ensureManagedDoltProjectIDAtTarget(metadataPath, target, cityPath, rec)
+			report, err := ensureManagedDoltProjectIDAtTargetTLS(metadataPath, target, cityPath, rec, tlsEnabled, tlsCA)
 			if err != nil {
 				fmt.Fprintf(stderr, "gc dolt-state ensure-project-id: %v\n", err) //nolint:errcheck
 				return errExit
@@ -115,10 +121,160 @@ func newEnsureProjectIDCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&user, "user", "", "Dolt user")
 	cmd.Flags().StringVar(&database, "database", "", "Dolt database")
 	cmd.Flags().StringVar(&cityPath, "city", "", "city root (required for event emission)")
+	cmd.Flags().BoolVar(&tlsEnabled, "tls", false, "use verified TLS for the resolved endpoint")
+	cmd.Flags().StringVar(&tlsCA, "tls-ca", "", "optional CA certificate file for the resolved TLS endpoint")
 	_ = cmd.MarkFlagRequired("city")
 	_ = cmd.MarkFlagRequired("metadata")
 	_ = cmd.MarkFlagRequired("database")
 	return cmd
+}
+
+// newVerifyProjectIDCmd is the read-only attachment gate used by the native
+// Kubernetes runtime. It requires the controller-resolved expected identity,
+// explicit database/user/endpoint values, and matching L1, L2, and remote L3
+// identities. It never seeds, adopts, repairs, or emits identity stamps.
+func newVerifyProjectIDCmd(stdout, stderr io.Writer) *cobra.Command {
+	var metadataPath, scopeRoot, database, expectedID, host, port, user, transport, tlsCA string
+	var tlsEnabled bool
+	cmd := &cobra.Command{
+		Use:    "verify-project-id",
+		Short:  "Verify local and remote project identity without mutation",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := verifyLocalProjectIdentity(metadataPath, scopeRoot, database, expectedID); err != nil {
+				fmt.Fprintf(stderr, "gc dolt-state verify-project-id: %v\n", err) //nolint:errcheck
+				return errExit
+			}
+			if strings.TrimSpace(transport) != "tcp" {
+				fmt.Fprintln(stderr, "gc dolt-state verify-project-id: unsupported transport") //nolint:errcheck
+				return errExit
+			}
+			user = strings.TrimSpace(user)
+			if user == "" {
+				fmt.Fprintln(stderr, "gc dolt-state verify-project-id: resolved database user is missing") //nolint:errcheck
+				return errExit
+			}
+			portNumber, portErr := strconv.Atoi(strings.TrimSpace(port))
+			if portErr != nil || portNumber < 1 || portNumber > 65535 || strings.TrimSpace(host) == "" {
+				fmt.Fprintln(stderr, "gc dolt-state verify-project-id: resolved TCP endpoint is invalid") //nolint:errcheck
+				return errExit
+			}
+			cfg := mysql.NewConfig()
+			cfg.User = user
+			cfg.Passwd = os.Getenv("GC_DOLT_PASSWORD")
+			cfg.Net = "tcp"
+			cfg.Addr = net.JoinHostPort(strings.TrimSpace(host), strings.TrimSpace(port))
+			cfg.DBName = strings.TrimSpace(database)
+			cfg.ParseTime = true
+			if tlsEnabled {
+				tlsConfig, tlsErr := verifiedDoltTLSConfig(host, tlsCA)
+				if tlsErr != nil {
+					fmt.Fprintln(stderr, "gc dolt-state verify-project-id: verified TLS trust configuration is invalid") //nolint:errcheck
+					return errExit
+				}
+				cfg.TLS = tlsConfig
+			} else if strings.TrimSpace(tlsCA) != "" {
+				fmt.Fprintln(stderr, "gc dolt-state verify-project-id: TLS CA was supplied while TLS is disabled") //nolint:errcheck
+				return errExit
+			}
+			connector, err := mysql.NewConnector(cfg)
+			if err != nil {
+				fmt.Fprintln(stderr, "gc dolt-state verify-project-id: could not create identity connector") //nolint:errcheck
+				return errExit
+			}
+			db := sql.OpenDB(connector)
+			db.SetMaxOpenConns(1)
+			defer db.Close() //nolint:errcheck // one-shot verification connection
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := db.PingContext(ctx); err != nil {
+				fmt.Fprintln(stderr, "gc dolt-state verify-project-id: database identity target unavailable") //nolint:errcheck
+				return errExit
+			}
+			var connectedDatabase string
+			if err := db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&connectedDatabase); err != nil || strings.TrimSpace(connectedDatabase) != strings.TrimSpace(database) {
+				fmt.Fprintln(stderr, "gc dolt-state verify-project-id: connected database does not match the resolved database") //nolint:errcheck
+				return errExit
+			}
+			remoteID, ok, err := readDatabaseProjectID(ctx, db)
+			if err != nil || !ok || remoteID != strings.TrimSpace(expectedID) {
+				fmt.Fprintln(stderr, "gc dolt-state verify-project-id: remote project identity is missing or mismatched") //nolint:errcheck
+				return errExit
+			}
+			_, _ = fmt.Fprintln(stdout, "verified")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&metadataPath, "metadata", "", "path to .beads/metadata.json")
+	cmd.Flags().StringVar(&scopeRoot, "scope", "", "resolved store scope root")
+	cmd.Flags().StringVar(&database, "database", "", "resolved Dolt database")
+	cmd.Flags().StringVar(&expectedID, "expected-project-id", "", "controller-resolved project identity")
+	cmd.Flags().StringVar(&host, "host", "", "resolved Dolt host")
+	cmd.Flags().StringVar(&port, "port", "", "resolved Dolt port")
+	cmd.Flags().StringVar(&user, "user", "", "resolved Dolt user")
+	cmd.Flags().StringVar(&transport, "transport", "tcp", "resolved transport")
+	cmd.Flags().BoolVar(&tlsEnabled, "tls", false, "use verified TLS for the resolved endpoint")
+	cmd.Flags().StringVar(&tlsCA, "tls-ca", "", "optional CA certificate file for the resolved TLS endpoint")
+	for _, flag := range []string{"metadata", "scope", "database", "expected-project-id", "host", "port", "user"} {
+		_ = cmd.MarkFlagRequired(flag)
+	}
+	return cmd
+}
+
+func verifiedDoltTLSConfig(serverName, caPath string) (*tls.Config, error) {
+	serverName = strings.TrimSpace(serverName)
+	if serverName == "" {
+		return nil, fmt.Errorf("TLS server name is empty")
+	}
+	config := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
+	if strings.TrimSpace(caPath) == "" {
+		return config, nil
+	}
+	caPEM, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, err
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil || roots == nil {
+		roots = x509.NewCertPool()
+	}
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("CA file contains no certificates")
+	}
+	config.RootCAs = roots
+	return config, nil
+}
+
+func verifyLocalProjectIdentity(metadataPath, scopeRoot, database, expectedID string) error {
+	metadataPath = strings.TrimSpace(metadataPath)
+	scopeRoot = strings.TrimSpace(scopeRoot)
+	database = strings.TrimSpace(database)
+	expectedID = strings.TrimSpace(expectedID)
+	if metadataPath == "" || scopeRoot == "" || database == "" || expectedID == "" {
+		return fmt.Errorf("incomplete local identity expectation")
+	}
+	derivedScope, err := scopeRootFromMetadataPath(metadataPath)
+	if err != nil || !samePath(derivedScope, scopeRoot) {
+		return fmt.Errorf("metadata path does not belong to resolved scope")
+	}
+	identityID, identityOK, err := contract.ReadProjectIdentity(fsys.OSFS{}, scopeRoot)
+	if err != nil || !identityOK || identityID != expectedID {
+		return fmt.Errorf("canonical local project identity is missing or mismatched")
+	}
+	metadataID, err := readManagedMetadataProjectID(metadataPath)
+	if err != nil || metadataID == "" || metadataID != expectedID {
+		return fmt.Errorf("metadata project identity is missing or mismatched")
+	}
+	state, ok, err := contract.LoadMetadataState(fsys.OSFS{}, metadataPath)
+	if err != nil || !ok {
+		return fmt.Errorf("store metadata is unavailable or invalid")
+	}
+	resolvedDatabase := strings.TrimSpace(state.DoltDatabase)
+	if resolvedDatabase == "" || resolvedDatabase != database {
+		return fmt.Errorf("store database does not match resolved database")
+	}
+	return nil
 }
 
 func openProjectIdentityEventRecorder(cityPath string, stderr io.Writer) (events.Recorder, func()) {
@@ -139,6 +295,10 @@ func ensureManagedDoltProjectIDWithRecorder(metadataPath, host, port, user, data
 }
 
 func ensureManagedDoltProjectIDAtTarget(metadataPath string, target contract.DoltConnectionTarget, cityPath string, rec events.Recorder) (managedDoltProjectIDReport, error) {
+	return ensureManagedDoltProjectIDAtTargetTLS(metadataPath, target, cityPath, rec, false, "")
+}
+
+func ensureManagedDoltProjectIDAtTargetTLS(metadataPath string, target contract.DoltConnectionTarget, cityPath string, rec events.Recorder, tlsEnabled bool, tlsCA string) (managedDoltProjectIDReport, error) {
 	metadataPath = strings.TrimSpace(metadataPath)
 	if metadataPath == "" {
 		return managedDoltProjectIDReport{}, fmt.Errorf("missing metadata path")
@@ -169,15 +329,47 @@ func ensureManagedDoltProjectIDAtTarget(metadataPath string, target contract.Dol
 	}
 	metadataOK := metadataProjectID != ""
 
-	// Pooled handle owned by internal/doltpool; do not Close.
+	// Non-TLS managed endpoints use the shared Dolt pool. An external TLS
+	// migration uses a scoped connector so its verified server name and custom
+	// roots cannot be lost in or leak through the process-wide pool.
 	var db *sql.DB
+	ownedDB := false
 	if target.Socket != "" {
+		if tlsEnabled || strings.TrimSpace(tlsCA) != "" {
+			return managedDoltProjectIDReport{}, fmt.Errorf("TLS is not supported for a Unix socket identity target")
+		}
 		db, err = managedDoltOpenDatabaseSocket(target.Socket, target.User, database)
+	} else if tlsEnabled {
+		config, configErr := verifiedDoltTLSConfig(target.Host, tlsCA)
+		if configErr != nil {
+			return managedDoltProjectIDReport{}, fmt.Errorf("resolved TLS trust configuration is invalid")
+		}
+		mysqlConfig := mysql.NewConfig()
+		mysqlConfig.User = target.User
+		mysqlConfig.Passwd = os.Getenv("GC_DOLT_PASSWORD")
+		mysqlConfig.Net = "tcp"
+		mysqlConfig.Addr = net.JoinHostPort(target.Host, target.Port)
+		mysqlConfig.DBName = database
+		mysqlConfig.ParseTime = true
+		mysqlConfig.TLS = config
+		connector, connectorErr := mysql.NewConnector(mysqlConfig)
+		if connectorErr != nil {
+			return managedDoltProjectIDReport{}, fmt.Errorf("could not create verified TLS identity connector")
+		}
+		db = sql.OpenDB(connector)
+		db.SetMaxOpenConns(1)
+		ownedDB = true
 	} else {
+		if strings.TrimSpace(tlsCA) != "" {
+			return managedDoltProjectIDReport{}, fmt.Errorf("TLS CA was supplied while TLS is disabled")
+		}
 		db, err = managedDoltOpenDatabase(target.Host, target.Port, target.User, database)
 	}
 	if err != nil {
 		return managedDoltProjectIDReport{}, err
+	}
+	if ownedDB {
+		defer db.Close() //nolint:errcheck // scoped TLS migration connection
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

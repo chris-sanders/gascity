@@ -148,6 +148,133 @@ func TestTarFileStripsOwnership(t *testing.T) {
 	}
 }
 
+func TestStageCanonicalStoreFilesProjectsIdentityWithoutCredentials(t *testing.T) {
+	root := t.TempDir()
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"config.yaml":   "issue_prefix: gc\n",
+		"metadata.json": `{"project_id":"city-id"}`,
+		"identity.toml": "[project]\nid = \"city-id\"\n",
+		"credentials":   "must-not-be-copied",
+	} {
+		if err := os.WriteFile(filepath.Join(beadsDir, name), []byte(content), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := newFakeK8sOps()
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) > 0 && cmd[0] == "tar" {
+			return archiveExtractAck, nil
+		}
+		return "", nil
+	}
+	if err := stageCanonicalStoreFilesInPod(context.Background(), fake, "worker", root, "/workspace"); err != nil {
+		t.Fatalf("stageCanonicalStoreFilesInPod: %v", err)
+	}
+	var archive []byte
+	for _, call := range fake.calls {
+		if call.method == "execInPod" && len(call.cmd) > 0 && call.cmd[0] == "tar" {
+			archive = call.stdin
+		}
+	}
+	if len(archive) == 0 {
+		t.Fatal("canonical attachment archive was not streamed")
+	}
+	reader := tar.NewReader(bytes.NewReader(archive))
+	got := map[string]string{}
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read canonical attachment archive: %v", err)
+		}
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatalf("read %s: %v", header.Name, err)
+		}
+		got[header.Name] = string(data)
+	}
+	if len(got) != 3 || got["config.yaml"] != "issue_prefix: gc\n" || got["metadata.json"] != `{"project_id":"city-id"}` || !strings.Contains(got["identity.toml"], "city-id") {
+		t.Fatalf("projected canonical store files = %#v", got)
+	}
+	for _, name := range []string{"credentials", "password", "dolt"} {
+		if _, ok := got[name]; ok {
+			t.Fatalf("mutable or secret store file %q was projected", name)
+		}
+	}
+}
+
+func TestStageCanonicalStoreFilesAllowsMissingIdentityForOwningStoreMigration(t *testing.T) {
+	root := t.TempDir()
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"config.yaml":   "issue_prefix: gc\n",
+		"metadata.json": `{"dolt_database":"hq"}`,
+	} {
+		if err := os.WriteFile(filepath.Join(beadsDir, name), []byte(content), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := newFakeK8sOps()
+	fake.execFunc = func(_ string, cmd []string) (string, error) {
+		if len(cmd) > 0 && cmd[0] == "tar" {
+			return archiveExtractAck, nil
+		}
+		return "", nil
+	}
+	if err := stageCanonicalStoreFilesInPod(context.Background(), fake, "worker", root, "/workspace"); err != nil {
+		t.Fatalf("stageCanonicalStoreFilesInPod before identity migration: %v", err)
+	}
+	for _, call := range fake.calls {
+		if call.method != "execInPod" || len(call.cmd) == 0 || call.cmd[0] != "tar" {
+			continue
+		}
+		reader := tar.NewReader(bytes.NewReader(call.stdin))
+		var names []string
+		for {
+			header, err := reader.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("read canonical attachment archive: %v", err)
+			}
+			names = append(names, header.Name)
+		}
+		if len(names) != 2 || names[0] != "config.yaml" || names[1] != "metadata.json" {
+			t.Fatalf("pre-migration files = %v, want config.yaml and metadata.json", names)
+		}
+		return
+	}
+	t.Fatal("canonical attachment archive was not streamed")
+}
+
+func TestStageCanonicalStoreFilesRejectsSymlinks(t *testing.T) {
+	root := t.TempDir()
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc/passwd", filepath.Join(beadsDir, "config.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeK8sOps()
+	if err := stageCanonicalStoreFilesInPod(context.Background(), fake, "worker", root, "/workspace"); err == nil {
+		t.Fatal("canonical attachment staging followed a symlink")
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("symlinked canonical input reached the pod: %#v", fake.calls)
+	}
+}
+
 func TestStageFilesStagesKiroPackOverlayAtWorkspaceRoot(t *testing.T) {
 	workDir := t.TempDir()
 	projectInstructions := filepath.Join(workDir, "AGENTS.md")
@@ -485,6 +612,9 @@ func TestStageFilesReportsWorkDirStagedOnlyAfterSuccessfulCopy(t *testing.T) {
 
 func TestInitCityInPodSkipsSuccessfullyStagedNestedWorkDir(t *testing.T) {
 	city := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(city, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	workDir := filepath.Join(city, "rigs", "team")
 	for name, content := range map[string]string{
 		"active.txt":      "active workdir",
@@ -548,6 +678,9 @@ func TestInitCityInPodSkipsSuccessfullyStagedNestedWorkDir(t *testing.T) {
 
 func TestInitCityInPodKeepsUnstagedWorkDirInTemplate(t *testing.T) {
 	city := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(city, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	workDir := filepath.Join(city, "rigs", "team")
 	if err := os.MkdirAll(filepath.Dir(workDir), 0o755); err != nil {
 		t.Fatal(err)

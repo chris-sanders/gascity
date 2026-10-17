@@ -151,6 +151,14 @@ type BackendListingProvider interface {
 	ListRunningByBackend(prefix string) []BackendListing
 }
 
+// K8sStoreAttachmentProvider marks a runtime leaf that must verify the
+// controller-resolved city and active Dolt scopes before opening its agent
+// pane. Callers should inspect the resolved leaf after routing, rather than
+// infer this property from an outer composite provider's configured name.
+type K8sStoreAttachmentProvider interface {
+	RequiresK8sStoreAttachment() bool
+}
+
 // BackendListing is one backend's ListRunning result inside a composite
 // provider. Provider is the backend itself, so callers can recurse into a
 // nested composite or ask the backend for its own optional capabilities.

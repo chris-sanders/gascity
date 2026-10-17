@@ -2,7 +2,6 @@ package k8s
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,8 +24,9 @@ import (
 
 // Compile-time interface checks.
 var (
-	_ runtime.Provider     = (*Provider)(nil)
-	_ runtime.ExecProvider = (*Provider)(nil)
+	_ runtime.Provider                   = (*Provider)(nil)
+	_ runtime.ExecProvider               = (*Provider)(nil)
+	_ runtime.K8sStoreAttachmentProvider = (*Provider)(nil)
 )
 
 // Provider is a native Kubernetes session provider using client-go.
@@ -53,9 +53,14 @@ type Provider struct {
 	priorityClassName  string              // GC_K8S_PRIORITY_CLASS_NAME
 	secretEnv          []runtime.K8sSecretEnv
 	secretMounts       []runtime.K8sSecretMount
+	reconcileProjectID projectIDReconciler
 	postStartSettle    time.Duration // settle time before post-start liveness check
 	stderr             io.Writer     // warning output (default os.Stderr)
 }
+
+// RequiresK8sStoreAttachment is consumed only after route resolution. Native
+// K8s sessions must stage and verify each Dolt-backed scope before tmux starts.
+func (*Provider) RequiresK8sStoreAttachment() bool { return true }
 
 // PodSecurityConfig supplies optional numeric identities for generated agent
 // pods. Unset fields are left to the image or Kubernetes admission policy.
@@ -111,6 +116,12 @@ func NewProviderWithSecurityConfig(config PodSecurityConfig) (*Provider, error) 
 // NewProviderWithConfig creates a K8s provider with the city's Secret
 // projections and optional pod-level identity configuration.
 func NewProviderWithConfig(secretEnv []runtime.K8sSecretEnv, secretMounts []runtime.K8sSecretMount, config PodSecurityConfig) (*Provider, error) {
+	return NewProviderWithConfigAndCityPath(secretEnv, secretMounts, config, processCityPath())
+}
+
+// NewProviderWithConfigAndCityPath creates a provider with its owning city
+// path explicitly bound for durable controller metadata and generation locks.
+func NewProviderWithConfigAndCityPath(secretEnv []runtime.K8sSecretEnv, secretMounts []runtime.K8sSecretMount, config PodSecurityConfig, cityPath string) (*Provider, error) {
 	podSecurity, err := resolvePodSecurityConfig(config)
 	if err != nil {
 		return nil, err
@@ -145,6 +156,7 @@ func NewProviderWithConfig(secretEnv []runtime.K8sSecretEnv, secretMounts []runt
 			restConfig: restConfig,
 			namespace:  namespace,
 		},
+		cityPath:           strings.TrimSpace(cityPath),
 		namespace:          namespace,
 		image:              image,
 		k8sContext:         k8sContext,
@@ -165,6 +177,7 @@ func NewProviderWithConfig(secretEnv []runtime.K8sSecretEnv, secretMounts []runt
 		priorityClassName:  scheduling.priorityClassName,
 		secretEnv:          append([]runtime.K8sSecretEnv(nil), secretEnv...),
 		secretMounts:       append([]runtime.K8sSecretMount(nil), secretMounts...),
+		reconcileProjectID: reconcileControllerDoltProjectID,
 	}, nil
 }
 
@@ -242,6 +255,7 @@ func parseSchedulingEnv() (schedulingFields, error) {
 func newProviderWithOps(ops k8sOps) *Provider {
 	return &Provider{
 		ops:                ops,
+		cityPath:           processCityPath(),
 		namespace:          "test-ns",
 		image:              "test-image:latest",
 		managedServiceHost: podManagedDoltHost,
@@ -344,25 +358,33 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 				fmt.Fprintf(p.stderr, "gc: warning: initCityInPod for %s: %v\n", podName, err) //nolint:errcheck
 			}
 		}
-
-		// Signal entrypoint to proceed.
-		if _, err := p.ops.execInPod(ctx, podName, "agent",
-			[]string{"touch", "/workspace/.gc-workspace-ready"}, nil); err != nil {
-			fmt.Fprintf(p.stderr, "gc: warning: touch .gc-workspace-ready in %s: %v\n", podName, err) //nolint:errcheck
-		}
 	}
 
-	// Ensure .beads/ inside the pod. This remains warning-only so older staged
-	// or prebaked workspaces can self-heal instead of failing session startup.
 	podWorkDir := projectedPodWorkDir(cfg)
-	if err := initBeadsInPod(ctx, p.ops, podName, cfg, podWorkDir, p.managedServiceHost, p.managedServicePort); err != nil {
-		fmt.Fprintf(p.stderr, "gc: warning: initBeadsInPod for %s: %v\n", podName, err) //nolint:errcheck
+	if err := stageRequiredStoreFilesInPod(ctx, p.ops, podName, cfg, podWorkDir); err != nil {
+		cleanup("canonical store projection failed")
+		return fmt.Errorf("projecting canonical store files for session %q: %w", name, err)
+	}
+	if err := initBeadsInPod(ctx, p.ops, podName, cfg, podWorkDir, p.managedServiceHost, p.managedServicePort, p.reconcileProjectID); err != nil {
+		cleanup("beads attachment failed")
+		return fmt.Errorf("attaching beads stores for session %q: %w", name, err)
+	}
+	// The entrypoint must not launch the agent until canonical files have
+	// been staged and every resolver-required Dolt attachment has passed.
+	if _, err := p.ops.execInPod(ctx, podName, "agent",
+		[]string{"touch", "/workspace/.gc-workspace-ready"}, nil); err != nil {
+		cleanup("workspace readiness gate failed")
+		return fmt.Errorf("opening workspace readiness gate for session %q", name)
 	}
 
 	// Wait for tmux session.
-	if err := waitForTmux(ctx, p.ops, podName, 60*time.Second); err != nil {
+	if err := p.waitForTmux(ctx, podName, 60*time.Second); err != nil {
 		cleanup("tmux not ready")
 		return fmt.Errorf("waiting for tmux in pod %q: %w", podName, err)
+	}
+	if err := p.seedStartMetadata(ctx, podName, name, sessionMetadataEnvForConfig(cfg)); err != nil {
+		cleanup("metadata projection failed")
+		return err
 	}
 
 	// Enable pane logging + run session setup (shared with the relaunch tail).
@@ -391,7 +413,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		}
 	}
 	if requiresPostStartLiveness {
-		_, tmuxErr := p.ops.execInPod(ctx, podName, "agent",
+		_, tmuxErr := p.execTmuxOwner(ctx, podName, "agent",
 			[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
 		if tmuxErr != nil {
 			cleanup("session died immediately after startup")
@@ -414,7 +436,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 // run SessionLive (RunLive is a no-op), matching the pre-un-weld behavior.
 func (p *Provider) runPodPostLaunchSetup(ctx context.Context, podName string, cfg runtime.Config) {
 	// Enable pane logging for diagnostics.
-	_, _ = p.ops.execInPod(ctx, podName, "agent",
+	_, _ = p.execTmuxOwner(ctx, podName, "agent",
 		[]string{"tmux", "pipe-pane", "-t", tmuxSession, "-o", "cat >> /tmp/agent-output.log"}, nil)
 
 	// Run session_setup commands inside the pod.
@@ -558,7 +580,7 @@ func (p *Provider) IsRunning(name string) bool {
 		return false
 	}
 	// Pod Running + tmux session alive.
-	_, err = p.ops.execInPod(ctx, podName, "agent",
+	_, err = p.execTmuxOwner(ctx, podName, "agent",
 		[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
 	return err == nil
 }
@@ -571,7 +593,7 @@ func (p *Provider) IsAttached(name string) bool {
 	if err != nil {
 		return false
 	}
-	output, err := p.ops.execInPod(ctx, podName, "agent",
+	output, err := p.execTmuxOwner(ctx, podName, "agent",
 		[]string{"tmux", "display-message", "-t", tmuxSession, "-p", "#{session_attached}"}, nil)
 	if err != nil {
 		return false
@@ -587,12 +609,16 @@ func (p *Provider) Attach(name string) error {
 		return fmt.Errorf("attach: no running pod for session %q", name)
 	}
 
+	tmuxCommand, err := p.tmuxOwnerCommand(ctx, podName, "agent", []string{"tmux", "attach", "-t", tmuxSession})
+	if err != nil {
+		return fmt.Errorf("attach: resolving tmux owner for session %q: %w", name, err)
+	}
 	args := []string{}
 	if p.k8sContext != "" {
 		args = append(args, "--context", p.k8sContext)
 	}
-	args = append(args, "-n", p.namespace, "exec", "-it", podName, "--",
-		"tmux", "attach", "-t", tmuxSession)
+	args = append(args, "-n", p.namespace, "exec", "-it", podName, "--")
+	args = append(args, tmuxCommand...)
 
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	cmd.Stdin = os.Stdin
@@ -637,7 +663,14 @@ func (p *Provider) ProcessAlive(name string, processNames []string) bool {
 // Uses -l (literal mode) so tmux key names in the message text are not
 // interpreted as keystrokes. Content blocks are flattened to text.
 func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
-	return p.carrier().Nudge(context.Background(), name, content)
+	ctx, cancel := context.WithTimeout(context.Background(), k8sMetaOpTimeout)
+	defer cancel()
+	releaseGeneration, err := p.acquireControllerGenerationLock(ctx, name)
+	if err != nil {
+		return fmt.Errorf("k8s nudge %q: generation fence unavailable", name)
+	}
+	defer releaseGeneration()
+	return p.carrier().Nudge(ctx, name, content)
 }
 
 // SendKeys sends bare keystrokes to the tmux session. Best-effort on a
@@ -979,7 +1012,7 @@ func (p *Provider) Exec(ctx context.Context, name string, argv []string) ([]byte
 	if err != nil {
 		return nil, -1, fmt.Errorf("k8s exec %q: %w", name, err)
 	}
-	out, err := p.ops.execInPod(ctx, podName, "agent", argv, nil)
+	out, err := p.execTmuxOwner(ctx, podName, "agent", argv, nil)
 	if err != nil {
 		var exitErr execerr.ExitError
 		if errors.As(err, &exitErr) && exitErr.Exited() {
@@ -1068,6 +1101,9 @@ func waitForPodRunning(ctx context.Context, ops k8sOps, name string, timeout tim
 		case corev1.PodFailed:
 			return fmt.Errorf("pod %s failed", name)
 		}
+		if podHasRequiredCredentialProjectionFailure(pod) {
+			return fmt.Errorf("pod %s cannot start because a required Kubernetes Secret projection is unavailable", name)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1077,8 +1113,26 @@ func waitForPodRunning(ctx context.Context, ops k8sOps, name string, timeout tim
 	return fmt.Errorf("pod %s not running after %s", name, timeout)
 }
 
-// waitForTmux waits for the tmux session to be available inside the pod.
-func waitForTmux(ctx context.Context, ops k8sOps, name string, timeout time.Duration) error {
+func podHasRequiredCredentialProjectionFailure(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		waiting := status.State.Waiting
+		if waiting == nil {
+			continue
+		}
+		message := strings.ToLower(waiting.Reason + " " + waiting.Message)
+		if strings.Contains(message, "secret") || strings.Contains(message, "configmap") {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForTmux waits for the tmux session to be available inside the pod as its
+// owner, including the legacy LINUX_USERNAME login user.
+func (p *Provider) waitForTmux(ctx context.Context, name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -1086,7 +1140,7 @@ func waitForTmux(ctx context.Context, ops k8sOps, name string, timeout time.Dura
 			return ctx.Err()
 		default:
 		}
-		_, err := ops.execInPod(ctx, name, "agent",
+		_, err := p.execTmuxOwner(ctx, name, "agent",
 			[]string{"tmux", "has-session", "-t", tmuxSession}, nil)
 		if err == nil {
 			return nil
@@ -1123,63 +1177,6 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity, skipRel s
 		return err
 	}
 	return nil
-}
-
-// initBeadsInPod ensures the pod workspace has usable .beads state. It keeps
-// the older warning-only self-heal behavior for prebaked or older staged
-// workspaces by patching existing metadata and bootstrapping missing state.
-func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime.Config, workDir, managedServiceHost, managedServicePort string) error {
-	projected, err := projectedPodDoltEnv(cfg.Env, managedServiceHost, managedServicePort)
-	if err != nil {
-		return err
-	}
-	if len(projected) == 0 {
-		return nil
-	}
-	doltHost := projected["GC_DOLT_HOST"]
-	doltPort := projected["GC_DOLT_PORT"]
-	storeRoot := projectedPodStoreRoot(cfg, workDir)
-	prefix := strings.TrimSpace(cfg.Env["GC_BEADS_PREFIX"])
-	if prefix == "" {
-		return fmt.Errorf("missing projected GC_BEADS_PREFIX")
-	}
-
-	portNum, err := strconv.Atoi(doltPort)
-	if err != nil {
-		return fmt.Errorf("invalid projected GC_DOLT_PORT %q: %w", doltPort, err)
-	}
-	patchJSON, err := json.Marshal(map[string]any{
-		"dolt_server_host": doltHost,
-		"dolt_server_port": portNum,
-	})
-	if err != nil {
-		return fmt.Errorf("marshaling beads patch: %w", err)
-	}
-	patchB64 := base64.StdEncoding.EncodeToString(patchJSON)
-	prefixB64 := base64.StdEncoding.EncodeToString([]byte(prefix))
-	storeRootB64 := base64.StdEncoding.EncodeToString([]byte(storeRoot))
-
-	patchCmd := fmt.Sprintf(
-		`WD=$(echo '%s' | base64 -d) && cd "$WD" && PATCH=$(echo '%s' | base64 -d) && `+
-			`if [ -f .beads/metadata.json ]; then `+
-			`python3 -c "import json,sys; `+
-			`m=json.load(open('.beads/metadata.json')); `+
-			`p=json.loads(sys.argv[1]); m.update(p); m.pop('project_id', None); `+
-			`json.dump(m,open('.beads/metadata.json','w'),indent=2)" "$PATCH" 2>/dev/null || `+
-			`printf '%%s' "$PATCH" | python3 -c "import json,sys; `+
-			`m=json.load(open('.beads/metadata.json')); `+
-			`p=json.loads(sys.stdin.read()); m.update(p); m.pop('project_id', None); `+
-			`json.dump(m,open('.beads/metadata.json','w'),indent=2)"; `+
-			`else PREFIX=$(echo '%s' | base64 -d) && `+
-			`DOLT_HOST=$(echo '%s' | base64 -d) && `+
-			`DOLT_PORT=$(echo '%s' | base64 -d) && `+
-			`yes | BEADS_DIR="$WD/.beads" bd init --server --server-host "$DOLT_HOST" --server-port "$DOLT_PORT" -p "$PREFIX" --skip-hooks --skip-agents; fi`,
-		storeRootB64, patchB64, prefixB64,
-		base64.StdEncoding.EncodeToString([]byte(doltHost)),
-		base64.StdEncoding.EncodeToString([]byte(doltPort)),
-	)
-	_, err = ops.execInPod(ctx, podName, "agent", []string{"sh", "-c", patchCmd}, nil)
-	return err
 }
 
 // verifyBeadsInPod confirms that canonical tracked .beads files are already

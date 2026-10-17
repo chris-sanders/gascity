@@ -27,6 +27,13 @@ const (
 	identityUnboundKey = "__gc_identity_unbound"
 )
 
+func processCityPath() string {
+	if city := strings.TrimSpace(os.Getenv("GC_CITY_PATH")); city != "" {
+		return city
+	}
+	return strings.TrimSpace(os.Getenv("GC_CITY_ROOT"))
+}
+
 var metadataKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // K8s metadata has separate identity, shared protocol, runtime-owner, and

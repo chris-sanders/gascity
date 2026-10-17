@@ -27,10 +27,12 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/execenv"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -358,6 +360,15 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		agentEnv["GC_RIG_ROOT"] = rigRoot
 		agentEnv["BEADS_DIR"] = filepath.Join(rigRoot, ".beads")
 		agentEnv["GC_BEADS_SCOPE_ROOT"] = rigRoot
+	}
+	if runtimeLeafRequiresK8sStoreAttachment(p.sp, sessName) {
+		activeStoreRoot := rigRoot
+		if activeStoreRoot == "" {
+			activeStoreRoot = p.cityPath
+		}
+		if err := projectK8sStoreAttachmentEnv(agentEnv, sessionBackendEnv, p.cityPath, activeStoreRoot, p.rigs); err != nil {
+			return TemplateParams{}, fmt.Errorf("agent %q: resolving Kubernetes store attachment: %w", qualifiedName, err)
+		}
 	}
 
 	// configDir is the directory agent config-relative paths (pre-start
@@ -772,6 +783,108 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		params.CityRuntimes = p.city.Runtimes
 	}
 	return params, nil
+}
+
+func runtimeLeafRequiresK8sStoreAttachment(sp runtime.Provider, name string) bool {
+	if sp == nil {
+		return false
+	}
+	leaf, _, _ := runtime.ResolveBackend(sp, name)
+	capability, ok := leaf.(runtime.K8sStoreAttachmentProvider)
+	return ok && capability.RequiresK8sStoreAttachment()
+}
+
+// projectK8sStoreAttachmentEnv carries independently resolved city and active
+// Dolt bindings to the selected K8s leaf. Only contract-proven managed-local
+// targets receive the managed endpoint remap marker; external endpoints retain
+// their resolved address and are verified from inside the pod.
+func projectK8sStoreAttachmentEnv(agentEnv, activeEnv map[string]string, cityRoot, activeRoot string, rigs []config.Rig) error {
+	// These are controller-only adapter assertions. Re-pin empty/default values
+	// after config layers so an agent env cannot claim managed provenance or
+	// silently disable a required attachment.
+	agentEnv["GC_K8S_ATTACH_REQUIRED"] = "0"
+	agentEnv["GC_K8S_CITY_ATTACH_REQUIRED"] = "0"
+	agentEnv["GC_K8S_DOLT_MANAGED_LOCAL"] = "0"
+	agentEnv["GC_K8S_CITY_DOLT_MANAGED_LOCAL"] = "0"
+	for _, key := range []string{"GC_K8S_CITY_DOLT_HOST", "GC_K8S_CITY_DOLT_PORT", "GC_K8S_CITY_DOLT_USER", "GC_K8S_CITY_DOLT_PASSWORD", "GC_K8S_CITY_DOLT_TLS", "GC_K8S_CITY_DOLT_CREDENTIAL_COMMAND"} {
+		agentEnv[key] = ""
+	}
+	agentEnv["GC_K8S_CITY_DOLT_CA"] = ""
+	cityEnv := activeEnv
+	if !samePath(cityRoot, activeRoot) {
+		var err error
+		cityEnv, err = sessionBackendEnvWithError(cityRoot, "", rigs)
+		if err != nil {
+			return fmt.Errorf("city SQL binding is unavailable: %w", err)
+		}
+	}
+	cityDolt, err := k8sDoltScopeRequiresAttachment(cityRoot)
+	if err != nil {
+		return fmt.Errorf("city Dolt binding: %w", err)
+	}
+	activeDolt := false
+	if !samePath(cityRoot, activeRoot) {
+		activeDolt, err = k8sDoltScopeRequiresAttachment(activeRoot)
+		if err != nil {
+			return fmt.Errorf("active Dolt binding: %w", err)
+		}
+	}
+	if cityDolt {
+		target, resolveErr := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityRoot, cityRoot)
+		if resolveErr != nil {
+			return fmt.Errorf("city Dolt endpoint cannot be resolved: %w", resolveErr)
+		}
+		agentEnv["GC_K8S_CITY_ATTACH_REQUIRED"] = "1"
+		projectK8sCityDoltEnv(agentEnv, cityEnv)
+		if isK8sManagedLocalDoltTarget(target) {
+			agentEnv["GC_K8S_CITY_DOLT_MANAGED_LOCAL"] = "1"
+			if samePath(cityRoot, activeRoot) {
+				agentEnv["GC_K8S_DOLT_MANAGED_LOCAL"] = "1"
+			}
+		}
+	}
+	if activeDolt {
+		target, resolveErr := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityRoot, activeRoot)
+		if resolveErr != nil {
+			return fmt.Errorf("active Dolt endpoint cannot be resolved: %w", resolveErr)
+		}
+		agentEnv["GC_K8S_ATTACH_REQUIRED"] = "1"
+		if isK8sManagedLocalDoltTarget(target) {
+			agentEnv["GC_K8S_DOLT_MANAGED_LOCAL"] = "1"
+		}
+	}
+	return nil
+}
+
+func projectK8sCityDoltEnv(dst, source map[string]string) {
+	projection := [][2]string{
+		{"GC_DOLT_HOST", "GC_K8S_CITY_DOLT_HOST"},
+		{"GC_DOLT_PORT", "GC_K8S_CITY_DOLT_PORT"},
+		{"GC_DOLT_USER", "GC_K8S_CITY_DOLT_USER"},
+		{"GC_DOLT_PASSWORD", "GC_K8S_CITY_DOLT_PASSWORD"},
+		{"BEADS_DOLT_SERVER_TLS", "GC_K8S_CITY_DOLT_TLS"},
+		{"BEADS_DOLT_SERVER_CA", "GC_K8S_CITY_DOLT_CA"},
+		{"BEADS_DOLT_CREDENTIAL_COMMAND", "GC_K8S_CITY_DOLT_CREDENTIAL_COMMAND"},
+	}
+	for _, pair := range projection {
+		dst[pair[1]] = source[pair[0]]
+	}
+}
+
+func k8sDoltScopeRequiresAttachment(scopeRoot string) (bool, error) {
+	metadata := filepath.Join(scopeRoot, ".beads", "metadata.json")
+	state, ok, err := contract.LoadMetadataState(fsys.OSFS{}, metadata)
+	if err != nil {
+		return false, fmt.Errorf("metadata is unreadable: %w", err)
+	}
+	if !ok || strings.TrimSpace(state.Backend) != "dolt" {
+		return false, nil
+	}
+	return true, nil
+}
+
+func isK8sManagedLocalDoltTarget(target contract.DoltConnectionTarget) bool {
+	return !target.External && (target.EndpointOrigin == contract.EndpointOriginManagedCity || target.EndpointOrigin == contract.EndpointOriginInheritedCity)
 }
 
 // isOperationalScript reports whether rel (a slash-separated path relative to
