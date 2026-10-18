@@ -1066,7 +1066,15 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity, skipRel s
 	// Run gc init --from with GC_DOLT=skip so it does not start a local Dolt
 	// server. Hosted City identity is passed explicitly because init's scope
 	// validation requires the controller-owned project identity.
-	args := []string{"env", "GC_DOLT=skip", "gc", "init", "--from", "/tmp/city-src", "/workspace"}
+	// exec inherits the agent container's selected-scope environment, which may
+	// describe a hosted rig store rather than the HQ City being initialized.
+	// Keep only the runtime environment needed to find gc and its home config;
+	// HQ hosted identity is supplied below through explicit init flags.
+	args := []string{
+		"sh", "-c",
+		`exec env -i PATH="$PATH" HOME="$HOME" GC_DOLT=skip "$0" "$@"`,
+		"gc", "init", "--from", "/tmp/city-src", "/workspace",
+	}
 	if identity != nil {
 		args = append(args,
 			"--dolt-host", identity.Host,
@@ -1083,9 +1091,9 @@ func initCityInPod(ctx context.Context, ops k8sOps, podName, ctrlCity, skipRel s
 	return nil
 }
 
-// initBeadsInPod initializes an empty hosted-Dolt scope with its canonical
-// identity, then verifies existing state before updating only the pod-local
-// server endpoint mirror. Conflicting or incomplete state fails closed.
+// initBeadsInPod verifies the existing canonical hosted-Dolt scope before
+// updating only the pod-local server endpoint mirror. Missing or conflicting
+// state fails closed without initializing or mutating the hosted store.
 func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime.Config, workDir, managedServiceHost, managedServicePort string) error {
 	identity, err := resolvePodHostedDoltIdentity(cfg.Env, "", managedServiceHost, managedServicePort)
 	if err != nil {
@@ -1118,11 +1126,6 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 		`WD=$(echo '%s' | base64 -d) && PROJECT_ID=$(echo '%s' | base64 -d) && PREFIX=$(echo '%s' | base64 -d) && `+
 			`DATABASE=$(echo '%s' | base64 -d) && DOLT_HOST=$(echo '%s' | base64 -d) && DOLT_PORT=$(echo '%s' | base64 -d) && `+
 			`PATCH=$(echo '%s' | base64 -d) && cd "$WD" || exit 1; `+
-			`if [ ! -e .beads/metadata.json ] && [ ! -e .beads/identity.toml ] && [ ! -e .beads/config.yaml ]; then `+
-			`mkdir -p .beads && yes | BEADS_DIR="$WD/.beads" GC_DOLT_HOST="$DOLT_HOST" GC_DOLT_PORT="$DOLT_PORT" `+
-			`GC_DOLT_DATABASE="$DATABASE" GC_BEADS_PROJECT_ID="$PROJECT_ID" `+
-			`bd init --server --server-host "$DOLT_HOST" --server-port "$DOLT_PORT" --database "$DATABASE" `+
-			`-p "$PREFIX" --non-interactive --skip-hooks --skip-agents || exit 1; fi; `+
 			`test -f .beads/metadata.json && test -f .beads/identity.toml && test -f .beads/config.yaml || `+
 			`{ echo 'hosted Dolt scoped beads files are incomplete' >&2; exit 1; }; `+
 			`grep -Fqx "id = \"$PROJECT_ID\"" .beads/identity.toml || `+
