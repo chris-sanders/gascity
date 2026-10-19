@@ -182,8 +182,27 @@ func (f *fakeK8sOps) listPods(_ context.Context, selector string, fieldSelector 
 	return result, nil
 }
 
-func (f *fakeK8sOps) execInPod(_ context.Context, pod, container string, cmd []string, _ io.Reader) (string, error) {
+func (f *fakeK8sOps) execInPod(_ context.Context, pod, container string, cmd []string, stdin io.Reader) (string, error) {
 	f.calls = append(f.calls, fakeCall{method: "execInPod", pod: pod, container: container, cmd: cmd})
+	if isStageArchiveExec(cmd, stdin) {
+		if _, err := io.Copy(io.Discard, stdin); err != nil {
+			return "", err
+		}
+		if f.execFunc != nil {
+			out, err := f.execFunc(pod, cmd)
+			if err != nil || out != "" {
+				return out, err
+			}
+		}
+		key := execKey(pod, cmd)
+		if err, ok := f.execErr[key]; ok {
+			return "", err
+		}
+		if out, ok := f.execOutput[key]; ok {
+			return out, nil
+		}
+		return archiveExtractAck, nil
+	}
 	if f.execFunc != nil {
 		return f.execFunc(pod, cmd)
 	}
@@ -195,6 +214,13 @@ func (f *fakeK8sOps) execInPod(_ context.Context, pod, container string, cmd []s
 		return out, nil
 	}
 	return "", nil
+}
+
+// isStageArchiveExec identifies the streamed tar extraction used by staging.
+// The fake acknowledges these uploads so Start tests can exercise post-staging
+// behavior without weakening production's fail-closed acknowledgment check.
+func isStageArchiveExec(cmd []string, stdin io.Reader) bool {
+	return stdin != nil && len(cmd) == 6 && cmd[0] == "sh" && cmd[1] == "-c" && cmd[5] == archiveExtractAck
 }
 
 // setExecResult configures the fake to return specific output for a pod+cmd combo.
