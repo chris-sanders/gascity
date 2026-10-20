@@ -196,6 +196,9 @@ func storeEngine(store beads.Store) beads.Store {
 type emittingClassStore struct {
 	beads.Store
 	cityPath string
+	// deferredRings, when set, queues the controller doorbells for
+	// journal-row writes for the caller to ring (deferJournalRings).
+	deferredRings *journalRingQueue
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +220,11 @@ type classStoreEmission struct {
 // running it here would race that recorder mid-rotation. It does not make the open free — NewFileRecorder reads
 // the log directory either way, to continue the sequence past the archives —
 // only unraced.
+//
+// An operation-journal row journals nothing: the controller is rung to
+// announce it (ringJournalEmissions).
 func (s *emittingClassStore) emit(emissions ...classStoreEmission) {
+	emissions = s.ringJournalEmissions(emissions)
 	if len(emissions) == 0 {
 		return
 	}
@@ -789,6 +796,14 @@ func (s *emittingClassStore) DepListBatch(ids []string) (map[string][]beads.Dep,
 		return nil, beads.ErrDepListBatchUnsupported
 	}
 	return batch.DepListBatch(ids)
+}
+
+// ReadyOrdered forwards a bounded ordered ready read (beads.OrderedReadyReader).
+// It emits nothing because it writes nothing, and it exists for the reason
+// DepListBatch does: a silent wrapper would send every bounded ready read of a
+// class binding down the whole-set path.
+func (s *emittingClassStore) ReadyOrdered(query beads.ReadyQuery, order beads.ReadyOrder) ([]beads.Bead, bool, error) {
+	return beads.ReadyOrdered(s.Store, query, order)
 }
 
 func (s *emittingClassStore) ApplyGraphPlan(ctx context.Context, plan *beads.GraphApplyPlan) (*beads.GraphApplyResult, error) {
