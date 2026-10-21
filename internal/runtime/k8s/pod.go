@@ -320,7 +320,7 @@ func buildPod(name string, cfg runtime.Config, p *Provider) (*corev1.Pod, error)
 	}
 	if !p.prebaked {
 		if _, err := resolvePodHostedDoltIdentity(cfg.Env, "GC_K8S_CITY_", p.managedServiceHost, p.managedServicePort); err != nil {
-			return nil, fmt.Errorf("City store identity: %w", err)
+			return nil, fmt.Errorf("city store identity: %w", err)
 		}
 	}
 
