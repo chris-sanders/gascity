@@ -163,8 +163,9 @@ func TestK8SSessionStoreIdentityFailsClosedOnMissingOrConflictingIdentity(t *tes
 		identity string
 		metadata string
 		wantErr  string
+		wantPath bool
 	}{
-		{name: "missing canonical identity", metadata: "project", wantErr: "missing .beads/identity.toml"},
+		{name: "missing canonical identity", metadata: "project", wantErr: "missing project identity at", wantPath: true},
 		{name: "identity mismatch", identity: "scope-id", metadata: "other-id", wantErr: "inconsistent project identity"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -190,6 +191,9 @@ func TestK8SSessionStoreIdentityFailsClosedOnMissingOrConflictingIdentity(t *tes
 			})
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("identity error = %v, want containing %q", err, tc.wantErr)
+			}
+			if tc.wantPath && !strings.Contains(err.Error(), contract.ProjectIdentityPath(cityPath)) {
+				t.Fatalf("identity error = %v, want canonical path %q", err, contract.ProjectIdentityPath(cityPath))
 			}
 		})
 	}

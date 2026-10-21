@@ -15,6 +15,7 @@ import (
 
 	execerr "k8s.io/client-go/util/exec"
 
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
@@ -1545,7 +1546,7 @@ func TestInitBeadsInPodUsesProjectedStoreRootAndPrefix(t *testing.T) {
 		if strings.Contains(script, wrongWorkDirB64) {
 			t.Fatalf("scoped Beads check used pod workdir instead of projected store root: %s", script)
 		}
-		if !strings.Contains(script, `grep -Fqx "id = \"$PROJECT_ID\"" .beads/identity.toml`) || !strings.Contains(script, "identity.toml") {
+		if !strings.Contains(script, `grep -Fqx "id = \"$PROJECT_ID\"" `+shellquote.Quote(contract.ProjectIdentityPath(""))) {
 			t.Fatalf("scoped Beads check did not verify project identity: %s", script)
 		}
 		found = true
@@ -1830,7 +1831,7 @@ func TestInitBeadsInPodPreservesAndVerifiesProjectID(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		`grep -Fqx "id = \"$PROJECT_ID\"" .beads/identity.toml`,
+		`grep -Fqx "id = \"$PROJECT_ID\"" ` + shellquote.Quote(contract.ProjectIdentityPath("")),
 		`m.get("dolt_database", "")).strip() == sys.argv[2]`,
 		`m.get("project_id", "")).strip() == sys.argv[3]`,
 		`[ "$GOT_PREFIX" = "$PREFIX" ]`,

@@ -604,12 +604,12 @@ func k8sSessionStoreIdentityEnv(cityPath, scopeRoot string, cfg *config.City, ba
 		return nil, fmt.Errorf("hosted Dolt scope %q project identity: %w", scopeRoot, err)
 	}
 	if !projectOK {
-		return nil, fmt.Errorf("hosted Dolt scope %q is missing .beads/identity.toml project identity", scopeRoot)
+		return nil, fmt.Errorf("hosted Dolt scope %q is missing project identity at %q", scopeRoot, contract.ProjectIdentityPath(scopeRoot))
 	}
 	if metadataID, ok, err := readMetadataProjectID(metadataPath); err != nil {
 		return nil, fmt.Errorf("hosted Dolt scope %q metadata project identity: %w", scopeRoot, err)
 	} else if ok && metadataID != projectID {
-		return nil, fmt.Errorf("hosted Dolt scope %q has inconsistent project identity: identity.toml=%q metadata.json=%q", scopeRoot, projectID, metadataID)
+		return nil, fmt.Errorf("hosted Dolt scope %q has inconsistent project identity at %q: identity=%q metadata.json=%q", scopeRoot, contract.ProjectIdentityPath(scopeRoot), projectID, metadataID)
 	}
 	prefix := strings.TrimSpace(issuePrefixForScope(scopeRoot, cityPath, cfg))
 	if prefix == "" {

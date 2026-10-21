@@ -20,7 +20,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	execerr "k8s.io/client-go/util/exec"
 
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // Compile-time interface checks.
@@ -1014,6 +1016,7 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 		return nil
 	}
 	storeRoot := projectedPodStoreRoot(cfg, workDir)
+	identityPath := shellquote.Quote(contract.ProjectIdentityPath(""))
 	portNum, err := strconv.Atoi(identity.Port)
 	if err != nil {
 		return fmt.Errorf("invalid projected GC_DOLT_PORT %q: %w", identity.Port, err)
@@ -1037,9 +1040,9 @@ func initBeadsInPod(ctx context.Context, ops k8sOps, podName string, cfg runtime
 		`WD=$(echo '%s' | base64 -d) && PROJECT_ID=$(echo '%s' | base64 -d) && PREFIX=$(echo '%s' | base64 -d) && `+
 			`DATABASE=$(echo '%s' | base64 -d) && DOLT_HOST=$(echo '%s' | base64 -d) && DOLT_PORT=$(echo '%s' | base64 -d) && `+
 			`PATCH=$(echo '%s' | base64 -d) && cd "$WD" || exit 1; `+
-			`test -f .beads/metadata.json && test -f .beads/identity.toml && test -f .beads/config.yaml || `+
+			`test -f .beads/metadata.json && test -f `+identityPath+` && test -f .beads/config.yaml || `+
 			`{ echo 'hosted Dolt scoped beads files are incomplete' >&2; exit 1; }; `+
-			`grep -Fqx "id = \"$PROJECT_ID\"" .beads/identity.toml || `+
+			`grep -Fqx "id = \"$PROJECT_ID\"" `+identityPath+` || `+
 			`{ echo 'hosted Dolt project identity does not match session scope' >&2; exit 1; }; `+
 			`python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); `+
 			`assert str(m.get("dolt_database", "")).strip() == sys.argv[2]; `+
