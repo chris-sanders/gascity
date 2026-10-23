@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
@@ -153,6 +155,66 @@ func TestStartPreparedStartCandidateUsesWorkerBoundaryForRuntimeOnlyTarget(t *te
 	}
 	if start.Config.Command != "claude --resume seeded" {
 		t.Fatalf("start command = %q, want claude --resume seeded", start.Config.Command)
+	}
+}
+
+func TestPrepareStartCandidateDoesNotRotateIdentityForLiveRuntime(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	bead := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&bead)
+	info := env.sessionInfo(bead.ID)
+
+	const token = "test-token"
+	if err := env.sp.Start(context.Background(), "worker", runtime.Config{
+		Command:      "codex",
+		ProcessNames: []string{"codex"},
+	}); err != nil {
+		t.Fatalf("starting existing runtime: %v", err)
+	}
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     info.ID,
+		"GC_INSTANCE_TOKEN": token,
+		"GC_RUNTIME_EPOCH":  info.Generation,
+	} {
+		if err := env.sp.SetMeta("worker", key, value); err != nil {
+			t.Fatalf("setting runtime identity %s: %v", key, err)
+		}
+	}
+
+	lease, release, err := tryRuntimeLease(env.store, env.city, "worker", info.ID, time.Minute)
+	if err != nil {
+		t.Fatalf("taking runtime lease: %v", err)
+	}
+	defer release()
+
+	candidate := startCandidate{
+		info:  info,
+		lease: lease,
+		tp: TemplateParams{
+			Command:      "codex",
+			SessionName:  "worker",
+			TemplateName: "worker",
+			Hints:        agent.StartupHints{ProcessNames: []string{"codex"}},
+		},
+	}
+	_, err = prepareStartCandidateForCity(candidate, env.city, "test-city", env.cfg, env.sp, env.store, env.clk, io.Discard, nil, dispatchOptionSources{})
+	if !errors.Is(err, errStartCandidateRuntimeAlreadyAlive) {
+		t.Fatalf("prepareStartCandidateForCity error = %v, want already-alive skip", err)
+	}
+
+	got := env.sessionInfo(info.ID)
+	if got.InstanceToken != token || got.Generation != info.Generation {
+		t.Fatalf("session identity after skipped wake = (%q, %q), want unchanged (%q, %q)", got.InstanceToken, got.Generation, token, info.Generation)
+	}
+	if got.MetadataState != "active" || got.PendingCreateStartedAt != "" {
+		t.Fatalf("session wake metadata after skipped wake = (state %q, pending_create_started_at %q), want active with no pending start", got.MetadataState, got.PendingCreateStartedAt)
+	}
+	runtimeToken, err := env.sp.GetMeta("worker", "GC_INSTANCE_TOKEN")
+	if err != nil {
+		t.Fatalf("reading runtime identity: %v", err)
+	}
+	if runtimeToken != got.InstanceToken {
+		t.Fatalf("runtime token = %q, session token = %q; warm reuse must keep their identities aligned", runtimeToken, got.InstanceToken)
 	}
 }
 

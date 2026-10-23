@@ -1047,6 +1047,12 @@ func prepareStartCandidate(
 // operator's user hold (sleep_intent=user-hold).
 var errStartUserHeld = errors.New("an operator holds the session (user-hold); start skipped")
 
+// errStartCandidateRuntimeAlreadyAlive means the planner selected a wake from
+// a stale liveness snapshot, but the runtime-name lease's fresh observation
+// found the session already healthy. The caller skips this candidate without
+// writing PreWake or counting a restart.
+var errStartCandidateRuntimeAlreadyAlive = errors.New("session runtime is already alive")
+
 func prepareStartCandidateForCity(
 	candidate startCandidate,
 	cityPath string,
@@ -1060,6 +1066,14 @@ func prepareStartCandidateForCity(
 	dispatchSources dispatchOptionSources,
 ) (*preparedStart, error) {
 	var undo preWakeUndo
+	runtimeAlreadyAlive := false
+	if candidate.lease != nil && sp != nil {
+		running, alive, err := observeRuntimeProviderLiveness(sp, candidate.name(), candidate.tp.Hints.ProcessNames)
+		if err != nil {
+			return nil, fmt.Errorf("observing runtime %q before pre-wake: %w", candidate.name(), err)
+		}
+		runtimeAlreadyAlive = running && alive
+	}
 	if id := strings.TrimSpace(candidate.info.ID); id != "" && store != nil {
 		if err := sessionpkg.WithSessionMutationLock(id, func() error {
 			sessFront := sessionFrontDoor(store)
@@ -1075,6 +1089,13 @@ func prepareStartCandidateForCity(
 			current, persisted, err := sessFront.GetPersistedResponse(id)
 			if err != nil {
 				return err
+			}
+			if runtimeAlreadyAlive && !shouldRollbackPendingCreateInfo(current) {
+				// The planner's liveness snapshot can be stale by the time this
+				// leased start reaches preparation. Reuse the existing incarnation
+				// as-is; minting here would make its live worker fail the session
+				// bead's token fence.
+				return errStartCandidateRuntimeAlreadyAlive
 			}
 			// An operator's suspend that landed since the snapshot wins: the
 			// controller never starts a row the operator holds.
@@ -2593,11 +2614,7 @@ func startPreparedStartCandidate(
 				// item.cfg.Nudge: that can carry the startup prompt ahead of it, to
 				// re-prime a resumed or prompt-less launch, which a running slot
 				// already has.
-				if store != nil {
-					if raw, err := store.Get(item.candidate.info.ID); err == nil {
-						deliverWarmBindClaimNudge(ctx, sp, store, &raw, warmBindClaimText(cfg, raw), warmClaim)
-					}
-				}
+				deliverWarmReuseClaimNudge(ctx, store, sp, cfg, item.candidate.info, warmClaim)
 				return false, nil
 			}
 			// Zombie: the runtime container (e.g. tmux pane) is up but the
@@ -2680,6 +2697,24 @@ func startPreparedStartCandidate(
 		return true, err
 	}
 	return true, handle.StartResolved(ctx, by, item.candidate.inc, item.cfg.Command, item.cfg)
+}
+
+// deliverWarmReuseClaimNudge preserves the warm-start behavior when a
+// candidate's initially absent runtime is found healthy under its start lease.
+func deliverWarmReuseClaimNudge(
+	ctx context.Context,
+	store beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	info sessionpkg.Info,
+	warmClaim warmClaimTriggerProbe,
+) {
+	if store == nil || strings.TrimSpace(info.ID) == "" {
+		return
+	}
+	if raw, err := store.Get(info.ID); err == nil {
+		deliverWarmBindClaimNudge(ctx, sp, store, &raw, warmBindClaimText(cfg, raw), warmClaim)
+	}
 }
 
 func runtimeObservationLive(obs worker.LiveObservation) bool {
@@ -4884,6 +4919,19 @@ func executePlannedStartsTraced(
 				item, err := prepareStartCandidateForCity(candidate, cityPath, cityName, cfg, sp, store, clk, stderr, startOpts.workDirResolver, startOpts.dispatchOptionSources)
 				prepareSpend.end()
 				if err != nil {
+					if errors.Is(err, errStartCandidateRuntimeAlreadyAlive) {
+						if identity != "" {
+							cb.restoreEntrySnapshot(sessFront, candidate.info.ID, identity, cbBefore, cbNow, stderr)
+						}
+						deliverWarmReuseClaimNudge(ctx, store, sp, cfg, candidate.info, startOpts.warmClaimProbe)
+						if trace != nil {
+							trace.RecordDecision(TraceSiteLifecycleStartRun, TraceReasonWake, TraceOutcomeSkipped, candidate.tp.TemplateName, candidate.name(), traceRecordPayload{
+								"runtime_already_alive": true,
+							})
+						}
+						drop("", nil)
+						continue
+					}
 					// A PreWake refused because the row moved (or the lease was
 					// taken over) is no restart and leaves the row's in-flight
 					// marker to whoever moved it; the next pass decides again.
