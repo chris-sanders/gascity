@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
@@ -215,6 +217,305 @@ func TestPrepareStartCandidateDoesNotRotateIdentityForLiveRuntime(t *testing.T) 
 	}
 	if runtimeToken != got.InstanceToken {
 		t.Fatalf("runtime token = %q, session token = %q; warm reuse must keep their identities aligned", runtimeToken, got.InstanceToken)
+	}
+}
+
+func identityPlannerCandidate(t *testing.T, env *reconcilerTestEnv, state string) (startCandidate, beads.Bead, TemplateParams) {
+	t.Helper()
+	configureAlwaysNamedSession(env)
+	bead := createCircuitTestNamedSession(t, env, state)
+	tp := TemplateParams{
+		Command:      "codex",
+		SessionName:  "session-a",
+		TemplateName: "template-a",
+		Hints:        agent.StartupHints{ProcessNames: []string{"codex"}},
+	}
+	env.setSessionMetadata(&bead, map[string]string{
+		"generation":                      "1",
+		"instance_token":                  "row-token",
+		"pool_managed":                    "true",
+		beadmeta.TriggerBeadIDMetadataKey: "work-1",
+	})
+	if state == "active" {
+		env.setSessionMetadata(&bead, map[string]string{"last_woke_at": env.clk.Now().UTC().Format(time.RFC3339)})
+	}
+	return startCandidate{info: env.sessionInfo(bead.ID), tp: tp}, bead, tp
+}
+
+func startIdentityRuntime(t *testing.T, env *reconcilerTestEnv, candidate startCandidate) {
+	t.Helper()
+	if err := env.sp.Start(context.Background(), candidate.name(), runtime.Config{
+		Command:      "codex",
+		ProcessNames: []string{"codex"},
+	}); err != nil {
+		t.Fatalf("starting existing runtime: %v", err)
+	}
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     candidate.info.ID,
+		"GC_INSTANCE_TOKEN": candidate.info.InstanceToken,
+		"GC_RUNTIME_EPOCH":  candidate.info.Generation,
+	} {
+		if err := env.sp.SetMeta(candidate.name(), key, value); err != nil {
+			t.Fatalf("setting runtime identity %s: %v", key, err)
+		}
+	}
+}
+
+type closeRowOnLivenessProvider struct {
+	*runtime.Fake
+	store beads.Store
+	id    string
+}
+
+func (p *closeRowOnLivenessProvider) ObserveLivenessWithError(name string, processNames []string) (runtime.Liveness, error) {
+	if err := p.store.Close(p.id); err != nil {
+		return runtime.Liveness{}, err
+	}
+	return runtime.ObserveLiveness(p.Fake, name, processNames), nil
+}
+
+func runIdentityPlanner(t *testing.T, env *reconcilerTestEnv, candidate startCandidate, tp TemplateParams, async bool) int {
+	return runIdentityPlannerWithProvider(t, env, candidate, tp, async, env.sp)
+}
+
+func runIdentityPlannerWithProvider(t *testing.T, env *reconcilerTestEnv, candidate startCandidate, tp TemplateParams, async bool, sp runtime.Provider) int {
+	t.Helper()
+	options := []startExecutionOption{
+		withWarmClaimProbe(alwaysUnclaimed),
+		withStartStabilityWaiter(immediateStartStabilityWaiter),
+		withSessionStaleKeyDetectionWaiter(immediateSessionStaleKeyDetectionWaiter),
+	}
+	var tracker *asyncStartTracker
+	if async {
+		tracker = &asyncStartTracker{}
+		options = append(options, withAsyncStartExecution(), withAsyncStartTracker(tracker))
+	}
+	woken := executePlannedStartsTraced(
+		context.Background(), []startCandidate{candidate}, env.cfg,
+		map[string]TemplateParams{tp.SessionName: tp}, sp, env.store,
+		"test-city", env.city, env.clk, events.Discard, 5*time.Second,
+		io.Discard, &env.stderr, nil, options...,
+	)
+	if tracker != nil && !tracker.wait(10*time.Second) {
+		t.Fatal("async start tracker did not drain")
+	}
+	return woken
+}
+
+func TestExecutePlannedStartsSkipsLiveSnapshotMismatchWithoutRotatingIdentity(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		name := "sync"
+		if async {
+			name = "async"
+		}
+		t.Run(name, func(t *testing.T) {
+			env := newReconcilerTestEnv(t)
+			candidate, bead, tp := identityPlannerCandidate(t, env, "active")
+			// The candidate is the planner's not-alive snapshot. The runtime
+			// becomes live before the executor takes its name lease.
+			startIdentityRuntime(t, env, candidate)
+			if err := setReconcilerDrainAckMetadata(env.sp, candidate.name(), &drainState{reason: "orphaned", generation: 1}); err != nil {
+				t.Fatalf("setting drain ack: %v", err)
+			}
+			cb := defaultSessionCircuitBreaker()
+			identity := namedSessionIdentityInfo(candidate.info)
+			cb.RecordRestart(identity, env.clk.Now().Add(-time.Minute))
+			beforeBreaker := cb.entrySnapshot(identity)
+
+			if got := runIdentityPlanner(t, env, candidate, tp, async); got != 0 {
+				t.Fatalf("wake count = %d, want 0 for warm reuse", got)
+			}
+			got := env.sessionInfo(bead.ID)
+			if got.InstanceToken != candidate.info.InstanceToken || got.Generation != candidate.info.Generation {
+				t.Fatalf("session identity = (%q, %q), want unchanged (%q, %q)", got.InstanceToken, got.Generation, candidate.info.InstanceToken, candidate.info.Generation)
+			}
+			if got.State != sessionpkg.StateActive {
+				t.Fatalf("state = %q, want active", got.State)
+			}
+			if env.sp.CountCalls("Start", candidate.name()) != 1 {
+				t.Fatalf("Start calls = %d, want only the pre-existing runtime start", env.sp.CountCalls("Start", candidate.name()))
+			}
+			if n, _ := countNudges(env.sp); n != 1 {
+				t.Fatalf("claim nudge count = %d, want exactly 1", n)
+			}
+			runtimeToken, err := env.sp.GetMeta(candidate.name(), "GC_INSTANCE_TOKEN")
+			if err != nil || runtimeToken != got.InstanceToken {
+				t.Fatalf("runtime token = %q (err %v), session token = %q", runtimeToken, err, got.InstanceToken)
+			}
+			if after := cb.entrySnapshot(identity); !reflect.DeepEqual(after, beforeBreaker) {
+				t.Fatalf("breaker snapshot after a skipped start = %#v, want %#v", after, beforeBreaker)
+			}
+			for _, key := range []string{"GC_DRAIN_ACK", reconcilerDrainAckSourceKey, reconcilerDrainAckReasonKey, reconcilerDrainAckGenerationKey} {
+				value, err := env.sp.GetMeta(candidate.name(), key)
+				if err != nil || value != "" {
+					t.Errorf("drain metadata %s = %q (err %v), want cleared", key, value, err)
+				}
+			}
+			raw, err := env.store.Get(bead.ID)
+			if err != nil {
+				t.Fatalf("reading lease record: %v", err)
+			}
+			if raw.Metadata[sessionpkg.RuntimeLeaseHolderKey] != "" {
+				t.Fatalf("runtime lease holder = %q, want cleared", raw.Metadata[sessionpkg.RuntimeLeaseHolderKey])
+			}
+		})
+	}
+}
+
+func TestExecutePlannedStartsDoesNotNudgeHeldOrClosedLiveRows(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, *reconcilerTestEnv, beads.Bead)
+	}{
+		{name: "held", mutate: func(t *testing.T, env *reconcilerTestEnv, bead beads.Bead) {
+			env.setSessionMetadata(&bead, map[string]string{"sleep_intent": "user-hold"})
+		}},
+		{name: "closed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newReconcilerTestEnv(t)
+			candidate, bead, tp := identityPlannerCandidate(t, env, "active")
+			startIdentityRuntime(t, env, candidate)
+			sp := runtime.Provider(env.sp)
+			if tc.mutate != nil {
+				tc.mutate(t, env, bead)
+			} else {
+				// Close after executePlannedStartsTraced takes the lease record,
+				// during its fresh liveness observation, so preparation exercises
+				// the locked closed-row check.
+				sp = &closeRowOnLivenessProvider{Fake: env.sp, store: env.store, id: bead.ID}
+			}
+			if got := runIdentityPlannerWithProvider(t, env, candidate, tp, false, sp); got != 0 {
+				t.Fatalf("wake count = %d, want 0", got)
+			}
+			if n, _ := countNudges(env.sp); n != 0 {
+				t.Fatalf("claim nudge count = %d, want 0", n)
+			}
+			if env.sp.CountCalls("Start", candidate.name()) != 1 {
+				t.Fatalf("Start calls = %d, want only the pre-existing runtime start", env.sp.CountCalls("Start", candidate.name()))
+			}
+		})
+	}
+}
+
+func TestExecutePlannedStartsDefersLivenessProbeErrorAndRestoresBreaker(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	candidate, bead, tp := identityPlannerCandidate(t, env, "active")
+	startIdentityRuntime(t, env, candidate)
+	fake := env.sp
+	cb := defaultSessionCircuitBreaker()
+	identity := namedSessionIdentityInfo(candidate.info)
+	cb.RecordRestart(identity, env.clk.Now().Add(-time.Minute))
+	beforeBreaker := cb.entrySnapshot(identity)
+	// The provider can report a live-looking result and still fail its
+	// authoritative liveness observation.
+	if got := executePlannedStartsTraced(
+		context.Background(), []startCandidate{candidate}, env.cfg,
+		map[string]TemplateParams{tp.SessionName: tp}, &startUnavailableLivenessProvider{Fake: fake}, env.store,
+		"test-city", env.city, env.clk, events.Discard, 5*time.Second,
+		io.Discard, &env.stderr, nil,
+		withWarmClaimProbe(alwaysUnclaimed),
+		withStartStabilityWaiter(immediateStartStabilityWaiter),
+		withSessionStaleKeyDetectionWaiter(immediateSessionStaleKeyDetectionWaiter),
+	); got != 0 {
+		t.Fatalf("wake count = %d, want 0", got)
+	}
+	if fake.CountCalls("Start", candidate.name()) != 1 {
+		t.Fatalf("Start calls = %d, want only the pre-existing runtime start", fake.CountCalls("Start", candidate.name()))
+	}
+	if n, _ := countNudges(fake); n != 0 {
+		t.Fatalf("claim nudge count = %d, want 0 on an uncertain observation", n)
+	}
+	if after := cb.entrySnapshot(identity); !reflect.DeepEqual(after, beforeBreaker) {
+		t.Fatalf("breaker snapshot after deferred observation = %#v, want %#v", after, beforeBreaker)
+	}
+	if !strings.Contains(env.stderr.String(), string(TraceOutcomeDeferred)) || strings.Contains(env.stderr.String(), "outcome=failed") {
+		t.Fatalf("liveness error should be logged as deferred, stderr=%q", env.stderr.String())
+	}
+	if got := env.sessionInfo(bead.ID); got.InstanceToken != candidate.info.InstanceToken || got.Generation != candidate.info.Generation {
+		t.Fatalf("identity after deferred observation = (%q, %q), want unchanged", got.InstanceToken, got.Generation)
+	}
+}
+
+func TestExecutePlannedStartsPendingCreateWarmReusePreservesIdentity(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	candidate, bead, tp := identityPlannerCandidate(t, env, "start-pending")
+	env.setSessionMetadata(&bead, map[string]string{"pending_create_claim": "true"})
+	candidate.info = env.sessionInfo(bead.ID)
+	startIdentityRuntime(t, env, candidate)
+	// The existing worker carries the row ID and old token but has no epoch,
+	// which the pending-create attribution contract still classifies as ours.
+	if err := env.sp.RemoveMeta(candidate.name(), "GC_RUNTIME_EPOCH"); err != nil {
+		t.Fatalf("removing runtime epoch: %v", err)
+	}
+	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 1 {
+		t.Fatalf("wake count = %d, want 1 after pending create converges", got)
+	}
+	got := env.sessionInfo(bead.ID)
+	if got.InstanceToken != candidate.info.InstanceToken || got.Generation != candidate.info.Generation {
+		t.Fatalf("pending-create warm reuse rotated identity to (%q, %q), want unchanged (%q, %q)", got.InstanceToken, got.Generation, candidate.info.InstanceToken, candidate.info.Generation)
+	}
+	if got.PendingCreateClaim || got.State != sessionpkg.StateActive {
+		t.Fatalf("pending-create convergence left claim=%v state=%q, want cleared and active", got.PendingCreateClaim, got.State)
+	}
+	if env.sp.CountCalls("Start", candidate.name()) != 1 {
+		t.Fatalf("Start calls = %d, want only the pre-existing runtime start", env.sp.CountCalls("Start", candidate.name()))
+	}
+}
+
+func TestExecutePlannedStartsPendingCreateWithoutRuntimeStillPreWakes(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	candidate, bead, tp := identityPlannerCandidate(t, env, "start-pending")
+	env.setSessionMetadata(&bead, map[string]string{"pending_create_claim": "true"})
+	candidate.info = env.sessionInfo(bead.ID)
+	oldToken, oldGeneration := candidate.info.InstanceToken, candidate.info.Generation
+	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 1 {
+		t.Fatalf("wake count = %d, want 1", got)
+	}
+	got := env.sessionInfo(bead.ID)
+	if got.InstanceToken == oldToken || got.Generation == oldGeneration {
+		t.Fatalf("pending create did not mint identity: got (%q, %q), old (%q, %q)", got.InstanceToken, got.Generation, oldToken, oldGeneration)
+	}
+	if got.PendingCreateClaim || got.State != sessionpkg.StateActive {
+		t.Fatalf("pending create ended claim=%v state=%q, want cleared and active", got.PendingCreateClaim, got.State)
+	}
+	if env.sp.CountCalls("Start", candidate.name()) != 1 {
+		t.Fatalf("Start calls = %d, want 1", env.sp.CountCalls("Start", candidate.name()))
+	}
+}
+
+func TestExecutePlannedStartsStillRecyclesZombieRuntime(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	candidate, _, tp := identityPlannerCandidate(t, env, "active")
+	if err := env.sp.Start(context.Background(), candidate.name(), runtime.Config{Command: "codex", ProcessNames: []string{"codex"}}); err != nil {
+		t.Fatalf("starting zombie runtime: %v", err)
+	}
+	env.sp.Zombies[candidate.name()] = true
+	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 1 {
+		t.Fatalf("wake count = %d, want 1 after recycling zombie", got)
+	}
+	if env.sp.CountCalls("Stop", candidate.name()) != 1 || env.sp.CountCalls("Start", candidate.name()) != 2 {
+		t.Fatalf("zombie recycle calls: Stop=%d Start=%d, want one stop and one new start after existing runtime", env.sp.CountCalls("Stop", candidate.name()), env.sp.CountCalls("Start", candidate.name()))
+	}
+}
+
+func TestExecutePlannedStartsRestoresIdentityForExistingK8sInitializingSession(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	candidate, bead, tp := identityPlannerCandidate(t, env, "active")
+	oldToken, oldGeneration := candidate.info.InstanceToken, candidate.info.Generation
+	env.sp.StartErrors[candidate.name()] = fmt.Errorf("%w: %w: young pod", runtime.ErrSessionInitializing, runtime.ErrExistingSessionInitializing)
+	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 0 {
+		t.Fatalf("wake count = %d, want 0 for initializing existing pod", got)
+	}
+	got := env.sessionInfo(bead.ID)
+	if got.InstanceToken != oldToken || got.Generation != oldGeneration {
+		t.Fatalf("identity after existing-pod initialization = (%q, %q), want restored (%q, %q)", got.InstanceToken, got.Generation, oldToken, oldGeneration)
+	}
+	if got.State != sessionpkg.StateActive || got.LastWokeAt != "" {
+		t.Fatalf("lifecycle after deferred existing pod = state %q last_woke_at %q, want active with no in-flight marker", got.State, got.LastWokeAt)
+	}
+	if env.sp.CountCalls("Start", candidate.name()) != 1 {
+		t.Fatalf("Start calls = %d, want one initializing response", env.sp.CountCalls("Start", candidate.name()))
 	}
 }
 

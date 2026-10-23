@@ -195,6 +195,10 @@ type startCandidate struct {
 	// (preWakeCommitUnder); the runtime-only start runs under it. Zero for a
 	// start with no session row, which has none.
 	inc sessionpkg.Incarnation
+	// convergeExistingPendingCreate means preparation found a live runtime
+	// already carrying this pending row's identity. It must be rechecked and
+	// committed in place; PreWake would rotate the identity out from under it.
+	convergeExistingPendingCreate bool
 }
 
 // name reads the RAW session_name metadata off the typed twin
@@ -358,6 +362,10 @@ type startResult struct {
 	// the row back (releaseRowOwnedRuntime). Nil on test-built results, which
 	// keeps their rollback behavior unchanged.
 	provider runtime.Provider
+	// restorePreWakeIdentity marks the K8s existing-pod initialization response:
+	// Start found a pod this attempt did not create, so its PreWake identity
+	// rotation must be undone along with the deferred lifecycle state.
+	restorePreWakeIdentity bool
 	// phases captures sub-phase wall-clock so the lifecycle log can pinpoint
 	// where a slow start spent its time. See gc-67o for context.
 	phases startPhaseTimings
@@ -1053,6 +1061,11 @@ var errStartUserHeld = errors.New("an operator holds the session (user-hold); st
 // writing PreWake or counting a restart.
 var errStartCandidateRuntimeAlreadyAlive = errors.New("session runtime is already alive")
 
+// errStartCandidateDeferred means preparation could not safely establish
+// whether the runtime belongs to this row. Like a start-time unavailable
+// observation, it is a retryable deferral rather than a failed restart.
+var errStartCandidateDeferred = errors.New("session start preparation deferred")
+
 func prepareStartCandidateForCity(
 	candidate startCandidate,
 	cityPath string,
@@ -1070,7 +1083,7 @@ func prepareStartCandidateForCity(
 	if candidate.lease != nil && sp != nil {
 		running, alive, err := observeRuntimeProviderLiveness(sp, candidate.name(), candidate.tp.Hints.ProcessNames)
 		if err != nil {
-			return nil, fmt.Errorf("observing runtime %q before pre-wake: %w", candidate.name(), err)
+			return nil, fmt.Errorf("%w: observing runtime %q before pre-wake: %w", errStartCandidateDeferred, candidate.name(), err)
 		}
 		runtimeAlreadyAlive = running && alive
 	}
@@ -1090,17 +1103,35 @@ func prepareStartCandidateForCity(
 			if err != nil {
 				return err
 			}
-			if runtimeAlreadyAlive && !shouldRollbackPendingCreateInfo(current) {
-				// The planner's liveness snapshot can be stale by the time this
-				// leased start reaches preparation. Reuse the existing incarnation
-				// as-is; minting here would make its live worker fail the session
-				// bead's token fence.
-				return errStartCandidateRuntimeAlreadyAlive
-			}
 			// An operator's suspend that landed since the snapshot wins: the
 			// controller never starts a row the operator holds.
 			if sessionpkg.DispositionOfInfo(current).KeepsSlot() {
 				return errStartUserHeld
+			}
+			if persisted.Status == "closed" {
+				return fmt.Errorf("%w: %w", errPreWakeSuperseded, sessionpkg.ErrMintClosed)
+			}
+			if runtimeAlreadyAlive {
+				if shouldRollbackPendingCreateInfo(current) {
+					identity := readPendingCreateIdentityBounded(context.Background(), cityPath, current, candidate.name(), sp)
+					switch identity.attribution() {
+					case pendingCreateRuntimeOurs:
+						// A matching old pod can be a pending create whose earlier
+						// start committed only partway. Reuse and commit it without
+						// rotating identity; PreWake would strand its worker.
+						candidate.info = current
+						candidate.convergeExistingPendingCreate = true
+						return nil
+					case pendingCreateRuntimeUnknown:
+						return fmt.Errorf("%w: pending-create runtime %q identity is unverifiable: %s", errStartCandidateDeferred, candidate.name(), strings.Join(identity.failed, "; "))
+					}
+				} else {
+					// The planner's liveness snapshot can be stale by the time this
+					// leased start reaches preparation. Reuse the existing
+					// incarnation as-is; minting here would make its worker fail
+					// the session bead's token fence.
+					return errStartCandidateRuntimeAlreadyAlive
+				}
 			}
 			// preWakeCommit persists its PreWakePatch through the front door and returns
 			// the batch; folding it onto the freshly re-read Info keeps the twin
@@ -1924,6 +1955,7 @@ func runPreparedStartCandidate(
 	// it true for the other detection path; neither path ever resets it back
 	// to false.
 	diedDuringStartup := errors.Is(err, runtime.ErrSessionDiedDuringStartup)
+	restorePreWakeIdentity := errors.Is(err, runtime.ErrExistingSessionInitializing)
 	// Split start_call into provider.Start and the ErrStateSync recovery
 	// branch (gc-9ha). The recovery branch hits the worker observation
 	// API which can dominate start_call when the runtime is wedged.
@@ -2010,7 +2042,7 @@ func runPreparedStartCandidate(
 		identity = readPendingCreateIdentityBounded(probeCtx, cityPath, item.candidate.info, item.candidate.name(), sp)
 		attribution = identity.attribution()
 	}
-	if attribution == pendingCreateRuntimeOurs {
+	if attribution == pendingCreateRuntimeOurs && !restorePreWakeIdentity {
 		item.runtimeBinding = startedRuntimeBinding(ctx, cityPath, sp, item.candidate.name())
 		return startResult{
 			prepared:            item,
@@ -2077,19 +2109,20 @@ func runPreparedStartCandidate(
 		item.runtimeBinding = startedRuntimeBinding(ctx, cityPath, sp, item.candidate.name())
 	}
 	return startResult{
-		prepared:            item,
-		err:                 err,
-		outcome:             outcome,
-		started:             started,
-		finished:            finished,
-		rollbackPending:     rollbackPending,
-		rateLimitScreen:     rateLimitScreen,
-		providerStartCalled: startedFresh,
-		diedDuringStartup:   diedDuringStartup,
-		diedPane:            diedPane,
-		unattributedErr:     unattributedErr,
-		provider:            sp,
-		phases:              phases,
+		prepared:               item,
+		err:                    err,
+		outcome:                outcome,
+		started:                started,
+		finished:               finished,
+		rollbackPending:        rollbackPending,
+		rateLimitScreen:        rateLimitScreen,
+		providerStartCalled:    startedFresh,
+		diedDuringStartup:      diedDuringStartup,
+		diedPane:               diedPane,
+		unattributedErr:        unattributedErr,
+		provider:               sp,
+		restorePreWakeIdentity: restorePreWakeIdentity,
+		phases:                 phases,
 	}
 }
 
@@ -2600,6 +2633,20 @@ func startPreparedStartCandidate(
 		if err != nil {
 			return false, err
 		}
+		if item.candidate.convergeExistingPendingCreate {
+			if !running || !alive {
+				// Preparation deliberately skipped PreWake because this runtime
+				// carried the pending row's old identity. If it stopped meanwhile,
+				// retry from the planner so the next attempt can mint before Start.
+				return false, fmt.Errorf("pending-create runtime %q changed during preparation: %w", name, runtime.ErrRuntimeUnavailable)
+			}
+			if attributePendingCreateRuntime(item.candidate.info, name, sp) != pendingCreateRuntimeOurs {
+				return false, fmt.Errorf("pending-create runtime %q identity changed during preparation: %w", name, runtime.ErrRuntimeUnavailable)
+			}
+			item.runtimeBinding = startedRuntimeBinding(ctx, cityPath, sp, name)
+			deliverWarmReuseClaimNudge(ctx, store, sp, cfg, item.candidate.info, warmClaim)
+			return false, nil
+		}
 		if running {
 			if alive {
 				if shouldRollbackPendingCreateInfo(item.candidate.info) && attributePendingCreateRuntime(item.candidate.info, name, sp) != pendingCreateRuntimeOurs {
@@ -3047,6 +3094,13 @@ func commitStartResultTraced(
 	// Session startup is not yet safe to decide — back off silently without
 	// recording failure. The reconciler will retry on the next patrol tick.
 	if startOutcomeDefersCommit(result.outcome) {
+		if result.restorePreWakeIdentity {
+			// Kubernetes found an existing pod that has not brought tmux up
+			// yet. This attempt did not create that pod, so undo the identity
+			// rotation as well as the lifecycle PreWake below.
+			restorePreWakeState(result.prepared, sessFront, stderr)
+			restorePreWakeIdentity(result.prepared, sessFront, stderr)
+		}
 		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		// A deferral on unknown attribution spares the runtime, not the
 		// crash-loop accounting: a provider Start that failed still delays the
@@ -3346,6 +3400,35 @@ func restorePreWakeState(prepared preparedStart, sessFront *sessionpkg.Store, st
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "session reconciler: restoring pre-wake state for %s: %v\n", prepared.candidate.name(), err) //nolint:errcheck
+	}
+}
+
+// restorePreWakeIdentity is limited to a provider's explicit existing-session
+// initialization response. PreWake normally keeps its new identity even when a
+// launch is refused; this response is different because Kubernetes found a pod
+// that this attempt did not create, and that pod still carries the prior token.
+// The write is fenced to the exact incarnation PreWake minted so a later wake
+// or an operator close wins.
+func restorePreWakeIdentity(prepared preparedStart, sessFront *sessionpkg.Store, stderr io.Writer) {
+	id := strings.TrimSpace(prepared.candidate.info.ID)
+	undo := prepared.preWakeUndo
+	if id == "" || sessFront == nil || undo.written == nil {
+		return
+	}
+	err := sessionpkg.WithSessionMutationLock(id, func() error {
+		_, err := sessFront.UpdateMetadataFenced(id, preWakeRestoreAttempts, func(current sessionpkg.Info, persisted sessionpkg.PersistedResponse) sessionpkg.MetadataPatch {
+			if persisted.Status == "closed" || current.InstanceToken != undo.token || current.Generation != prepared.candidate.info.Generation {
+				return nil
+			}
+			return sessionpkg.MetadataPatch{
+				"instance_token": undo.before["instance_token"],
+				"generation":     undo.before["generation"],
+			}
+		})
+		return err
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: restoring pre-wake identity for %s: %v\n", prepared.candidate.name(), err) //nolint:errcheck
 	}
 }
 
@@ -4923,6 +5006,7 @@ func executePlannedStartsTraced(
 						if identity != "" {
 							cb.restoreEntrySnapshot(sessFront, candidate.info.ID, identity, cbBefore, cbNow, stderr)
 						}
+						_ = clearReconcilerDrainAckMetadata(sp, candidate.name())
 						deliverWarmReuseClaimNudge(ctx, store, sp, cfg, candidate.info, startOpts.warmClaimProbe)
 						if trace != nil {
 							trace.RecordDecision(TraceSiteLifecycleStartRun, TraceReasonWake, TraceOutcomeSkipped, candidate.tp.TemplateName, candidate.name(), traceRecordPayload{
@@ -4930,6 +5014,19 @@ func executePlannedStartsTraced(
 							})
 						}
 						drop("", nil)
+						continue
+					}
+					if errors.Is(err, errStartCandidateDeferred) {
+						if identity != "" {
+							cb.restoreEntrySnapshot(sessFront, candidate.info.ID, identity, cbBefore, cbNow, stderr)
+						}
+						clearPendingStartInFlightLease(candidate.info.ID, sessFront, stderr)
+						if trace != nil {
+							trace.RecordDecision(TraceSiteLifecycleStartRun, TraceReasonWake, TraceOutcomeDeferred, candidate.tp.TemplateName, candidate.name(), traceRecordPayload{
+								"preparation_error": err.Error(),
+							})
+						}
+						drop(string(TraceOutcomeDeferred), err)
 						continue
 					}
 					// A PreWake refused because the row moved (or the lease was
