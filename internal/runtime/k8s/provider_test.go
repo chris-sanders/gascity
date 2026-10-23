@@ -232,6 +232,61 @@ func TestIsRunning(t *testing.T) {
 	}
 }
 
+func TestObserveLivenessWithErrorDistinguishesTransportFailureAndZombie(t *testing.T) {
+	t.Run("transport failure is unknown", func(t *testing.T) {
+		fake := newFakeK8sOps()
+		p := newProviderWithOps(fake)
+		addRunningPod(fake, "worker", "worker")
+		fake.setExecResult("worker", []string{"tmux", "has-session", "-t", "main"}, "", errors.New("exec transport failed"))
+		obs, err := p.ObserveLivenessWithError("worker", []string{"codex"})
+		if !errors.Is(err, runtime.ErrRuntimeUnavailable) {
+			t.Fatalf("ObserveLivenessWithError error = %v, want ErrRuntimeUnavailable", err)
+		}
+		if obs.Running || obs.Alive {
+			t.Fatalf("observation = %+v, want unknown zero state", obs)
+		}
+	})
+
+	t.Run("running tmux with dead agent is zombie", func(t *testing.T) {
+		fake := newFakeK8sOps()
+		p := newProviderWithOps(fake)
+		addRunningPod(fake, "worker", "worker")
+		fake.setExecResult("worker", []string{"tmux", "has-session", "-t", "main"}, "", nil)
+		fake.setExecResult("worker", []string{"pgrep", "-f", "codex"}, "", execerr.CodeExitError{Err: errors.New("no process"), Code: 1})
+		obs, err := p.ObserveLivenessWithError("worker", []string{"codex"})
+		if err != nil || !obs.Running || obs.Alive {
+			t.Fatalf("ObserveLivenessWithError = (%+v, %v), want running zombie", obs, err)
+		}
+	})
+}
+
+func TestGetMetaReadsIdentityFromPodEnvironment(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "worker", "worker")
+	fake.pods["worker"].Spec.Containers = []corev1.Container{{
+		Name: "agent",
+		Env: []corev1.EnvVar{
+			{Name: "GC_SESSION_ID", Value: "session-1"},
+			{Name: "GC_INSTANCE_TOKEN", Value: "token-1"},
+			{Name: "GC_RUNTIME_EPOCH", Value: "7"},
+		},
+	}}
+	for key, want := range map[string]string{
+		"GC_SESSION_ID": "session-1", "GC_INSTANCE_TOKEN": "token-1", "GC_RUNTIME_EPOCH": "7",
+	} {
+		got, err := p.GetMeta("worker", key)
+		if err != nil || got != want {
+			t.Errorf("GetMeta(%s) = (%q, %v), want (%q, nil)", key, got, err, want)
+		}
+	}
+	for _, call := range fake.calls {
+		if call.method == "execInPod" {
+			t.Fatal("identity metadata read used tmux exec instead of the pod environment")
+		}
+	}
+}
+
 func TestStop(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)

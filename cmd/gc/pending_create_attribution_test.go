@@ -44,7 +44,7 @@ func TestAttributePendingCreateRuntime(t *testing.T) {
 		reason string
 	}{
 		{name: "token only", meta: map[string]string{"GC_INSTANCE_TOKEN": "tok-1"}, want: pendingCreateRuntimeOurs},
-		{name: "id only", meta: map[string]string{"GC_SESSION_ID": "gc-1"}, want: pendingCreateRuntimeOurs},
+		{name: "id only", meta: map[string]string{"GC_SESSION_ID": "gc-1"}, want: pendingCreateRuntimeUnknown},
 		{name: "id and token", meta: map[string]string{"GC_SESSION_ID": "gc-1", "GC_INSTANCE_TOKEN": "tok-1"}, want: pendingCreateRuntimeOurs},
 		{
 			name: "id match, token unreadable", meta: map[string]string{"GC_SESSION_ID": "gc-1"},
@@ -53,8 +53,8 @@ func TestAttributePendingCreateRuntime(t *testing.T) {
 		},
 		{
 			name: "id match, token unreadable, generation matches", meta: map[string]string{"GC_SESSION_ID": "gc-1", "GC_RUNTIME_EPOCH": "2"},
-			errs: map[string]error{"GC_INSTANCE_TOKEN": errIdentityReadFailed}, want: pendingCreateRuntimeOurs,
-			reason: "preWakeCommit bumps the generation with the token, so a re-woken incarnation carries another",
+			errs: map[string]error{"GC_INSTANCE_TOKEN": errIdentityReadFailed}, want: pendingCreateRuntimeUnknown,
+			reason: "generation cannot substitute for the unreadable expected token",
 		},
 		{
 			name: "id match, token unreadable, generation conflicts", meta: map[string]string{"GC_SESSION_ID": "gc-1", "GC_RUNTIME_EPOCH": "3"},
@@ -82,8 +82,8 @@ func TestAttributePendingCreateRuntime(t *testing.T) {
 		},
 		{
 			name: "id unreadable, token mismatch", meta: map[string]string{"GC_INSTANCE_TOKEN": "tok-2"},
-			errs: map[string]error{"GC_SESSION_ID": errIdentityReadFailed}, want: pendingCreateRuntimeUnknown,
-			reason: "a matching ID would make a non-conflicting token drift ours",
+			errs: map[string]error{"GC_SESSION_ID": errIdentityReadFailed}, want: pendingCreateRuntimeForeign,
+			reason: "a mismatching expected token is foreign even when the ID is unreadable",
 		},
 		{
 			name: "id unreadable, token mismatch, generation conflicts", meta: map[string]string{"GC_INSTANCE_TOKEN": "tok-2", "GC_RUNTIME_EPOCH": "3"},
@@ -96,24 +96,24 @@ func TestAttributePendingCreateRuntime(t *testing.T) {
 		{name: "nothing recorded", want: pendingCreateRuntimeForeign},
 		{
 			name: "no id, no expected token, token unreadable", info: sessionpkg.Info{ID: "gc-1", SessionNameMetadata: name},
-			errs: map[string]error{"GC_INSTANCE_TOKEN": errIdentityReadFailed}, want: pendingCreateRuntimeForeign,
+			errs: map[string]error{"GC_INSTANCE_TOKEN": errIdentityReadFailed}, want: pendingCreateRuntimeUnknown,
 		},
 		{name: "id read gone", errs: map[string]error{"GC_SESSION_ID": gone}, want: pendingCreateRuntimeForeign},
 		{name: "token read gone", meta: map[string]string{"GC_SESSION_ID": "gc-1"}, errs: map[string]error{"GC_INSTANCE_TOKEN": gone}, want: pendingCreateRuntimeForeign},
 		{
 			name: "no metadata store", errs: map[string]error{"GC_SESSION_ID": runtime.ErrMetaUnsupported, "GC_INSTANCE_TOKEN": runtime.ErrMetaUnsupported},
-			want: pendingCreateRuntimeForeign,
+			want: pendingCreateRuntimeUnknown,
 		},
 		{
 			name: "gone-looking text without the sentinel", meta: map[string]string{"GC_SESSION_ID": "gc-1"},
 			errs: map[string]error{"GC_INSTANCE_TOKEN": errors.New("session not found in cache")}, want: pendingCreateRuntimeUnknown,
 			reason: "classification uses errors.Is, never message matching",
 		},
-		{name: "id match, token drift, same generation", meta: map[string]string{"GC_SESSION_ID": "gc-1", "GC_INSTANCE_TOKEN": "tok-2", "GC_RUNTIME_EPOCH": "2"}, want: pendingCreateRuntimeOurs},
+		{name: "id match, token drift, same generation", meta: map[string]string{"GC_SESSION_ID": "gc-1", "GC_INSTANCE_TOKEN": "tok-2", "GC_RUNTIME_EPOCH": "2"}, want: pendingCreateRuntimeForeign},
 		{name: "id match, token drift, generation conflicts", meta: map[string]string{"GC_SESSION_ID": "gc-1", "GC_INSTANCE_TOKEN": "tok-2", "GC_RUNTIME_EPOCH": "3"}, want: pendingCreateRuntimeForeign},
 		{
 			name: "id match, token drift, generation unreadable", meta: map[string]string{"GC_SESSION_ID": "gc-1", "GC_INSTANCE_TOKEN": "tok-2"},
-			errs: map[string]error{"GC_RUNTIME_EPOCH": errIdentityReadFailed}, want: pendingCreateRuntimeUnknown,
+			errs: map[string]error{"GC_RUNTIME_EPOCH": errIdentityReadFailed}, want: pendingCreateRuntimeForeign,
 		},
 		{name: "no id, token mismatch", meta: map[string]string{"GC_INSTANCE_TOKEN": "tok-2"}, want: pendingCreateRuntimeForeign},
 	}
