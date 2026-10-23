@@ -287,6 +287,37 @@ func TestGetMetaReadsIdentityFromPodEnvironment(t *testing.T) {
 	}
 }
 
+func TestGetMetaUsesTheServingPodForIdentity(t *testing.T) {
+	fake := newFakeK8sOps()
+	p := newProviderWithOps(fake)
+	addRunningPod(fake, "worker", "worker")
+	fake.pods["worker"].Spec.Containers = []corev1.Container{{Name: "agent", Env: []corev1.EnvVar{{Name: "GC_INSTANCE_TOKEN", Value: "live-token"}}}}
+
+	terminating := fake.pods["worker"].DeepCopy()
+	terminating.Name = "worker-terminating"
+	deleting := metav1.Now()
+	terminating.DeletionTimestamp = &deleting
+	terminating.Spec.Containers = []corev1.Container{{Name: "agent", Env: []corev1.EnvVar{{Name: "GC_INSTANCE_TOKEN", Value: "stale-token"}}}}
+	fake.pods[terminating.Name] = terminating
+	addFailedPod(fake, "worker-failed", "worker")
+	fake.pods["worker-failed"].Spec.Containers = []corev1.Container{{Name: "agent", Env: []corev1.EnvVar{{Name: "GC_INSTANCE_TOKEN", Value: "failed-token"}}}}
+
+	got, err := p.GetMeta("worker", "GC_INSTANCE_TOKEN")
+	if err != nil || got != "live-token" {
+		t.Fatalf("GetMeta serving pod identity = (%q, %v), want live-token", got, err)
+	}
+
+	obs, err := p.ObserveLivenessWithError("worker", nil)
+	if err != nil || !obs.Running || !obs.Alive {
+		t.Fatalf("ObserveLivenessWithError = (%+v, %v), want the serving pod", obs, err)
+	}
+	for _, call := range fake.calls {
+		if call.method == "execInPod" && call.pod != "worker" {
+			t.Errorf("liveness exec used pod %q, want worker", call.pod)
+		}
+	}
+}
+
 func TestStop(t *testing.T) {
 	fake := newFakeK8sOps()
 	p := newProviderWithOps(fake)

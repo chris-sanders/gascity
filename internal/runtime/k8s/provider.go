@@ -488,13 +488,7 @@ func (p *Provider) ObserveLivenessWithError(name string, processNames []string) 
 	if len(pods) == 0 {
 		return runtime.Liveness{}, nil
 	}
-	var pod *corev1.Pod
-	for i := range pods {
-		if pods[i].DeletionTimestamp == nil && pods[i].Status.Phase == corev1.PodRunning {
-			pod = &pods[i]
-			break
-		}
-	}
+	pod := firstRunningPod(pods)
 	if pod == nil {
 		return runtime.Liveness{}, nil
 	}
@@ -643,20 +637,22 @@ func (p *Provider) GetMeta(name, key string) (string, error) {
 		if len(pods) == 0 {
 			return "", runtime.ErrSessionNotFound
 		}
-		for _, pod := range pods {
-			for _, container := range pod.Spec.Containers {
-				if container.Name != "agent" {
+		pod := firstRunningPod(pods)
+		if pod == nil {
+			return "", runtime.ErrSessionNotFound
+		}
+		for _, container := range pod.Spec.Containers {
+			if container.Name != "agent" {
+				continue
+			}
+			for _, value := range container.Env {
+				if value.Name != key {
 					continue
 				}
-				for _, value := range container.Env {
-					if value.Name != key {
-						continue
-					}
-					if value.ValueFrom != nil {
-						return "", fmt.Errorf("reading k8s session %q metadata %s: %w", name, key, runtime.ErrRuntimeUnavailable)
-					}
-					return value.Value, nil
+				if value.ValueFrom != nil {
+					return "", fmt.Errorf("reading k8s session %q metadata %s: %w", name, key, runtime.ErrRuntimeUnavailable)
 				}
+				return value.Value, nil
 			}
 		}
 		return "", nil
@@ -688,6 +684,18 @@ func isPodIdentityKey(key string) bool {
 	default:
 		return false
 	}
+}
+
+// firstRunningPod selects the same serving pod for liveness and identity
+// reads. Terminating and failed replacements must not supply stale identity
+// metadata for a different live pod.
+func firstRunningPod(pods []corev1.Pod) *corev1.Pod {
+	for i := range pods {
+		if pods[i].DeletionTimestamp == nil && pods[i].Status.Phase == corev1.PodRunning {
+			return &pods[i]
+		}
+	}
+	return nil
 }
 
 // RemoveMeta removes a metadata key from the tmux environment.

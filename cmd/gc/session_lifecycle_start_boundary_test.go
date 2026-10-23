@@ -58,14 +58,20 @@ func (p *startConfirmedAbsentProvider) ObserveLivenessWithError(string, []string
 type sequencedStartLivenessProvider struct {
 	*runtime.Fake
 	observations []runtime.Liveness
+	errors       []error
 	calls        int
 }
 
 func (p *sequencedStartLivenessProvider) ObserveLivenessWithError(name string, processNames []string) (runtime.Liveness, error) {
 	if p.calls < len(p.observations) {
-		obs := p.observations[p.calls]
+		index := p.calls
+		obs := p.observations[index]
 		p.calls++
-		return obs, nil
+		var err error
+		if index < len(p.errors) {
+			err = p.errors[index]
+		}
+		return obs, err
 	}
 	return runtime.ObserveLiveness(p.Fake, name, processNames), nil
 }
@@ -259,9 +265,19 @@ func identityPlannerCandidate(t *testing.T, env *reconcilerTestEnv, state string
 
 func startIdentityRuntime(t *testing.T, env *reconcilerTestEnv, candidate startCandidate) {
 	t.Helper()
+	fence, ok := sessionpkg.InputFenceFor(candidate.info)
+	if !ok {
+		t.Fatal("candidate has no input fence")
+	}
 	if err := env.sp.Start(context.Background(), candidate.name(), runtime.Config{
 		Command:      "codex",
 		ProcessNames: []string{"codex"},
+		Env: map[string]string{
+			runtime.RuntimeEpochEnv:      fmt.Sprint(fence.Generation),
+			runtime.ContinuationEpochEnv: fmt.Sprint(fence.Epoch),
+			runtime.InstanceTokenEnv:     fence.Token,
+			"BEADS_HOLDER_TOKEN":         fence.Token,
+		},
 	}); err != nil {
 		t.Fatalf("starting existing runtime: %v", err)
 	}
@@ -392,7 +408,7 @@ func TestExecutePlannedStartsKeepsPriorIdentityWhenRuntimeAppearsAfterPreWake(t 
 	candidate, bead, tp := identityPlannerCandidate(t, env, "active")
 	env.cfg.Agents[0].PromptMode = "arg"
 	startIdentityRuntime(t, env, candidate)
-	oldToken, oldGeneration := candidate.info.InstanceToken, candidate.info.Generation
+	oldToken, oldGeneration, oldEpoch, oldLastWoke := candidate.info.InstanceToken, candidate.info.Generation, candidate.info.ContinuationEpoch, candidate.info.LastWokeAt
 	sp := &sequencedStartLivenessProvider{
 		Fake: env.sp,
 		observations: []runtime.Liveness{
@@ -405,8 +421,8 @@ func TestExecutePlannedStartsKeepsPriorIdentityWhenRuntimeAppearsAfterPreWake(t 
 		t.Fatalf("wake count = %d, want 1 for warm reuse after pre-wake race", got)
 	}
 	got := env.sessionInfo(bead.ID)
-	if got.InstanceToken != oldToken || got.Generation == oldGeneration {
-		t.Fatalf("identity after post-prewake warm reuse = (%q,%q), want prior token %q and monotonic generation above %q", got.InstanceToken, got.Generation, oldToken, oldGeneration)
+	if got.InstanceToken != oldToken || got.Generation != oldGeneration || got.ContinuationEpoch != oldEpoch || got.LastWokeAt != oldLastWoke {
+		t.Fatalf("identity after post-prewake warm reuse = (%q,%q,%q) last_woke_at=%q, want prior (%q,%q,%q) last_woke_at=%q", got.InstanceToken, got.Generation, got.ContinuationEpoch, got.LastWokeAt, oldToken, oldGeneration, oldEpoch, oldLastWoke)
 	}
 	runtimeToken, err := env.sp.GetMeta(candidate.name(), "GC_INSTANCE_TOKEN")
 	if err != nil || runtimeToken != got.InstanceToken {
@@ -428,7 +444,7 @@ func TestExecutePlannedStartsRestoresPriorIdentityAfterSessionExistsCollision(t 
 	candidate, bead, tp := identityPlannerCandidate(t, env, "active")
 	env.cfg.Agents[0].PromptMode = "arg"
 	startIdentityRuntime(t, env, candidate)
-	oldToken, oldGeneration := candidate.info.InstanceToken, candidate.info.Generation
+	oldToken, oldGeneration, oldEpoch, oldLastWoke := candidate.info.InstanceToken, candidate.info.Generation, candidate.info.ContinuationEpoch, candidate.info.LastWokeAt
 	env.sp.StartErrors[candidate.name()] = runtime.ErrSessionExists
 	sp := &sequencedStartLivenessProvider{
 		Fake: env.sp,
@@ -443,8 +459,8 @@ func TestExecutePlannedStartsRestoresPriorIdentityAfterSessionExistsCollision(t 
 		t.Fatalf("wake count = %d, want 1 after attributed session collision", got)
 	}
 	got := env.sessionInfo(bead.ID)
-	if got.InstanceToken != oldToken || got.Generation == oldGeneration {
-		t.Fatalf("identity after session collision = (%q,%q), want prior token %q and monotonic generation above %q", got.InstanceToken, got.Generation, oldToken, oldGeneration)
+	if got.InstanceToken != oldToken || got.Generation != oldGeneration || got.ContinuationEpoch != oldEpoch || got.LastWokeAt != oldLastWoke {
+		t.Fatalf("identity after session collision = (%q,%q,%q) last_woke_at=%q, want prior (%q,%q,%q) last_woke_at=%q", got.InstanceToken, got.Generation, got.ContinuationEpoch, got.LastWokeAt, oldToken, oldGeneration, oldEpoch, oldLastWoke)
 	}
 	runtimeToken, err := env.sp.GetMeta(candidate.name(), "GC_INSTANCE_TOKEN")
 	if err != nil || runtimeToken != got.InstanceToken {
@@ -452,6 +468,32 @@ func TestExecutePlannedStartsRestoresPriorIdentityAfterSessionExistsCollision(t 
 	}
 	if got.StartedConfigHash == "" || got.State != sessionpkg.StateActive {
 		t.Fatalf("collision reuse did not commit lifecycle/config state: state=%q hash=%q", got.State, got.StartedConfigHash)
+	}
+}
+
+func TestExecutePlannedStartsWarmReuseKeepsPriorFenceUsable(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	candidate, _, tp := identityPlannerCandidate(t, env, "active")
+	env.cfg.Agents[0].PromptMode = "arg"
+	startIdentityRuntime(t, env, candidate)
+	priorFence, ok := sessionpkg.InputFenceFor(candidate.info)
+	if !ok {
+		t.Fatal("candidate has no input fence")
+	}
+
+	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 1 {
+		t.Fatalf("wake count = %d, want 1 for warm reuse", got)
+	}
+	if n, _ := countNudges(env.sp); n != 1 {
+		t.Fatalf("warm claim nudge count = %d, want exactly 1", n)
+	}
+	got := env.sessionInfo(candidate.info.ID)
+	gotFence, ok := sessionpkg.InputFenceFor(got)
+	if !ok || gotFence != priorFence {
+		t.Fatalf("session fence after warm reuse = %+v (valid %v), want prior fence %+v", gotFence, ok, priorFence)
+	}
+	if err := env.sp.NudgeFenced(context.Background(), candidate.name(), runtime.TextContent("fenced after warm reuse"), runtime.FencedNudge{Fence: priorFence}); err != nil {
+		t.Fatalf("fenced nudge after warm reuse = %v, want the prior runtime fence to remain valid", err)
 	}
 }
 
@@ -651,7 +693,7 @@ func TestExecutePlannedStartsStillRecyclesZombieRuntime(t *testing.T) {
 	}
 }
 
-func TestExecutePlannedStartsRestoresIdentityForExistingK8sInitializingSession(t *testing.T) {
+func TestExecutePlannedStartsKeepsAttemptIdentityForExistingK8sInitializingSession(t *testing.T) {
 	env := newReconcilerTestEnv(t)
 	candidate, bead, tp := identityPlannerCandidate(t, env, "active")
 	setSessionCircuitBreakerForTest(t, newSessionCircuitBreaker(sessionCircuitBreakerConfig{}))
@@ -661,22 +703,24 @@ func TestExecutePlannedStartsRestoresIdentityForExistingK8sInitializingSession(t
 		t.Fatalf("wake count = %d, want 0 for initializing existing pod", got)
 	}
 	got := env.sessionInfo(bead.ID)
-	if got.InstanceToken != oldToken || got.Generation == oldGeneration {
-		t.Fatalf("identity after existing-pod initialization = (%q, %q), want prior token %q and a monotonic generation above %q", got.InstanceToken, got.Generation, oldToken, oldGeneration)
+	if got.InstanceToken == oldToken || got.Generation <= oldGeneration {
+		t.Fatalf("identity after existing-pod initialization = (%q, %q), want the minted identity retained for the initializing pod", got.InstanceToken, got.Generation)
 	}
-	if got.State != sessionpkg.StateActive || got.LastWokeAt != "" {
-		t.Fatalf("lifecycle after deferred existing pod = state %q last_woke_at %q, want active with no in-flight marker", got.State, got.LastWokeAt)
+	if got.State != sessionpkg.StateActive || got.LastWokeAt == "" {
+		t.Fatalf("lifecycle after deferred existing pod = state %q last_woke_at %q, want active with its initialization marker", got.State, got.LastWokeAt)
 	}
+	delete(env.sp.StartErrors, candidate.name())
 	candidate.info = got
-	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 0 {
-		t.Fatalf("retry wake count = %d, want 0 for initializing existing pod", got)
+	startIdentityRuntime(t, env, candidate)
+	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 1 {
+		t.Fatalf("retry wake count = %d, want 1 after the initializing runtime becomes live", got)
 	}
 	retried := env.sessionInfo(bead.ID)
-	if retried.InstanceToken != oldToken || retried.Generation <= got.Generation {
-		t.Fatalf("identity after initializing retry = (%q, %q), want prior token %q and generation above %q", retried.InstanceToken, retried.Generation, oldToken, got.Generation)
+	if retried.InstanceToken != got.InstanceToken || retried.Generation != got.Generation {
+		t.Fatalf("identity after initializing runtime converges = (%q, %q), want retained identity (%q, %q)", retried.InstanceToken, retried.Generation, got.InstanceToken, got.Generation)
 	}
 	if env.sp.CountCalls("Start", candidate.name()) != 2 {
-		t.Fatalf("Start calls = %d, want two initializing responses", env.sp.CountCalls("Start", candidate.name()))
+		t.Fatalf("Start calls = %d, want initial initializing response plus fixture runtime", env.sp.CountCalls("Start", candidate.name()))
 	}
 }
 
