@@ -1978,6 +1978,19 @@ func runPreparedStartCandidate(
 	// to false.
 	diedDuringStartup := errors.Is(err, runtime.ErrSessionDiedDuringStartup)
 	restorePreWakeIdentity := false
+	if errors.Is(err, runtime.ErrExistingSessionInitializing) && item.preWakeUndo.written != nil {
+		// A young Kubernetes Pod may be present while tmux has not initialized.
+		// Its configured Pod environment can still identify the prior runtime.
+		// Keep the old fence only when the witness exactly matches the
+		// pre-PreWake token; otherwise leave the attempted identity in place.
+		prior := item.candidate.info.ApplyPatch(sessionpkg.MetadataPatch{
+			"generation":         item.preWakeUndo.before["generation"],
+			"instance_token":     item.preWakeUndo.before["instance_token"],
+			"continuation_epoch": item.preWakeUndo.before["continuation_epoch"],
+		})
+		priorIdentity := readPendingCreateIdentityBounded(ctx, cityPath, prior, item.candidate.name(), sp)
+		restorePreWakeIdentity = priorIdentity.matchesExpectedInstanceToken()
+	}
 	if errors.Is(err, errStartCandidateReusePriorIdentity) {
 		err = nil
 		restorePreWakeIdentity = true
@@ -2169,12 +2182,12 @@ func runPreparedStartCandidate(
 		unattributedErr = unattributedStartError(err, identity)
 		err = nil
 		rollbackPending = false
-	case startCtxErr == context.DeadlineExceeded:
+	case startCtxErr == context.DeadlineExceeded && !restorePreWakeIdentity:
 		outcome = TraceOutcomeDeadlineExceeded
 		if err == nil {
 			err = fmt.Errorf("session %q startup: %w", item.candidate.name(), context.DeadlineExceeded)
 		}
-	case startCtxErr == context.Canceled:
+	case startCtxErr == context.Canceled && !restorePreWakeIdentity:
 		outcome = TraceOutcomeCanceled
 		if err == nil {
 			err = fmt.Errorf("session %q startup: %w", item.candidate.name(), context.Canceled)
@@ -2187,7 +2200,16 @@ func runPreparedStartCandidate(
 			outcome = TraceOutcomeProviderError
 		case rollbackPending:
 			outcome = TraceOutcomeSessionExists
+		case item.preWakeUndo.written != nil:
+			// Do not commit an occupied runtime whose identity does not match
+			// either the attempt or the pre-PreWake incarnation. Keep this as a
+			// retryable deferral until the owner can attribute it or it exits.
+			outcome = TraceOutcomeDeferred
+			unattributedErr = err
+			err = nil
 		default:
+			// Legacy and runtime-only rows have no minted fence to protect. Keep
+			// their established live-collision convergence behavior.
 			outcome = TraceOutcomeSessionExists
 			err = nil
 		}
@@ -2763,12 +2785,18 @@ func startPreparedStartCandidate(
 						return false, fmt.Errorf("runtime %q prior identity is unverifiable after pre-wake: %w", name, runtime.ErrRuntimeUnavailable)
 					}
 				}
-				currentIdentity := readPendingCreateIdentityBounded(ctx, cityPath, item.candidate.info, name, sp)
-				if !currentIdentity.matchesExpectedInstanceToken() {
-					if currentIdentity.attribution() == pendingCreateRuntimeUnknown {
-						return false, fmt.Errorf("runtime %q identity is unverifiable at start boundary: %w", name, runtime.ErrRuntimeUnavailable)
+				// Identity is required when this start minted an incarnation or
+				// when a pending create owns the runtime name. A legacy/runtime-only
+				// target has no persisted fence to compare, so preserve its historic
+				// already-running behavior.
+				if item.preWakeUndo.written != nil || shouldRollbackPendingCreateInfo(item.candidate.info) {
+					currentIdentity := readPendingCreateIdentityBounded(ctx, cityPath, item.candidate.info, name, sp)
+					if !currentIdentity.matchesExpectedInstanceToken() {
+						if currentIdentity.attribution() == pendingCreateRuntimeUnknown {
+							return false, fmt.Errorf("runtime %q identity is unverifiable at start boundary: %w", name, runtime.ErrRuntimeUnavailable)
+						}
+						return false, fmt.Errorf("%w: session %q has a live runtime with a different identity", runtime.ErrSessionExists, name)
 					}
-					return false, fmt.Errorf("%w: session %q has a live runtime with a different identity", runtime.ErrSessionExists, name)
 				}
 				// Warm reuse: the slot is already up, so cold Start's startup nudge
 				// never fires. If on-demand work was bound to it since it last Started
@@ -2861,7 +2889,29 @@ func startPreparedStartCandidate(
 	if err != nil {
 		return true, err
 	}
-	return true, handle.StartResolved(ctx, by, item.candidate.inc, item.cfg.Command, item.cfg)
+	err = handle.StartResolved(ctx, by, item.candidate.inc, item.cfg.Command, item.cfg)
+	if err == nil && item.preWakeUndo.written != nil {
+		// The session layer can observe IsRunning after the provider liveness
+		// check reported absent and return success without calling Provider.Start.
+		// Attribute that race before treating the result as a fresh start: if the
+		// live process still carries the pre-PreWake identity, commit warm reuse
+		// and keep its input fence intact.
+		prior := item.candidate.info.ApplyPatch(sessionpkg.MetadataPatch{
+			"generation":         item.preWakeUndo.before["generation"],
+			"instance_token":     item.preWakeUndo.before["instance_token"],
+			"continuation_epoch": item.preWakeUndo.before["continuation_epoch"],
+		})
+		priorIdentity := readPendingCreateIdentityBounded(ctx, cityPath, prior, name, sp)
+		if priorIdentity.matchesExpectedInstanceToken() {
+			deliverWarmReuseClaimNudge(ctx, store, sp, cfg, prior, warmClaim)
+			return false, errStartCandidateReusePriorIdentity
+		}
+		currentIdentity := readPendingCreateIdentityBounded(ctx, cityPath, item.candidate.info, name, sp)
+		if currentIdentity.hasConflictingInstanceIdentity() {
+			return false, fmt.Errorf("%w: session %q has a runtime with a different identity", runtime.ErrSessionExists, name)
+		}
+	}
+	return true, err
 }
 
 // deliverWarmReuseClaimNudge preserves the warm-start behavior when a
@@ -3216,12 +3266,21 @@ func commitStartResultTraced(
 			// The runtime was not created by this attempt. Restore lifecycle
 			// facts and its full prior incarnation in one fenced write.
 			restorePreWakeStateWithIdentity(result.prepared, sessFront, stderr, true)
+		} else if result.prepared.preWakeUndo.written != nil && !result.providerStartCalled {
+			// The attempted identity stays minted, but lifecycle fields and the
+			// in-flight marker return to their pre-wake state only when this
+			// attempt did not call the provider. If Start may have created a
+			// runtime, preserve PreWake lifecycle state and release only its lease.
+			restorePreWakeState(result.prepared, sessFront, stderr)
+			clearPendingStartInFlightLease(info.ID, sessFront, stderr)
+		} else if result.prepared.preWakeUndo.written != nil {
+			clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		}
-		if result.prepared.preWakeUndo.written == nil {
-			// Preparation-only deferrals did not write last_woke_at; keep the
-			// marker that protects a claimless creating row from stale aging.
-			logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, string(result.outcome), result.started, result.finished, result.unattributedErr, result.phases)
-			return startCommitFailed
+		if result.prepared.preWakeUndo.written == nil && !result.restorePreWakeIdentity {
+			// This path did not run PreWake, so the failed start does not own an
+			// in-flight marker to restore. Release the lease and keep the retry
+			// from being blocked behind this completed attempt.
+			clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		}
 		// A deferral on unknown attribution spares the runtime, not the
 		// crash-loop accounting: a provider Start that failed still delays the
@@ -3451,8 +3510,9 @@ func commitCapacityRefusal(result startResult, sessFront *sessionpkg.Store, wave
 }
 
 // preWakeRestoredKeys are the lifecycle keys PreWake overwrites that a
-// capacity refusal restores. The complete incarnation identity is restored
-// with them so a refused or safely reused start leaves old runtime fences valid.
+// capacity refusal or a start that never reached the provider restores. The
+// generation and token stay minted unless the caller positively attributes the
+// live runtime to the exact prior incarnation.
 var preWakeRestoredKeys = []string{
 	"state", "sleep_reason", "detached_at", "continuation_reset_pending",
 	"continuation_epoch", "wake_request", "wake_requested_at",
@@ -3499,6 +3559,7 @@ func newPreWakeUndo(current sessionpkg.Info, persisted map[string]string, writte
 		undo.written[key] = value
 		undo.restore[key] = persisted[key]
 	}
+	undo.restore["last_woke_at"] = ""
 	return undo
 }
 
@@ -3513,7 +3574,7 @@ func newPreWakeUndo(current sessionpkg.Info, persisted map[string]string, writte
 // landing after the re-read is not overwritten; on stores without conditional
 // writes only that read-to-write window stays unfenced.
 func restorePreWakeState(prepared preparedStart, sessFront *sessionpkg.Store, stderr io.Writer) {
-	restorePreWakeStateWithIdentity(prepared, sessFront, stderr, true)
+	restorePreWakeStateWithIdentity(prepared, sessFront, stderr, false)
 }
 
 // restorePreWakeStateWithIdentity restores lifecycle fields and, when
@@ -3598,20 +3659,6 @@ func commitStartFailure(result startResult, sessFront *sessionpkg.Store, clk clo
 	info := result.prepared.candidate.info
 	name := result.prepared.candidate.name()
 	tp := result.prepared.candidate.tp
-	// The attempt is over. Unmint only when runPreparedStartCandidate proved
-	// that the exact prior incarnation is still present; otherwise keep the
-	// attempted identity and release only this attempt's in-flight lease.
-	defer func() {
-		if result.prepared.preWakeUndo.written == nil {
-			clearPendingStartInFlightLease(info.ID, sessFront, stderr)
-			return
-		}
-		if result.restorePreWakeIdentity {
-			restorePreWakeStateWithIdentity(result.prepared, sessFront, stderr, true)
-			return
-		}
-		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
-	}()
 	fmt.Fprintf(stderr, "session reconciler: starting %s: %s\n", name, formatLifecycleError(result.err)) //nolint:errcheck
 	// Every exit from this function is a failed start attempt, so record it
 	// here once rather than at each arm below — mirrors the single call site
@@ -3726,15 +3773,31 @@ func commitStartFailure(result startResult, sessFront *sessionpkg.Store, clk clo
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, string(result.outcome), result.started, result.finished, result.err, result.phases)
 		return
 	}
+	// The failed attempt is over: restore the lifecycle fields PreWake changed,
+	// but retain its newly minted token/generation unless attribution proved the
+	// prior runtime is still alive. A relaunch of an abandoned creating row must
+	// keep its marker so the stale-creating reaper cannot close it before retry.
+	undo := result.prepared.preWakeUndo
+	relaunched := sessionpkg.State(strings.TrimSpace(undo.restore["state"])) == sessionpkg.StateCreating
+	switch {
+	case result.restorePreWakeIdentity:
+		restorePreWakeStateWithIdentity(result.prepared, sessFront, stderr, true)
+	case undo.written != nil && !relaunched:
+		restorePreWakeState(result.prepared, sessFront, stderr)
+	case undo.written == nil:
+		if err := sessFront.SetMarker(info.ID, "last_woke_at", ""); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: clearing last_woke_at for %s: %v\n", name, err) //nolint:errcheck
+		}
+	}
 	// tp.DisplayName() is the exact identity the start counter records, so a
 	// quarantine triggered by repeated start failures joins the start series
 	// even for a namepool-themed pool instance whose bead predates agent_name.
 	// The candidate.info twin is coherent for the reads recordWakeFailure makes
 	// (WakeAttemptsMetadata / SessionKey / StartedConfigHash — the last two reflecting
 	// buildPreparedStart's stale-resume clears / session_key mint via the
-	// prepareStartCandidateForCity + refreshAsyncStartResult coherence refresh). The
-	// The deferred lease release is not one of those reads, so the twin need not
-	// carry it. Terminal failure arm; discard the fold (never assign back into
+	// prepareStartCandidateForCity + refreshAsyncStartResult coherence refresh).
+	// The start lease is released by the async caller after this commit. Terminal
+	// failure arm; discard the fold (never assign back into
 	// infoByID — this is the async start goroutine). The persist lands via
 	// recordWakeFailure's ApplyPatchInfo/SetMarker writes.
 	rf := startResumeFailure(result.prepared.resumed, result.diedDuringStartup, result.prepared.candidate.info.SessionKey, result.err, result.diedPane)
@@ -4103,6 +4166,14 @@ func (r pendingCreateIdentity) attribution() pendingCreateAttribution {
 // ID/generation compatibility semantics.
 func (r pendingCreateIdentity) matchesExpectedInstanceToken() bool {
 	return r.token == runtimeTokenMatch && r.id != runtimeTokenMismatch && r.id != runtimeTokenGone
+}
+
+// hasConflictingInstanceIdentity reports only positive evidence that the
+// runtime belongs to another session or incarnation. Missing and temporarily
+// unreadable metadata do not prove a conflict; fresh-start success retains its
+// prior behavior for providers that do not expose identity metadata.
+func (r pendingCreateIdentity) hasConflictingInstanceIdentity() bool {
+	return r.id == runtimeTokenMismatch || r.token == runtimeTokenMismatch
 }
 
 // pendingCreateCollisionAttribution is deliberately local to a live

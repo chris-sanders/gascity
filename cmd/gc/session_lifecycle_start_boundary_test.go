@@ -76,6 +76,38 @@ func (p *sequencedStartLivenessProvider) ObserveLivenessWithError(name string, p
 	return runtime.ObserveLiveness(p.Fake, name, processNames), nil
 }
 
+// initializingPriorIdentityProvider models a provider that refuses to start
+// over a young runtime, while its pod/container metadata still identifies the
+// incarnation that existed before PreWake.
+type initializingPriorIdentityProvider struct {
+	*runtime.Fake
+	identity map[string]string
+	startErr error
+	live     bool
+	starts   int
+}
+
+func (p *initializingPriorIdentityProvider) IsRunning(string) bool { return p.live }
+
+func (p *initializingPriorIdentityProvider) ObserveLivenessWithError(string, []string) (runtime.Liveness, error) {
+	return runtime.Liveness{Running: p.live, Alive: p.live}, nil
+}
+
+func (p *initializingPriorIdentityProvider) GetMeta(_ string, key string) (string, error) {
+	if value, ok := p.identity[key]; ok {
+		return value, nil
+	}
+	return "", nil
+}
+
+func (p *initializingPriorIdentityProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	p.starts++
+	if p.startErr != nil {
+		return p.startErr
+	}
+	return p.Fake.Start(ctx, name, cfg)
+}
+
 func TestExecutePreparedStartWaveUsesWorkerBoundaryForKnownSession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
@@ -245,6 +277,10 @@ func identityPlannerCandidate(t *testing.T, env *reconcilerTestEnv, state string
 	t.Helper()
 	configureAlwaysNamedSession(env)
 	bead := createCircuitTestNamedSession(t, env, state)
+	trigger, err := env.store.Create(beads.Bead{Title: "work", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("creating trigger work bead: %v", err)
+	}
 	tp := TemplateParams{
 		Command:      "codex",
 		SessionName:  "session-a",
@@ -255,7 +291,7 @@ func identityPlannerCandidate(t *testing.T, env *reconcilerTestEnv, state string
 		"generation":                      "1",
 		"instance_token":                  "row-token",
 		"pool_managed":                    "true",
-		beadmeta.TriggerBeadIDMetadataKey: "work-1",
+		beadmeta.TriggerBeadIDMetadataKey: trigger.ID,
 	})
 	if state == "active" {
 		env.setSessionMetadata(&bead, map[string]string{"last_woke_at": env.clk.Now().UTC().Format(time.RFC3339)})
@@ -468,6 +504,51 @@ func TestExecutePlannedStartsRestoresPriorIdentityAfterSessionExistsCollision(t 
 	}
 	if got.StartedConfigHash == "" || got.State != sessionpkg.StateActive {
 		t.Fatalf("collision reuse did not commit lifecycle/config state: state=%q hash=%q", got.State, got.StartedConfigHash)
+	}
+}
+
+func TestExecutePlannedStartsDefersWhenSessionLayerFindsForeignRuntime(t *testing.T) {
+	env := newReconcilerTestEnv(t)
+	candidate, bead, tp := identityPlannerCandidate(t, env, "active")
+	env.cfg.Agents[0].PromptMode = "arg"
+	if err := env.sp.Start(context.Background(), candidate.name(), runtime.Config{
+		Command:      "codex",
+		ProcessNames: []string{"codex"},
+	}); err != nil {
+		t.Fatalf("starting foreign runtime: %v", err)
+	}
+	for key, value := range map[string]string{
+		"GC_SESSION_ID":     candidate.info.ID,
+		"GC_INSTANCE_TOKEN": "foreign-token",
+		"GC_RUNTIME_EPOCH":  "99",
+	} {
+		if err := env.sp.SetMeta(candidate.name(), key, value); err != nil {
+			t.Fatalf("setting foreign runtime identity %s: %v", key, err)
+		}
+	}
+	sp := &sequencedStartLivenessProvider{
+		Fake: env.sp,
+		observations: []runtime.Liveness{
+			{},                           // preparation's stale snapshot
+			{},                           // start-boundary stale snapshot
+			{Running: true, Alive: true}, // provider sees the existing process after StartResolved
+			{Running: true, Alive: true}, // collision attribution
+		},
+	}
+
+	if got := runIdentityPlannerWithProvider(t, env, candidate, tp, false, sp); got != 0 {
+		t.Fatalf("wake count = %d, want a deferral without committing the foreign runtime", got)
+	}
+	got := env.sessionInfo(bead.ID)
+	if got.StartedConfigHash != candidate.info.StartedConfigHash {
+		t.Fatalf("started_config_hash = %q, want the prior value %q after foreign-runtime deferral", got.StartedConfigHash, candidate.info.StartedConfigHash)
+	}
+	if got.State != sessionpkg.StateActive || got.LastWokeAt != "" {
+		t.Fatalf("session lifecycle after foreign-runtime deferral = (%q, %q), want active with released in-flight marker", got.State, got.LastWokeAt)
+	}
+	runtimeToken, err := env.sp.GetMeta(candidate.name(), "GC_INSTANCE_TOKEN")
+	if err != nil || runtimeToken != "foreign-token" {
+		t.Fatalf("foreign runtime token = %q (err %v), want it left untouched", runtimeToken, err)
 	}
 }
 
@@ -693,34 +774,42 @@ func TestExecutePlannedStartsStillRecyclesZombieRuntime(t *testing.T) {
 	}
 }
 
-func TestExecutePlannedStartsKeepsAttemptIdentityForExistingK8sInitializingSession(t *testing.T) {
+func TestExecutePlannedStartsRestoresPriorIdentityForExistingK8sInitializingSession(t *testing.T) {
 	env := newReconcilerTestEnv(t)
 	candidate, bead, tp := identityPlannerCandidate(t, env, "active")
 	setSessionCircuitBreakerForTest(t, newSessionCircuitBreaker(sessionCircuitBreakerConfig{}))
-	oldToken, oldGeneration := candidate.info.InstanceToken, candidate.info.Generation
-	env.sp.StartErrors[candidate.name()] = fmt.Errorf("%w: %w: young pod", runtime.ErrSessionInitializing, runtime.ErrExistingSessionInitializing)
-	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 0 {
+	old := candidate.info
+	sp := &initializingPriorIdentityProvider{
+		Fake: env.sp,
+		identity: map[string]string{
+			"GC_SESSION_ID":     old.ID,
+			"GC_INSTANCE_TOKEN": old.InstanceToken,
+			"GC_RUNTIME_EPOCH":  old.Generation,
+		},
+		startErr: fmt.Errorf("%w: %w: young pod", runtime.ErrSessionInitializing, runtime.ErrExistingSessionInitializing),
+	}
+	if got := runIdentityPlannerWithProvider(t, env, candidate, tp, false, sp); got != 0 {
 		t.Fatalf("wake count = %d, want 0 for initializing existing pod", got)
 	}
 	got := env.sessionInfo(bead.ID)
-	if got.InstanceToken == oldToken || got.Generation <= oldGeneration {
-		t.Fatalf("identity after existing-pod initialization = (%q, %q), want the minted identity retained for the initializing pod", got.InstanceToken, got.Generation)
+	if got.InstanceToken != old.InstanceToken || got.Generation != old.Generation || got.ContinuationEpoch != old.ContinuationEpoch {
+		t.Fatalf("identity after existing-pod initialization = (%q, %q, %q), want prior (%q, %q, %q)", got.InstanceToken, got.Generation, got.ContinuationEpoch, old.InstanceToken, old.Generation, old.ContinuationEpoch)
 	}
-	if got.State != sessionpkg.StateActive || got.LastWokeAt == "" {
-		t.Fatalf("lifecycle after deferred existing pod = state %q last_woke_at %q, want active with its initialization marker", got.State, got.LastWokeAt)
+	if got.State != sessionpkg.StateActive || got.LastWokeAt != old.LastWokeAt {
+		t.Fatalf("lifecycle after deferred existing pod = state %q last_woke_at %q, want prior active state and marker %q", got.State, got.LastWokeAt, old.LastWokeAt)
 	}
-	delete(env.sp.StartErrors, candidate.name())
 	candidate.info = got
-	startIdentityRuntime(t, env, candidate)
-	if got := runIdentityPlanner(t, env, candidate, tp, false); got != 1 {
+	sp.startErr = nil
+	sp.live = true
+	if got := runIdentityPlannerWithProvider(t, env, candidate, tp, false, sp); got != 1 {
 		t.Fatalf("retry wake count = %d, want 1 after the initializing runtime becomes live", got)
 	}
 	retried := env.sessionInfo(bead.ID)
-	if retried.InstanceToken != got.InstanceToken || retried.Generation != got.Generation {
-		t.Fatalf("identity after initializing runtime converges = (%q, %q), want retained identity (%q, %q)", retried.InstanceToken, retried.Generation, got.InstanceToken, got.Generation)
+	if retried.InstanceToken != old.InstanceToken || retried.Generation != old.Generation || retried.ContinuationEpoch != old.ContinuationEpoch {
+		t.Fatalf("identity after initializing runtime converges = (%q, %q, %q), want retained identity (%q, %q, %q)", retried.InstanceToken, retried.Generation, retried.ContinuationEpoch, old.InstanceToken, old.Generation, old.ContinuationEpoch)
 	}
-	if env.sp.CountCalls("Start", candidate.name()) != 2 {
-		t.Fatalf("Start calls = %d, want initial initializing response plus fixture runtime", env.sp.CountCalls("Start", candidate.name()))
+	if sp.starts != 1 {
+		t.Fatalf("Start calls = %d, want only the initial initializing response", sp.starts)
 	}
 }
 
