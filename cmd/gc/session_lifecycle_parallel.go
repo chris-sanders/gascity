@@ -3262,18 +3262,19 @@ func commitStartResultTraced(
 	// Session startup is not yet safe to decide — back off silently without
 	// recording failure. The reconciler will retry on the next patrol tick.
 	if startOutcomeDefersCommit(result.outcome) {
-		if result.restorePreWakeIdentity {
+		switch {
+		case result.restorePreWakeIdentity:
 			// The runtime was not created by this attempt. Restore lifecycle
 			// facts and its full prior incarnation in one fenced write.
 			restorePreWakeStateWithIdentity(result.prepared, sessFront, stderr, true)
-		} else if result.prepared.preWakeUndo.written != nil && !result.providerStartCalled {
+		case result.prepared.preWakeUndo.written != nil && !result.providerStartCalled:
 			// The attempted identity stays minted, but lifecycle fields and the
 			// in-flight marker return to their pre-wake state only when this
 			// attempt did not call the provider. If Start may have created a
 			// runtime, preserve PreWake lifecycle state and release only its lease.
 			restorePreWakeState(result.prepared, sessFront, stderr)
 			clearPendingStartInFlightLease(info.ID, sessFront, stderr)
-		} else if result.prepared.preWakeUndo.written != nil {
+		case result.prepared.preWakeUndo.written != nil:
 			clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		}
 		if result.prepared.preWakeUndo.written == nil && !result.restorePreWakeIdentity {

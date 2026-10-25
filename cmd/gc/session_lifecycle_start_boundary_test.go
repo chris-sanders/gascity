@@ -81,16 +81,17 @@ func (p *sequencedStartLivenessProvider) ObserveLivenessWithError(name string, p
 // incarnation that existed before PreWake.
 type initializingPriorIdentityProvider struct {
 	*runtime.Fake
-	identity map[string]string
-	startErr error
-	live     bool
-	starts   int
+	identity    map[string]string
+	startErr    error
+	livenessErr error
+	live        bool
+	starts      int
 }
 
 func (p *initializingPriorIdentityProvider) IsRunning(string) bool { return p.live }
 
 func (p *initializingPriorIdentityProvider) ObserveLivenessWithError(string, []string) (runtime.Liveness, error) {
-	return runtime.Liveness{Running: p.live, Alive: p.live}, nil
+	return runtime.Liveness{Running: p.live, Alive: p.live}, p.livenessErr
 }
 
 func (p *initializingPriorIdentityProvider) GetMeta(_ string, key string) (string, error) {
