@@ -2142,7 +2142,7 @@ func runPreparedStartCandidate(
 			// converge the create either.
 			if runtimeObservationLive(sessionExistsObservation) {
 				attribution = pendingCreateCollisionAttribution(identity)
-			} else if sessionExistsObservationErr == nil {
+			} else if sessionExistsObservationErr == nil && attribution != pendingCreateRuntimeUnknown {
 				attribution = pendingCreateRuntimeForeign
 			}
 		}

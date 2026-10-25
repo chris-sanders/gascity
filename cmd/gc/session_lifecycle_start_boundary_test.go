@@ -288,6 +288,7 @@ func identityPlannerCandidate(t *testing.T, env *reconcilerTestEnv, state string
 		Hints:        agent.StartupHints{ProcessNames: []string{"codex"}},
 	}
 	env.setSessionMetadata(&bead, map[string]string{
+		"template":                        "rig-a/template-a",
 		"generation":                      "1",
 		"instance_token":                  "row-token",
 		"pool_managed":                    "true",
