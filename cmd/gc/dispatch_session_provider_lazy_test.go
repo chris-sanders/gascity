@@ -90,10 +90,10 @@ func TestControlDispatchBuildsNoSessionProviderUnlessARetryRecycles(t *testing.T
 }
 
 // TestControlDispatcherReportsABrokenSessionProviderConfigAtStartup pins the
-// other half of the lazy provider: a session provider that cannot be built
-// still fails the control dispatcher fast, at startup and with a clear error,
-// before it serves any control -- not later, on the first retry that recycles.
-// A provider that builds lets the dispatcher start and serve.
+// non-managed path: a session provider that cannot be built still fails fast,
+// at startup and with a clear error, before it serves any control -- not later,
+// on the first retry that recycles. A provider that builds lets the dispatcher
+// start and serve.
 func TestControlDispatcherReportsABrokenSessionProviderConfigAtStartup(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -148,4 +148,54 @@ func TestControlDispatcherReportsABrokenSessionProviderConfigAtStartup(t *testin
 	if scans == 0 {
 		t.Fatal("dispatcher with a working provider never scanned")
 	}
+}
+
+// TestManagedControlDispatcherSkipsLiveK8sProviderConstruction pins the
+// controller-owned runtime boundary: the managed dispatcher validates its
+// loaded config but does not try to construct a Kubernetes client from a Pod
+// that intentionally has neither an in-cluster token nor a kubeconfig.
+func TestManagedControlDispatcherSkipsLiveK8sProviderConstruction(t *testing.T) {
+	clearGCEnv(t)
+	clearKubernetesClientConfigForDispatchTest(t)
+	t.Setenv("GC_SESSION_ID", "de-wisp-test")
+
+	cfg := &config.City{}
+	cfg.Session.Provider = "k8s"
+	if err := validateDispatchSessionProviderConfig(cfg, t.TempDir()); err != nil {
+		t.Fatalf("managed dispatcher validation without Kubernetes credentials: %v", err)
+	}
+}
+
+func TestManagedControlDispatcherStillChecksStaticProviderConfig(t *testing.T) {
+	clearGCEnv(t)
+	clearKubernetesClientConfigForDispatchTest(t)
+	t.Setenv("GC_SESSION_ID", "de-wisp-test")
+
+	cfg := &config.City{}
+	cfg.Session.Provider = "k8s"
+	cfg.Session.K8s.SecretEnv = []config.K8sSecretEnv{{Name: "bad-name", Secret: "token", Key: "key"}}
+	err := validateDispatchSessionProviderConfig(cfg, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "not a valid environment variable name") {
+		t.Fatalf("managed dispatcher validation error = %v, want static Secret projection validation", err)
+	}
+}
+
+// Controller-side provider construction remains credential-backed. Managed
+// dispatchers skip this constructor at startup; constructing the configured
+// K8s provider directly still returns the ordinary client-config error.
+func TestK8sSessionProviderConstructionStillRequiresClientConfig(t *testing.T) {
+	clearGCEnv(t)
+	clearKubernetesClientConfigForDispatchTest(t)
+	_, err := k8sProviderFromSession(config.K8sConfig{})
+	if err == nil || !strings.Contains(err.Error(), "building K8s config") {
+		t.Fatalf("K8s provider construction error = %v, want missing client config", err)
+	}
+}
+
+func clearKubernetesClientConfigForDispatchTest(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "missing-kubeconfig"))
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 }

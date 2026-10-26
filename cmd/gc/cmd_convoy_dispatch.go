@@ -368,9 +368,22 @@ func runControlDispatcherDeferringEmits(cityPath, storePath string, store beads.
 // broken [session] config fails the dispatcher at startup with a clear error
 // instead of surfacing only when a retry first recycles a session. It builds the
 // provider from config alone, without the session snapshot the recycle path
-// reads, so it costs no bd call.
+// reads, so it costs no bd call. A managed dispatcher is different: its
+// provider is owned by the controller, and its worker Pod intentionally has no
+// Kubernetes credentials. For that process, keep the config-only checks but do
+// not construct a live provider; a retry that actually needs recycling will
+// report its controller-provider error through the normal per-control path.
 func validateDispatchSessionProviderConfig(cfg *config.City, cityPath string) error {
 	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
+	if strings.TrimSpace(os.Getenv("GC_SESSION_ID")) != "" {
+		if _, err := runtimeRegistryForCity(cfg); err != nil {
+			return fmt.Errorf("control dispatcher: session provider config is invalid: %w", err)
+		}
+		if err := config.ValidateK8sSecretProjection(cfg, "control dispatcher"); err != nil {
+			return fmt.Errorf("control dispatcher: session provider config is invalid: %w", err)
+		}
+		return nil
+	}
 	sp, err := newSessionProviderFromContext(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("control dispatcher: session provider config is invalid (retry session recycling would fail): constructing session provider: %w", err)
