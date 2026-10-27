@@ -1114,6 +1114,7 @@ func TestBuildPodEnvRemapsVars(t *testing.T) {
 		"GC_PACK_STATE_DIR":                   "/host/city/.gc/runtime/packs/rlm",
 		"GC_PACK_DIR":                         "/host/city/packs/maintenance",
 		"GC_SESSION":                          "exec:gc-session-k8s",
+		"GC_K8S_WORKER_POD":                   "spoofed",
 		"GC_BEADS":                            "exec:something",
 		"GC_EVENTS":                           "exec:other",
 		"GC_DOLT_HOST":                        "",
@@ -1134,8 +1135,15 @@ func TestBuildPodEnvRemapsVars(t *testing.T) {
 	env := mustBuildPodEnv(t, cfgEnv, "/workspace/rig", podManagedDoltHost, podManagedDoltPort)
 
 	envMap := map[string]string{}
+	workerMarkerCount := 0
 	for _, e := range env {
 		envMap[e.Name] = e.Value
+		if e.Name == config.K8sWorkerPodMarkerEnv {
+			workerMarkerCount++
+		}
+	}
+	if workerMarkerCount != 1 || envMap[config.K8sWorkerPodMarkerEnv] != "true" {
+		t.Fatalf("generated Kubernetes worker marker = (%d, %q), want (1, true)", workerMarkerCount, envMap[config.K8sWorkerPodMarkerEnv])
 	}
 
 	// GC_CITY should be remapped to /workspace.

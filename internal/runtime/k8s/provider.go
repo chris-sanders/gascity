@@ -249,6 +249,22 @@ func parseSchedulingEnv() (schedulingFields, error) {
 	return scheduling, nil
 }
 
+// ValidateStaticConfig validates Kubernetes provider settings without loading
+// credentials or constructing a live Kubernetes client. Managed worker
+// processes use this before deferring provider construction to the controller.
+func ValidateStaticConfig(config PodSecurityConfig) error {
+	if _, err := resolvePodSecurityConfig(config); err != nil {
+		return err
+	}
+	if _, _, err := managedServiceAlias(); err != nil {
+		return err
+	}
+	if _, err := parseSchedulingEnv(); err != nil {
+		return err
+	}
+	return nil
+}
+
 // newProviderWithOps creates a provider with a custom k8sOps (for testing).
 func newProviderWithOps(ops k8sOps) *Provider {
 	return &Provider{

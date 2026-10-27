@@ -28,6 +28,7 @@ import (
 	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionk8s "github.com/gastownhall/gascity/internal/runtime/k8s"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 	"github.com/gastownhall/gascity/internal/storeref"
 	"github.com/spf13/cobra"
@@ -368,15 +369,22 @@ func runControlDispatcherDeferringEmits(cityPath, storePath string, store beads.
 // broken [session] config fails the dispatcher at startup with a clear error
 // instead of surfacing only when a retry first recycles a session. It builds the
 // provider from config alone, without the session snapshot the recycle path
-// reads, so it costs no bd call. A managed dispatcher is different: its
+// reads, so it costs no bd call. A marked Kubernetes worker is different: its
 // provider is owned by the controller, and its worker Pod intentionally has no
-// Kubernetes credentials. For that process, keep the config-only checks but do
+// Kubernetes credentials. For that process, keep the static K8s checks but do
 // not construct a live provider; a retry that actually needs recycling will
 // report its controller-provider error through the normal per-control path.
 func validateDispatchSessionProviderConfig(cfg *config.City, cityPath string) error {
 	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
-	if strings.TrimSpace(os.Getenv("GC_SESSION_ID")) != "" {
+	if isK8sManagedWorker(ctx.providerName) {
 		if _, err := runtimeRegistryForCity(cfg); err != nil {
+			return fmt.Errorf("control dispatcher: session provider config is invalid: %w", err)
+		}
+		if err := sessionk8s.ValidateStaticConfig(sessionk8s.PodSecurityConfig{
+			RunAsUser:  ctx.sc.K8s.RunAsUser,
+			RunAsGroup: ctx.sc.K8s.RunAsGroup,
+			FSGroup:    ctx.sc.K8s.FSGroup,
+		}); err != nil {
 			return fmt.Errorf("control dispatcher: session provider config is invalid: %w", err)
 		}
 		if err := config.ValidateK8sSecretProjection(cfg, "control dispatcher"); err != nil {
@@ -392,6 +400,16 @@ func validateDispatchSessionProviderConfig(cfg *config.City, cityPath string) er
 		return fmt.Errorf("control dispatcher: session provider config is invalid: no provider for %q", ctx.providerName)
 	}
 	return nil
+}
+
+// isK8sManagedWorker identifies only an agent Pod created by the Kubernetes
+// provider. GC_SESSION_ID alone is shared by local managed sessions and cannot
+// distinguish this credential boundary.
+func isK8sManagedWorker(providerName string) bool {
+	if strings.TrimSpace(os.Getenv("GC_SESSION_ID")) == "" || os.Getenv(config.K8sWorkerPodMarkerEnv) != "true" {
+		return false
+	}
+	return providerName == "k8s" || providerName == "hybrid"
 }
 
 // recycleDispatchSubjectSession returns the RecycleSession hook for a retry
