@@ -63,6 +63,7 @@ go_test(
         "//internal/citylayout",
         "//internal/config",
         "//internal/runtime",
+        "//internal/runtime/runtimetest",
         "//internal/shellquote",
         "//internal/suspensionstate",
         "//internal/testenv",
