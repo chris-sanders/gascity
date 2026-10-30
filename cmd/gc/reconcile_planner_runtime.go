@@ -1,11 +1,13 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,13 +23,14 @@ import (
 
 // Boot states, for the pass record and the startup watchdog.
 const (
-	plannerBootCensus  = "census" // C11's boot census has not passed
-	plannerBootGate    = "gate"   // no pass has completed with the boot gate open
-	plannerBootReady   = "ready"
-	plannerBootNoStore = "no-store" // no bead store: boot never runs (MAINT-003)
+	plannerBootCapabilities = "capabilities" // C0.7's read of the class stores has not passed
+	plannerBootCensus       = "census"       // C11's boot census has not passed
+	plannerBootGate         = "gate"         // no pass has completed with the boot gate open
+	plannerBootReady        = "ready"
+	plannerBootNoStore      = "no-store" // no bead store: boot never runs (MAINT-003)
 )
 
-// The boot census retry backoff (laneBackoff).
+// The boot read retry backoff (laneBackoff).
 const (
 	v2LaneBaseBackoff = time.Second
 	v2LaneMaxBackoff  = 30 * time.Second
@@ -38,16 +41,22 @@ var errV2Stopped = errors.New("v2 reconciler: stopped before ready")
 
 // plannerHost is the only way the planner reaches the city (F2). bindHost
 // fills gather's Env and Recording; only publishEnv calls snapshotEnv; a nil
-// bootCensus skips C11's check.
+// bootCensus skips C11's check, and a nil capabilities C0.7's.
 type plannerHost struct {
 	gather           gatherEnv
 	snapshotEnv      func() (*config.City, runtime.Provider, string)
 	setInventoryHook func(fn func(prev, next *ObservationSnapshot))
 	bootCensus       func() (v2SessionMigration, error)
+	capabilities     func() error
 	beginTrace       func(trigger string) *sessionReconcilerTraceCycle // off the controller goroutine
+	inventoryFields  func() map[string]any                             // the pass record's view of the inventory lane
 	safeTick         func(fn func(), trigger string) (panicked bool)
 	rec              events.Recorder
 	stderr           io.Writer
+	// preserveSessions reports a shutdown that leaves the city's sessions
+	// running for the next boot to adopt (a supervisor's restart).
+	preserveSessions func() bool
+	stranded         *strandedClaimAlerts // the controller's (strandedClaimAlerter)
 }
 
 // plannerRuntime owns the planner and what runs beside it. mu orders
@@ -58,9 +67,9 @@ type plannerRuntime struct {
 	exec    *effectExecutor
 	lane    atomic.Pointer[externalReadsLane] // built at start
 	env     atomic.Pointer[reconcileEnv]
-	// softReload amends a reload's reply; v2SoftReloadUnavailable until C7c
-	// hands the planner a soft-reload request instead (v5 M2).
-	softReload func(intent reloadIntent, r *reloadControlReply)
+	// softReload amends a reload's reply (acceptSoftReload, v5 M2).
+	softReload func(ctx context.Context, intent reloadIntent, r *reloadControlReply)
+	capable    atomic.Bool   // C0.7's read of the class stores passed
 	census     atomic.Bool   // C11's boot census passed
 	ready      chan struct{} // closed by the first completed pass with the gate open
 	readyOnce  sync.Once
@@ -78,9 +87,14 @@ func newDefaultPlanner(stderr io.Writer) *plannerRuntime {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	rt := &plannerRuntime{host: plannerHost{stderr: stderr}, softReload: v2SoftReloadUnavailable, ready: make(chan struct{})}
-	rt.exec = newEffectExecutor(func(rowKey, error) {}, stderr)
+	rt := &plannerRuntime{host: plannerHost{stderr: stderr}, ready: make(chan struct{})}
+	rt.exec = newEffectExecutor(func(s settlement) { rt.planner.settlements.post(s) }, stderr)
+	rt.exec.preserve = func() bool { return rt.host.preserveSessions != nil && rt.host.preserveSessions() }
 	rt.planner = newPlanner(realPlannerClock{}, func() time.Duration { return rt.env.Load().patrol() }, rt.pass, newInflightMap(), rt.exec.stop, stderr)
+	rt.softReload = rt.acceptSoftReload
+	if v2EffectsReal {
+		rt.planner.effects = rt.exec
+	}
 	return rt
 }
 
@@ -102,6 +116,7 @@ func (rt *plannerRuntime) bindHost(h plannerHost) {
 		}
 		return nil
 	}
+	h.gather.WakeReads = rt.wakeReads
 	h.gather.ReadyWaits = func() map[string]bool {
 		if l := rt.lane.Load(); l != nil {
 			return l.readyWaitSet()
@@ -109,6 +124,17 @@ func (rt *plannerRuntime) bindHost(h plannerHost) {
 		return nil
 	}
 	rt.host = h
+	rt.planner.rec, rt.planner.observations, rt.planner.capacity = h.rec, h.gather.Observations, h.gather.Capacity
+	rt.planner.stranded = h.stranded
+	rt.planner.emitRecord = rt.emitPassRecord
+	creates, err := newCreateEffects(createEffectHost{cityPath: h.gather.CityPath, cityName: h.gather.CityName, lookPath: h.gather.LookPath, stderr: h.stderr})
+	if err != nil {
+		fmt.Fprintf(h.stderr, "v2 planner: creates disabled: %v\n", err) //nolint:errcheck // best-effort stderr
+	}
+	rt.planner.creates = creates
+	if stagingSeam != nil {
+		rt.planner.seam = stagingSeam(h.gather.CityPath)
+	}
 }
 
 // publishEnv publishes the host's config as the next generation unless the
@@ -130,12 +156,33 @@ func (rt *plannerRuntime) publishEnv() *reconcileEnv {
 	return e
 }
 
-// boot publishes env Gen 1, refuses enterprise-era session rows on a live
-// census (C11; a failed census is retried with backoff, as an error is not
-// an empty city), starts the planner, and returns once a pass has completed
-// with the boot gate open (CONTRACT v5 P2), or with ctx's error. It is
-// idempotent, so a startup retry after a panic resumes it (MAINT-005).
+// boot refuses stores that cannot fence (C0.7; a store C0.7 could not read
+// is retried with backoff, as a failed read is no verdict on the store),
+// publishes env Gen 1, refuses enterprise-era session rows on a live census
+// (C11; a failed census is retried with backoff, as an error is not an empty
+// city), starts the planner, and returns once a pass has completed with the
+// boot gate open (CONTRACT v5 P2), or with ctx's error. It is idempotent, so a
+// startup retry after a panic resumes it (MAINT-005).
 func (rt *plannerRuntime) boot(ctx context.Context) error {
+	for failures := 0; !rt.capable.Load(); {
+		var verdict error
+		if rt.host.capabilities != nil {
+			verdict = rt.host.capabilities()
+		}
+		var unread *v2CapabilityUnreadError
+		if !errors.As(verdict, &unread) {
+			if verdict != nil {
+				rt.planner.alert(alertBootRefused, "", verdict.Error())
+				return verdict
+			}
+			rt.capable.Store(true)
+			break
+		}
+		failures++
+		if err := rt.bootBackoff(ctx, failures, "C0.7 store read", verdict); err != nil {
+			return err
+		}
+	}
 	if rt.env.Load() == nil {
 		rt.publishEnv()
 	}
@@ -147,20 +194,15 @@ func (rt *plannerRuntime) boot(ctx context.Context) error {
 		}
 		if err == nil {
 			if refusal := m.refusal(); refusal != nil {
+				rt.planner.alert(alertBootRefused, "", refusal.Error())
 				return refusal
 			}
 			rt.census.Store(true)
 			break
 		}
 		failures++
-		d := laneBackoff(failures, rand.Float64)
-		fmt.Fprintf(rt.host.stderr, "v2 planner: boot census failed (retry in %s): %v\n", d.Round(time.Millisecond), err) //nolint:errcheck // best-effort stderr
-		t := time.NewTimer(d)
-		select {
-		case <-t.C:
-		case <-ctx.Done():
-			t.Stop()
-			return ctx.Err()
+		if err := rt.bootBackoff(ctx, failures, "boot census", err); err != nil {
+			return err
 		}
 	}
 	if !rt.start(ctx) {
@@ -190,6 +232,7 @@ func (rt *plannerRuntime) start(parent context.Context) bool {
 	rt.cancel = cancel
 	h := rt.host
 	lane := newExternalReadsLane(rt.env.Load().patrol(), h.gather.externalReadsEnv, func() { rt.planner.markDirty("external-reads") }, h.safeTick, h.rec, h.stderr)
+	lane.stranded = h.stranded
 	lane.addWaitsStep()
 	lane.addPoolSteps(rt.planner.out.summary.Load, rt.planner.postExecutionStalled)
 	rt.lane.Store(lane)
@@ -203,6 +246,15 @@ func (rt *plannerRuntime) start(parent context.Context) bool {
 	rt.laneDone = lane.start(ctx)
 	go rt.planner.run(ctx)
 	return true
+}
+
+// wakeReads asks the lane for a pass, so a poke or a reload reaches the
+// legs and custom scale_checks it reads without waiting out the patrol. It
+// never blocks, and does nothing before start.
+func (rt *plannerRuntime) wakeReads() {
+	if l := rt.lane.Load(); l != nil {
+		l.wake()
+	}
 }
 
 // waitDependencyClosed runs the lane's waits step alone when a pending deps
@@ -222,10 +274,10 @@ func (rt *plannerRuntime) pass(now time.Time) passResult {
 	if rec.Err != "" {
 		return res
 	}
-	if b := rt.planner.boot; b.CachePrimed && b.InventoryComplete && b.RecordingSeen {
+	if rt.planner.boot.open() {
 		rt.readyOnce.Do(func() { close(rt.ready) })
 	}
-	rt.traceRows(rec.Rows)
+	rt.traceRows(append(slices.Clone(rec.Rows), rec.IdleTraces...))
 	return res
 }
 
@@ -236,7 +288,7 @@ func (rt *plannerRuntime) traceRows(rows []rowTrace) {
 	}
 	t := rt.host.beginTrace("v2-pass")
 	for _, r := range rows {
-		t.RecordDecision(TraceSiteV2SessionDecision, TraceReasonCode(r.Reason), TraceOutcomeCode(r.Outcome), r.Template, r.SessionName, map[string]any{
+		t.RecordDecision(cmp.Or(r.Site, TraceSiteV2SessionDecision), TraceReasonCode(r.Reason), TraceOutcomeCode(r.Outcome), r.Template, r.SessionName, map[string]any{
 			"key": r.Key.Leg + "/" + r.Key.ID,
 		})
 	}
@@ -276,6 +328,8 @@ func (rt *plannerRuntime) bootState() string {
 	switch {
 	case rt.noStore.Load():
 		return plannerBootNoStore
+	case !rt.capable.Load():
+		return plannerBootCapabilities
 	case !rt.census.Load():
 		return plannerBootCensus
 	}
@@ -287,19 +341,15 @@ func (rt *plannerRuntime) bootState() string {
 	}
 }
 
-// passRecord is a maintenance tick's reconcile_pass record: what boot waits
-// on, the passes and their wakes, what admission let through and held back
-// (submitted by nothing while trace-only), and legacyEntries, the refused
-// legacy session entries, which must stay 0. OBS1 owns the published record.
+// passRecord is a maintenance tick's reconcile_pass record, a summary of
+// the planner's v2_pass record (emitPassRecord): what boot waits on, the
+// passes and their wakes, what admission let through and held back, and
+// legacyEntries, the refused legacy session entries, which must stay 0.
 func (rt *plannerRuntime) passRecord(now time.Time, legacyEntries int64) map[string]any {
 	m := rt.planner.metrics.snapshot(now)
-	deferred := make(map[string]uint64, len(m.Deferred))
-	for d, n := range m.Deferred {
-		deferred[d.Kind+"/"+d.Cause] = n
-	}
 	return map[string]any{
 		"boot": rt.bootState(), "legacy_session_entries": legacyEntries, "passes": m.Passes,
-		"wakes": m.Wakes, "admitted": m.Admitted, "deferred": deferred,
+		"wakes": m.Wakes, "admitted": m.Admitted, "deferred": deferralKeys(m.Deferred),
 	}
 }
 
@@ -311,4 +361,19 @@ func laneBackoff(failures int, rand func() float64) time.Duration {
 	}
 	d = min(d, v2LaneMaxBackoff)
 	return time.Duration(float64(d) * (1 + v2Jitter*(2*rand()-1)))
+}
+
+// bootBackoff reports a failed boot read and waits out its backoff, or
+// returns ctx's error.
+func (rt *plannerRuntime) bootBackoff(ctx context.Context, failures int, what string, err error) error {
+	d := laneBackoff(failures, rand.Float64)
+	fmt.Fprintf(rt.host.stderr, "v2 planner: %s failed (retry in %s): %v\n", what, d.Round(time.Millisecond), err) //nolint:errcheck // best-effort stderr
+	t := time.NewTimer(d)
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		t.Stop()
+		return ctx.Err()
+	}
 }

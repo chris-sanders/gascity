@@ -83,6 +83,44 @@ func ownRuntime(v identityVerdict, row session.Info, rt runtimeIdentity) bool {
 	return v == identityStaleSelf && ok && epoch == generation
 }
 
+// liveIncarnation reports rt, read under row's name, as another incarnation
+// of row's own session (#2081): the row's session ID under another token, at
+// an epoch below the row's generation (StaleSelf) or above it (NewerSelf). A
+// pending create holds over it while the session has work in flight, which
+// its rollback would stop.
+func liveIncarnation(row session.Info, rt runtimeIdentity) bool {
+	v := compareIdentity(row, rt)
+	epoch, generation, ok := identityEpochs(row, rt)
+	return v == identityNewerSelf || v == identityStaleSelf && ok && epoch < generation
+}
+
+// adoptableIdentity is named AdoptLive's rule (v5 O2, LL5; the C4c1 review
+// ruling): a clean read with no session ID, which is Ownerless or the
+// legacy-adopted shape (a token and no GC_SESSION_ID, Unknown to every row
+// but its own), whose token the adoption captures. It never adopts Foreign,
+// an unread identity, or any other Unknown. The effect re-confirms presence
+// after its fresh read.
+func adoptableIdentity(rt runtimeIdentity) bool {
+	return rt.Known && strings.TrimSpace(rt.SessionID) == ""
+}
+
+// rekeyable is S4's guards on verdict v of row's runtime. StaleSelf is three
+// of them (compareIdentity): the row's session ID, a non-empty runtime token
+// (v5.1 B6), and the runtime's epoch at most the row's generation. The
+// fourth: the row holds no pending_create_claim, since a pending create's
+// runtime is resolved by S1 and C8.2(a), never re-keyed (X2). Arm A3 and the
+// rekey effect's fresh read both apply it.
+func rekeyable(v identityVerdict, row session.Info) bool {
+	return v == identityStaleSelf && !row.PendingCreateClaim
+}
+
+// rekeyStillHolds is the rekey effect's fresh check (v5 S4): rt, read after
+// the pass, is still rekeyable for row and carries token, the runtime token
+// the pass saw.
+func rekeyStillHolds(row session.Info, rt runtimeIdentity, token string) bool {
+	return rekeyable(compareIdentity(row, rt), row) && strings.TrimSpace(rt.Token) == strings.TrimSpace(token)
+}
+
 // identityEpochs parses the runtime's epoch and the row's generation.
 func identityEpochs(row session.Info, rt runtimeIdentity) (int, int, bool) {
 	epoch, err := strconv.Atoi(strings.TrimSpace(rt.Epoch))
@@ -90,13 +128,25 @@ func identityEpochs(row session.Info, rt runtimeIdentity) (int, int, bool) {
 	return epoch, generation, err == nil && genErr == nil
 }
 
-// ownsName is C8.2(a)'s bead-scoped name, legacy's predicate verbatim
-// (staleAsyncStartRuntimeAttribution): a pool-managed row whose stored
-// session name embeds its bead ID, and name is that stored name. The
-// pending-create rollback reads it as the own-runtime attribution, with L3
-// waived (v5 C3, F2). The stop verb (v5 D3) reads it as own for the identity
-// leg (L2) only, never Foreign, with L3 kept.
+// ownsName is C8.2(a)'s bead-scoped name, legacy's pool arm
+// (staleAsyncStartRuntimeAttribution; its manual arm cannot arise under v2,
+// which admits only runtimes that vouch for identity): a pool-managed row
+// whose stored session name embeds its bead ID, and name is that stored
+// name. The pending-create rollback reads it as the own-runtime attribution,
+// with L3 waived (v5 C3, F2). The stop verb (v5 D3) reads it as own for the
+// identity leg (L2) only, never Foreign, with L3 kept.
 func ownsName(row session.Info, name string) bool {
 	return isPoolManagedSessionInfo(row) && infoOwnsPoolSessionName(row) &&
 		strings.TrimSpace(row.SessionNameMetadata) == strings.TrimSpace(name)
+}
+
+// deadToken is a dead runtime's identity key for the classified set (v5 S5,
+// X10): its session ID and token.
+func deadToken(id runtimeIdentity) string {
+	return strings.TrimSpace(id.SessionID) + "/" + strings.TrimSpace(id.Token)
+}
+
+// classifies reports that c, a classified set's entry, is id's dead runtime.
+func (c classifiedRuntime) classifies(id runtimeIdentity) bool {
+	return c.Token == deadToken(id)
 }

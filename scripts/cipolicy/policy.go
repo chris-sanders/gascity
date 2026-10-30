@@ -16,7 +16,13 @@ const (
 	// approximating shell semantics: any execution change requires explicit
 	// policy review, while workflow, job, step, and input descriptions remain
 	// free to change. A failure prints the projection and candidate digest.
-	expectedCITriggersHash = "d1a8bcd089019589658d8f154af9c26a70877285d84a384c2dcea299efc9554a"
+	//
+	// Triggers bumped for merge-queue readiness (TESTING.md "Merge queue"):
+	// merge_group [checks_requested], so Check and CI / required report on a
+	// queue entry's merge-group commit. Reviewed delta: one trigger, no new
+	// job, step command or permission; scripts/ci_merge_queue_test.go pins
+	// what each event expression yields on it.
+	expectedCITriggersHash = "869922e05434e56d0b7fe8245e29529edc9616efac89ce4ba068edf7faa3f69b"
 	// Bumped for the beads-topology-acceptance job: the bd/dolt-backed topology
 	// shapes had never executed in CI — every job lacked a bd with
 	// --proxied-server, so each test skipped and a suite that ran nothing
@@ -280,7 +286,53 @@ const (
 	// against the PR base commit's spec, which the lane writes with git show
 	// and hands to @openapi_base_spec. Reviewed delta: one job removed; no
 	// new job, trigger, step command or permission.
-	expectedCIExecutionHash     = "0b81b0eead4e815e218330ee63ccec936e8a14b7867b5e784ef0aadbd3cb006b"
+	//
+	// Bumped again (ga-96smfk.12, final cutover: every suite of this tree
+	// under Bazel): preflight-static (no steps left but setup),
+	// preflight-acceptance (Tier A: bazel.yml's acceptance lane plus the
+	// untagged helpers in the unit lane), the push-only unit cover jobs
+	// (bazel-nightly.yml's `bazel coverage //...` -> Codecov flag
+	// bazel-unit), the push-only integration-rest-full shards
+	// (bazel-nightly.yml's //test/integration lane), release-config
+	// (//:goreleaser_check_test) and the ci-preflight / ci-integration
+	// rollups are removed, with the changes job's cmd_gc_process and
+	// integration filters and outputs that only they read. Check and
+	// ci-required fan in the remaining gating jobs; credential-provider-
+	// windows moves to runner_policy.py's Blacksmith Windows runner.
+	// Reviewed delta: jobs, filters and needs removed, one runs-on and one
+	// runner-policy output; no new trigger, step command or permission.
+	//
+	// Bumped again (merge-queue readiness): the changes job's paths-filter
+	// takes base/ref from merge_group.base_sha/head_sha, empty on every other
+	// event (the action's defaults). Reviewed delta: two `with` inputs; no
+	// new job, step command or permission.
+	//
+	// Bumped again (installation rate limit): the changes job's paths-filter
+	// gets `token: ''`, so pull requests diff with git instead of calling the
+	// pulls/files API on the shared github.token budget. Reviewed delta: one
+	// `with` input; no new job, step command or permission.
+	//
+	// Bumped again (MCP mail conformance on lock bumps): the changes job's
+	// mail filter adds .github/requirements/mcp-agent-mail.in, .overrides.txt
+	// and .txt. The mcp-mail job installs mcp_agent_mail from that lock and
+	// runs TestMCPMailConformanceLive, the only live gc <-> mcp_agent_mail
+	// test, yet #8307 (GitPython, filelock, fastmcp and opentelemetry-api
+	// bumps) merged without it running. requiredFilterPaths pins the three
+	// paths. Reviewed delta: three filter paths; no new job, step command or
+	// permission.
+	//
+	// Bumped again (eMudhra CA follow-up): the mcp-mail job's setup-python
+	// python-version moves from '3.12' to the patched '3.12.16'. Reviewed
+	// delta: one `with` input; no new job, step command or permission.
+	//
+	// Bumped again (ga-ylpbsy.55, advisory probes in their own workflow): the
+	// contract-radar-bd-head and mcp-mail jobs move, steps unchanged, to
+	// advisory-probes.yml, with the changes job's beads and mail filters and
+	// outputs that only they read. Neither was in the needs of Check or
+	// CI / required, whose needs are unchanged. Reviewed delta: two jobs, two
+	// filters and two outputs removed; no new job, trigger, step command or
+	// permission.
+	expectedCIExecutionHash     = "8d71c559b60d2715b518faf498209843132276ed3e448929e1841f082136e6cf"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
@@ -310,23 +362,31 @@ const (
 	// beads-proxied-perf's -run selects TestBeadsProxiedDefaultNativeLane, the
 	// one test split out of TestBeadsProxiedDefault that reads
 	// GC_ACCEPTANCE_PERF; no new job, trigger, permission or secret.
-	expectedNightlyExecutionHash = "81df6767fb4a45226bfdf50a367a369c86f525510772a313d0ce3fa744295153"
+	// Bumped again (ga-96smfk.59): integration-sqlite-coordstore is removed.
+	// It selected GC_BEADS=sqlite, a provider #3151 removed (gc now
+	// hard-errors on it), so it failed every night; no job may select a
+	// provider now. Reviewed delta: one job removed; no new job, trigger or
+	// permission. Then Beads v1.3.1 -> v1.3.2 (the v1.5.1 pin, merged back
+	// from hotfix/1.5.1): BD_VERSION env value only. Then Dolt 2.2.0 -> 2.6.0
+	// (the first patched Dolt release for the eMudhra CA distrust):
+	// the workflow DOLT_VERSION env value only.
+	expectedNightlyExecutionHash = "56ab9f58ed4e8b418c22d7890cd3372de3f276bdf37956322e2f1a69911205e4"
 	// Setup action: reviewed delta (Go module fetch resilience) is setup-go
 	// `cache: false` and one step right after it,
-	// `uses: ./.github/actions/go-mod-download`.
-	expectedSetupActionHash = "910f005f48c629c9bf76c69a007b60c4132a76859183e59c0fe99d642bf6141f"
+	// `uses: ./.github/actions/go-mod-download`. Then the claude-version
+	// input default moves 2.1.123 -> 2.1.283 (Opus 5.5 needs >= 2.1.280);
+	// install-claude-native.sh pins its per-platform SHA-256s. No new step,
+	// input, permission or secret.
+	// Bumped again (eMudhra CA follow-up): 2.1.283 -> 2.1.308, the first
+	// stable Claude Code that rejects the compromised eMudhra intermediates.
+	// Reviewed delta: one input default; no new step, command, permission or
+	// secret.
+	expectedSetupActionHash = "2894a52d9e9e5fc4ae62402076003c6e7ee8f6ad74f53c14126ceda00b3dae70"
 )
 
+// requiredFilterPaths pins the paths each of ci.yml's changes filters must
+// keep. scripts/advisory_probes_workflow_test.go pins advisory-probes.yml's.
 var requiredFilterPaths = map[string][]string{
-	"mail": {"internal/mail/**", "contrib/mail-scripts/**"},
-	"beads": {
-		"go.mod",
-		"internal/beads/**",
-		"test/acceptance/beads_cli_contract_test.go",
-		"deps.env",
-		".github/scripts/install-bd-archive.sh",
-		"cmd/gc/init_provider_readiness.go",
-	},
 	"packs": {
 		"examples/gastown/**",
 		"internal/config/pack.go",
@@ -334,33 +394,12 @@ var requiredFilterPaths = map[string][]string{
 		"cmd/gc/embed_builtin_packs.go",
 		"scripts/update-bundled-gastown-pack",
 	},
-	"cmd_gc_process": {
-		"go.mod",
-		"go.sum",
-		".github/workflows/**",
-		"Makefile",
-		"cmd/gc/**",
-		"internal/**",
-		"examples/gastown/**",
-	},
 	"credential_provider": {
 		"go.mod",
 		"go.sum",
 		"internal/credentialprovider/**",
 		"internal/testenv/**",
 		"internal/testutil/**",
-	},
-	"integration": {
-		"go.mod",
-		"go.sum",
-		".github/workflows/**",
-		"Makefile",
-		"**/*.go",
-		"scripts/test-integration-shard",
-		"scripts/test-go-test-shard",
-		"scripts/runtime-tmux-tests.manifest",
-		"scripts/go-test-observable",
-		"examples/gastown/**",
 	},
 	"shared": {
 		"go.mod",
@@ -528,7 +567,7 @@ func validatePRProviderOwnership(workflow map[string]any) error {
 func validateNightlyProviderOwnership(workflow map[string]any) error {
 	if match, ok := findEnvField(workflow, "nightly"); ok {
 		return fmt.Errorf(
-			"nightly provider selection must be owned only by integration-sqlite-coordstore: %s assigns %s",
+			"nightly jobs must not select a beads test provider (the sqlite coordination store it selected was removed in #3151): %s assigns %s",
 			match.path,
 			match.name,
 		)
@@ -549,13 +588,10 @@ func validateNightlyProviderOwnership(workflow map[string]any) error {
 		if !ok {
 			return fmt.Errorf("nightly job %q must be a mapping", name)
 		}
-		if name == "integration-sqlite-coordstore" {
-			continue
-		}
 		path := "nightly.jobs." + name
 		if match, found := findJobProviderSelector(projectJob(job), path); found {
 			return fmt.Errorf(
-				"nightly provider selection must be owned only by integration-sqlite-coordstore: %s assigns %s",
+				"nightly jobs must not select a beads test provider (the sqlite coordination store it selected was removed in #3151): %s assigns %s",
 				match.path,
 				match.name,
 			)
