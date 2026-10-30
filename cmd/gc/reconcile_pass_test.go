@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"reflect"
 	"slices"
 	"strings"
@@ -212,6 +213,23 @@ func TestPassCarriesAdmissionStateAndDeadlines(t *testing.T) {
 	}
 }
 
+// Kills a row backoff's expiry left to the patrol (CONTRACT v5.10d (b);
+// staging lmcp: a killed seat's restart waited 13-23s past its 10s
+// backoff): a pass whose admission defers gc-1's heal on a live row backoff
+// asks for its next pass at the backoff's expiry.
+func TestPassWakesAtRowBackoffExpiry(t *testing.T) {
+	f := newGatherFixture(t, poolRow("gc-1", "worker", 1, "asleep", expiredHold...))
+	f.p.backoff.Refuse(rowBackoffKey(rowKey{Leg: rowLeg, ID: "gc-1"}), gatherNow, time.Time{}, causeRedecided, "")
+	res := f.p.tracePass(f.env, gatherNow)
+	rec := f.p.out.record.Load()
+	if len(rec.Deferred) != 1 || rec.Deferred[0].Cause != causeRowBackoff {
+		t.Fatalf("deferred %+v, want gc-1's heal on its row backoff", rec.Deferred)
+	}
+	if want := gatherNow.Add(backoffBase); !res.Next.Equal(want) {
+		t.Fatalf("next pass = %v, want the backoff's expiry %v", res.Next, want)
+	}
+}
+
 // Kills the boot gate left out of the pass (P2): with no inventory pass yet,
 // admission defers a destructive intent with cause boot-gate. No C2c1 arm
 // proposes one, so a test arm proposes a stop.
@@ -245,5 +263,43 @@ func TestTracePassKeepsNoTokenDebit(t *testing.T) {
 	}
 	if f.p.bucket != (bucketState{}) || !res.Next.IsZero() {
 		t.Fatalf("bucket = %+v, next pass at %v; want the bucket untouched and no refill pass", f.p.bucket, res.Next)
+	}
+}
+
+// Kills effects that ignore the D-14 gate's other half, an unregistered kind
+// that is submitted (and backs its row off) instead of traced, and an
+// effect that never clears its entry: with effects on but no create runner
+// wired, the pass defers the creates with cause no-effect before admission,
+// submits gc-1's heal under an in-flight entry, keeps admission's bucket,
+// and the heal's settlement clears the entry. Nothing backs the creates off.
+func TestPassWithEffectsSubmitsRegisteredKindsOnly(t *testing.T) {
+	f := newGatherFixture(t, poolRow("gc-1", "worker", 1, "asleep", expiredHold...), routedDemandBead("gc-r1"), routedDemandBead("gc-r2"))
+	x := newEffectExecutor(f.p.settlements.post, io.Discard)
+	f.p.effects = x
+	rec := f.passRecord(t)
+	if got := intentKeys(rec.Admitted); !slices.Equal(got, []string{"row-heal:gc-1"}) {
+		t.Fatalf("admitted = %v, want gc-1's heal only", got)
+	}
+	var noEffect int
+	for _, it := range rec.Deferred {
+		if it.Kind == intentCreate && it.Cause == causeNoEffect {
+			noEffect++
+		}
+	}
+	if noEffect != 2 {
+		t.Fatalf("deferred = %+v, want both creates with cause %q", rec.Deferred, causeNoEffect)
+	}
+	if f.p.bucket == (bucketState{}) {
+		t.Fatal("the planner kept no bucket with effects on")
+	}
+	x.stop(time.Now().Add(time.Minute)) // returns once the heal settled
+	f.p.drainSettlements(gatherNow)
+	if v := f.inflight.view(); len(v.Entries) != 0 {
+		t.Fatalf("in flight after the heal settled = %+v, want none", v.Entries)
+	}
+	for k := range f.p.backoff.Snapshot() {
+		if !strings.HasPrefix(k, "row:") {
+			t.Fatalf("backoff record %s, want none for the deferred creates", k)
+		}
 	}
 }

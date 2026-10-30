@@ -221,6 +221,9 @@ func (s *DoltliteReadStore) CloseStore() error {
 	return nil
 }
 
+// readsBySubprocess overrides the embedded BdStore's: Get reads in-process.
+func (s *DoltliteReadStore) readsBySubprocess() bool { return false }
+
 // Get returns the bead with the given ID, open or closed.
 func (s *DoltliteReadStore) Get(id string) (Bead, error) {
 	beads, err := s.queryIssues(ListQuery{AllowScan: true, IncludeClosed: true, TierMode: TierBoth}, "i.id = ?", []any{id}, 1)
@@ -1558,6 +1561,7 @@ func scanBead(rows interface{ Scan(...any) error }) (Bead, error) {
 		p := int(priority.Int64)
 		b.Priority = &p
 	}
+	b.SourceStatus = b.Status
 	b.Status = mapBdStatus(b.Status)
 	b.CloseReason = bdCloseReason(b.Status, closeReason)
 	b.CreatedAt = parseDBTime(createdRaw).Truncate(time.Second)
