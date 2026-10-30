@@ -14,6 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/reconcilekey"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/testutil"
@@ -651,6 +652,10 @@ func TestCmdSessionWake_PokesManagedControllerAndRequestsSuspendedStart(t *testi
 	if err != nil {
 		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
 	}
+	// Session resolution and session-row writes go through the session-class
+	// store, as the CLI's own callers do (cliSessionStore): the fixture now
+	// matches the production path.
+	store = cliSessionStore(store, cfg, cityDir)
 	sessionID, err := resolveSessionIDMaterializingNamed(cityDir, cfg, store, "mayor")
 	if err != nil {
 		t.Fatalf("resolveSessionIDMaterializingNamed(mayor): %v", err)
@@ -703,7 +708,7 @@ func TestCmdSessionWake_PokesManagedControllerAndRequestsSuspendedStart(t *testi
 	}()
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionWake([]string{"mayor"}, &stdout, &stderr); code != 0 {
+	if code := cmdSessionWake([]string{"mayor"}, "", &stdout, &stderr, false); code != 0 {
 		t.Fatalf("cmdSessionWake() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 
@@ -782,6 +787,10 @@ func TestCmdSessionWake_RejectsArchivedHistoricalSessionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
 	}
+	// Session resolution and session-row writes go through the session-class
+	// store, as the CLI's own callers do (cliSessionStore): the fixture now
+	// matches the production path.
+	store = cliSessionStore(store, cfg, cityDir)
 	sessionID, err := resolveSessionIDMaterializingNamed(cityDir, cfg, store, "mayor")
 	if err != nil {
 		t.Fatalf("resolveSessionIDMaterializingNamed(mayor): %v", err)
@@ -796,7 +805,7 @@ func TestCmdSessionWake_RejectsArchivedHistoricalSessionID(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionWake([]string{sessionID}, &stdout, &stderr); code == 0 {
+	if code := cmdSessionWake([]string{sessionID}, "", &stdout, &stderr, false); code == 0 {
 		t.Fatalf("cmdSessionWake() = %d, want rejection; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	// Pin the CLI wake-conflict artifact: the fused WakeSession returns a
@@ -830,6 +839,10 @@ func TestCmdSessionWake_RequestsStartForContinuityEligibleArchivedSessionID(t *t
 	if err != nil {
 		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
 	}
+	// Session resolution and session-row writes go through the session-class
+	// store, as the CLI's own callers do (cliSessionStore): the fixture now
+	// matches the production path.
+	store = cliSessionStore(store, cfg, cityDir)
 	sessionID, err := resolveSessionIDMaterializingNamed(cityDir, cfg, store, "mayor")
 	if err != nil {
 		t.Fatalf("resolveSessionIDMaterializingNamed(mayor): %v", err)
@@ -843,7 +856,7 @@ func TestCmdSessionWake_RequestsStartForContinuityEligibleArchivedSessionID(t *t
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionWake([]string{sessionID}, &stdout, &stderr); code != 0 {
+	if code := cmdSessionWake([]string{sessionID}, "", &stdout, &stderr, false); code != 0 {
 		t.Fatalf("cmdSessionWake() = %d, want success; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "wake requested") {
@@ -890,5 +903,68 @@ func TestDoSessionWake_JudgesThePostWakeRow(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := doSessionWake(b.ID, &stdout, &stderr, false, deps); code != 0 || strings.Contains(stderr.String(), "drained pool seat") {
 		t.Fatalf("doSessionWake() = %d, stderr=%s; want the woken (asleep) seat not refused as drained", code, stderr.String())
+	}
+}
+
+// On a city whose sessions live on their own binding, the CLI wake's
+// will-not-start predicate reads assigned work from the work store: a claim
+// there overrides the idle latch, as in the API (B4).
+func TestDoSessionWakeReadsTheWorkStoreOnASplitCity(t *testing.T) {
+	work, binding := beads.NewMemStore(), beads.NewMemStore()
+	cityPath := t.TempDir()
+	seedCLIStorageRoutes(t, cityPath, splitRoutes(binding))
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker", SleepAfterIdle: "1m"}}}
+	sp := runtime.NewFake()
+	info := session.Info{Template: "worker", SessionNameMetadata: "worker", SleepReason: "idle"}
+	seat, err := binding.Create(beads.Bead{Title: "worker", Type: sessionBeadType, Labels: []string{sessionBeadLabel}, Metadata: map[string]string{
+		"template": "worker", "session_name": "worker", "state": "asleep", "sleep_reason": "idle",
+		"sleep_policy_fingerprint": resolveSessionSleepPolicyInfo(info, cfg, sp).Fingerprint,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := work.Create(beads.Bead{Title: "task", Type: "task", Status: "in_progress", Assignee: seat.ID}); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := doSessionWake(seat.ID, &bytes.Buffer{}, &stderr, false, sessionWakeDeps{
+		store: work, cfg: cfg, cityPath: cityPath, sp: sp, now: time.Now,
+	}); code != 0 || strings.Contains(stderr.String(), "will not start") {
+		t.Fatalf("doSessionWake = %d, stderr %q; want the work store's claim to override the latch", code, stderr.String())
+	}
+}
+
+// TestDoSessionWake_OpenCircuitRefusesOnlyUnderLegacy: the CLI wake refuses a
+// session whose respawn circuit is open only when the city's controller runs
+// legacy, the one reconciler that reads the circuit; under v2 the open circuit
+// is stale state. The mode is the running controller's latch. Kills the
+// circuit refusal applied under v2.
+func TestDoSessionWake_OpenCircuitRefusesOnlyUnderLegacy(t *testing.T) {
+	original := controllerLatchedReconcilerMode
+	t.Cleanup(func() { controllerLatchedReconcilerMode = original })
+	for _, mode := range []reconcilerMode{reconcilerLegacy, reconcilerV2} {
+		t.Run(mode.String(), func(t *testing.T) {
+			controllerLatchedReconcilerMode = func(string, *config.City) (reconcilerMode, bool) { return mode, true }
+			store := beads.NewMemStore()
+			b, err := store.Create(beads.Bead{Title: "worker", Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
+				"template": "worker", "session_name": "worker", "state": "asleep",
+				session.SessionCircuitStateMetadataKey: session.SessionCircuitStateOpen,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			deps := sessionWakeDeps{
+				store: store, cfg: &config.City{Agents: []config.Agent{{Name: "worker"}}}, cityPath: t.TempDir(), cityResolved: true, now: time.Now,
+				withdrawQueuedWaitNudges:  func(string, []string) error { return nil },
+				cityUsesManagedReconciler: func(string) bool { return false },
+				pokeController:            func(string, reconcilekey.Key) error { return nil },
+			}
+			var stderr bytes.Buffer
+			code := doSessionWake(b.ID, &bytes.Buffer{}, &stderr, false, deps)
+			refused := code != 0 && strings.Contains(stderr.String(), "circuit breaker is open")
+			if refused != (mode == reconcilerLegacy) {
+				t.Fatalf("doSessionWake = %d, stderr %q; want refused=%v under %s", code, stderr.String(), mode == reconcilerLegacy, mode)
+			}
+		})
 	}
 }

@@ -19,10 +19,14 @@ type wakeVerdictDeps struct {
 	cityPath  string
 	sessFront *sessionpkg.Store // startup-health episodes
 	sp        runtime.Provider  // the sleep policy's capability
-	// workStore and rigStores (opened only when needed) read assigned work,
-	// which overrides an idle latch. A nil workStore never refuses on it.
-	workStore beads.Store
+	// work and rigStores (opened only when needed) read assigned work, which
+	// overrides an idle latch. No work store never refuses on it.
+	work      cityWorkLeg
 	rigStores func() map[string]beads.Store
+	// runsV2 reports the controller's latched mode, read only for a row whose
+	// respawn circuit is open: v2 never reads or clears the circuit, so under
+	// v2 a stale open circuit refuses nothing. Nil is legacy.
+	runsV2 func() bool
 }
 
 // wakeWillNotStart is CONTRACT v5.9 D8 7(a)'s one will-not-start predicate,
@@ -59,7 +63,7 @@ func wakeWillNotStart(info sessionpkg.Info, d wakeVerdictDeps, now time.Time) (w
 		return "it is a drained pool seat; the pool restarts seats only for demand", true
 	case sessionWakeCreateAbandonedInfo(info, d.cfg.Session.StartupTimeoutDuration()):
 		return "its create never completed; use `gc session close` to release the slot", true
-	case info.SessionCircuitState == sessionpkg.SessionCircuitStateOpen:
+	case info.SessionCircuitState == sessionpkg.SessionCircuitStateOpen && (d.runsV2 == nil || !d.runsV2()):
 		return fmt.Sprintf("its respawn circuit breaker is open; `gc session reset %s` clears it", info.ID), true
 	}
 	if name := info.SessionNameMetadata; name != "" && d.sessFront != nil {
@@ -70,11 +74,12 @@ func wakeWillNotStart(info sessionpkg.Info, d wakeVerdictDeps, now time.Time) (w
 	policy := resolveSessionSleepPolicyInfo(info, d.cfg, d.sp)
 	// The idle latch yields to pin_awake, to assigned work, and (for a
 	// non-interactive policy) to pool demand, which this read cannot see.
-	if pinned || d.workStore == nil || policy.Class == config.SessionSleepNonInteractive ||
+	if pinned || d.work.store == nil || policy.Class == config.SessionSleepNonInteractive ||
 		!configWakeSuppressedInfo(info, policy, d.sp, clock.Real{}) {
 		return "", certain
 	}
-	if work, err := sessionHasAwakeAssignedWorkForReachableStore(d.cityPath, d.cfg, d.workStore, d.rigStores(), info); err != nil || work {
+	legs := workLegsFromCensus(d.cityPath, d.cfg, d.work, d.rigStores())
+	if work, err := sessionHasAwakeAssignedWorkForReachableStore(seatWorkFor(legs, releaseScope(info, d.cfg)), info); err != nil || work {
 		return "", certain
 	}
 	return "its idle sleep policy holds it asleep until work or demand wakes it; send with `resume: true` (or `gc session attach`) to start it now", true
@@ -84,7 +89,8 @@ func wakeWillNotStart(info sessionpkg.Info, d wakeVerdictDeps, now time.Time) (w
 func (cs *controllerState) WakeStartRefusal(info sessionpkg.Info) (string, bool) {
 	return wakeWillNotStart(info, wakeVerdictDeps{
 		cfg: cs.Config(), cityPath: cs.CityPath(), sessFront: sessionpkg.NewStore(cs.SessionsBeadStore()),
-		sp: cs.SessionProvider(), workStore: cs.CityBeadStore(), rigStores: cs.wakeRigStores,
+		sp: cs.SessionProvider(), work: cityWorkLegOf(cs.cityWorkStore()), rigStores: cs.wakeRigStores,
+		runsV2: cs.wakeOf().runsV2,
 	}, time.Now())
 }
 
@@ -94,7 +100,7 @@ func (cs *controllerState) WakeStartRefusal(info sessionpkg.Info) (string, bool)
 // residency:allow — returns a copy of the controller's own snapshot; it opens
 // no store and resolves no bead.
 func (cs *controllerState) wakeRigStores() map[string]beads.Store {
-	stores := cs.BeadStores() // residency:allow — the controller's own snapshot, handed to assignedWorkExistsForSession, which plans the legs
+	stores := cs.BeadStores() // residency:allow — the controller's own snapshot, handed to workLegsFromCensus, which plans the legs
 	delete(stores, cs.cityName)
 	return stores
 }
