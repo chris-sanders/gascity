@@ -34,7 +34,7 @@ func newNoticeLaneHost(t *testing.T, f *laneFixture, kinds ...string) *conversat
 // set to store.
 func newNoticeLaneHostOver(t *testing.T, f *laneFixture, store beads.Store, kinds ...string) *conversationLaneHost {
 	t.Helper()
-	h := newConversationLaneHost(&laneHostEnvFake{f: f, store: store}, kinds)
+	h := newConversationLaneHost(&laneHostEnvFake{f: f, store: store}, kinds, sessionpkg.StopRequestsLive)
 	h.clk = f.clk
 	h.state = laneHostStateRunning
 	ctx, cancel := context.WithCancel(context.Background())
@@ -160,7 +160,7 @@ func TestPlannerNoticeLaneForFindsTheHostFromBothReconcilers(t *testing.T) {
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}, Ops: config.OpsConfig{Authoritative: []string{"message"}}}
 	cs := &controllerState{cfg: cfg, cityPath: f.dir, cityName: "test-city", cityBeadStore: beads.NewCachingStore(f.store, nil)}
 	cr := &CityRuntime{cityName: "test-city", cityPath: f.dir, cfg: cfg, cs: cs}
-	h := newConversationLaneHost(cs, cfg.Ops.Authoritative)
+	h := newConversationLaneHost(cs, cfg.Ops.Authoritative, sessionpkg.StopRequestsLive)
 	h.state = laneHostStateRunning
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -1207,7 +1207,7 @@ func wedgeDrainReminderRow(t *testing.T, f *laneFixture) (string, sessionpkg.Inf
 	}
 	mustSetMeta(t, f.sp, f.name, reconcilerDrainAckSourceKey, reconcilerDrainAckSourceValue)
 	f.sp.SetActivity(f.name, f.clk.Now().Add(-30*time.Minute))
-	_, info := f.view(t)
+	info := f.rowInfo(t)
 	return drainAt, info
 }
 
@@ -1244,7 +1244,7 @@ func TestDrainReminderProposesANoticeOpWhenTheLaneExecutesMessages(t *testing.T)
 	}
 	// The next attempt, one cadence on, is attempt 2 of the same drain.
 	f.clk.Advance(drainReminderInterval)
-	_, info = f.view(t)
+	info = f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderProposed {
 		t.Fatalf("second outcome = %v, want proposed; journal %q", got, out.String())
 	}
@@ -1306,7 +1306,7 @@ func TestDrainReminderWaitsOnAnInFlightNotice(t *testing.T) {
 		t.Fatalf("starting the first notice: %v", err)
 	}
 	f.clk.Advance(drainReminderInterval)
-	_, info = f.view(t)
+	info = f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderHeld {
 		t.Fatalf("outcome = %v, want held behind the in-flight notice; journal %q", got, out.String())
 	}
@@ -1386,6 +1386,49 @@ func TestDrainReminderDeliveredByTheLaneHostToADrainingSession(t *testing.T) {
 	}
 	if got := sessionpkg.State(f.meta(t, "state")); got != sessionpkg.StateDraining {
 		t.Fatalf("state = %q, want still draining", got)
+	}
+}
+
+// TestDrainReminderDeliveredByTheLaneHostToAV2SignaledSession (V2-18): a
+// row v2 signaled carries its stop request beside state=draining, which the
+// gate reads as stop_requested; the drain notice passes it as it passes
+// draining, so the reminder is proposed, not nudged directly, and the lane
+// host delivers it as one notice block.
+func TestDrainReminderDeliveredByTheLaneHostToAV2SignaledSession(t *testing.T) {
+	f := newLaneFixture(t, laneStopRequestedAt(1))
+	hh := newLaneHostHarness(t, f, "message")
+	hh.start()
+	hh.waitTicker(t)
+	drainAt, info := wedgeDrainReminderRow(t, f)
+	v, row := f.view(t)
+	if p, err := newConversationLaneExec(f.deps(f.laneStore(t)), row).Probe(context.Background(), v); err != nil || p.ContentBlock != sessionpkg.ContentGateStopRequested {
+		t.Fatalf("Probe = block %q, %v; want the signaled row read as stop_requested", p.ContentBlock, err)
+	}
+	var out bytes.Buffer
+	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderProposed {
+		t.Fatalf("outcome = %v, want proposed; journal %q", got, out.String())
+	}
+	st := f.laneStore(t)
+	id := noticeOpID(t, f, drainReminderNoticePurpose, drainAt, "", 1)
+	deadline := time.After(laneWaitBudget)
+	for {
+		if got := f.get(t, st, id); got.Status == opjournal.StatusClosed {
+			if got.Outcome.Arm != opjournal.ArmSucceeded {
+				t.Fatalf("outcome = %+v, want succeeded", got.Outcome)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the host never delivered the drain reminder")
+		case <-hh.passes:
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	nudges := f.nudges()
+	text := drainReminderContent(info)
+	if len(nudges) != 1 || !strings.Contains(nudges[0].Message, text) || nudges[0].Message == text {
+		t.Fatalf("nudges = %+v, want one notice block carrying the reminder", nudges)
 	}
 }
 
@@ -2031,7 +2074,7 @@ func markIdleDrainedWedge(t *testing.T, f *laneFixture) sessionpkg.Info {
 	}
 	mustSetMeta(t, f.sp, f.name, reconcilerDrainAckSourceKey, reconcilerDrainAckSourceValue)
 	f.sp.SetActivity(f.name, f.clk.Now().Add(-30*time.Minute))
-	_, info := f.view(t)
+	info := f.rowInfo(t)
 	return info
 }
 
@@ -2047,7 +2090,7 @@ func TestDrainReminderNudgesAnIdleDrainedWedgeDirectlyWithTheMessageLane(t *test
 	hh.start()
 	hh.waitTicker(t)
 	info := markIdleDrainedWedge(t, f)
-	if got := sessionpkg.ContentGate(info, true, f.clk.Now(), sessionpkg.GateContentDrainNotice); got != sessionpkg.ContentGateStopPending {
+	if got := sessionpkg.ContentGate(info, sessionpkg.StopRequest{}, true, f.clk.Now(), sessionpkg.GateContentDrainNotice); got != sessionpkg.ContentGateStopPending {
 		t.Fatalf("drain notice gate = %q, want stop_pending on the real mark", got)
 	}
 	var out bytes.Buffer
@@ -2099,7 +2142,7 @@ func TestDrainAckStopPendingMarkKeepsTheIdleLatch(t *testing.T) {
 	if info.SleepIntent != "idle-stop-pending" {
 		t.Fatalf("sleep_intent = %q, want the idle latch kept", info.SleepIntent)
 	}
-	if got := sessionpkg.ContentGate(info, true, env.clk.Now(), sessionpkg.GateContentDrainNotice); got != sessionpkg.ContentGateStopPending {
+	if got := sessionpkg.ContentGate(info, sessionpkg.StopRequest{}, true, env.clk.Now(), sessionpkg.GateContentDrainNotice); got != sessionpkg.ContentGateStopPending {
 		t.Fatalf("drain notice gate = %q, want stop_pending", got)
 	}
 }
@@ -2115,7 +2158,7 @@ func TestDrainReminderCountsNoticesNeverDeliveredAsUndeliverable(t *testing.T) {
 	wedgeDrainReminderRow(t, f)
 	var out bytes.Buffer
 	for attempt := 1; attempt <= drainReminderMaxAttempts; attempt++ {
-		_, info := f.view(t)
+		info := f.rowInfo(t)
 		if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderProposed {
 			t.Fatalf("attempt %d: outcome = %v, want proposed; journal %q", attempt, got, out.String())
 		}
@@ -2124,7 +2167,7 @@ func TestDrainReminderCountsNoticesNeverDeliveredAsUndeliverable(t *testing.T) {
 		}
 		f.clk.Advance(drainReminderInterval)
 	}
-	_, info := f.view(t)
+	info := f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderExhausted {
 		t.Fatalf("outcome = %v, want exhausted; journal %q", got, out.String())
 	}
@@ -2152,7 +2195,7 @@ func TestDrainReminderDoesNotCountDeliveredNotices(t *testing.T) {
 	st := f.laneStore(t)
 	var out bytes.Buffer
 	for attempt := 1; attempt <= drainReminderMaxAttempts; attempt++ {
-		_, info := f.view(t)
+		info := f.rowInfo(t)
 		if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderProposed {
 			t.Fatalf("attempt %d: outcome = %v, want proposed; journal %q", attempt, got, out.String())
 		}
@@ -2164,7 +2207,7 @@ func TestDrainReminderDoesNotCountDeliveredNotices(t *testing.T) {
 	if n := len(f.nudges()); n != drainReminderMaxAttempts {
 		t.Fatalf("the lane delivered %d notices, want %d", n, drainReminderMaxAttempts)
 	}
-	_, info := f.view(t)
+	info := f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderExhausted {
 		t.Fatalf("outcome = %v, want exhausted; journal %q", got, out.String())
 	}
@@ -2190,14 +2233,14 @@ func TestDrainReminderExhaustionWaitsOnTheLastNotice(t *testing.T) {
 		if attempt > 1 {
 			f.clk.Advance(drainReminderInterval)
 		}
-		_, info := f.view(t)
+		info := f.rowInfo(t)
 		if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderProposed {
 			t.Fatalf("attempt %d: outcome = %v, want proposed; journal %q", attempt, got, out.String())
 		}
 	}
 	last := f.clk.Now()
 	f.clk.Advance(time.Second)
-	_, info := f.view(t)
+	info := f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderHeld {
 		t.Fatalf("outcome = %v, want held behind the standing last notice; journal %q", got, out.String())
 	}
@@ -2210,7 +2253,7 @@ func TestDrainReminderExhaustionWaitsOnTheLastNotice(t *testing.T) {
 		t.Fatalf("starting the last notice: %v", err)
 	}
 	f.clk.Advance(last.Add(drainReminderInterval).Sub(f.clk.Now()))
-	_, info = f.view(t)
+	info = f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderHeld {
 		t.Fatalf("outcome = %v, want held behind the in-flight last notice; journal %q", got, out.String())
 	}
@@ -2221,7 +2264,7 @@ func TestDrainReminderExhaustionWaitsOnTheLastNotice(t *testing.T) {
 	if !drainRemindersSpent(f.row(t), f.clk.Now()) {
 		t.Fatal("an in-flight last notice held the escalation past its lease")
 	}
-	_, info = f.view(t)
+	info = f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderExhausted {
 		t.Fatalf("outcome = %v, want exhausted past the lease; journal %q", got, out.String())
 	}
@@ -2245,7 +2288,7 @@ func TestDrainReminderDirectAttemptSettlesAnUndeliveredLaneNotice(t *testing.T) 
 		t.Fatalf("latching the idle stop: %v", err)
 	}
 	f.clk.Advance(drainReminderInterval)
-	_, info = f.view(t)
+	info = f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderDelivered {
 		t.Fatalf("second outcome = %v, want delivered directly; journal %q", got, out.String())
 	}
@@ -2275,7 +2318,7 @@ func TestDrainReminderCountsNoticesTheLaneExpiresUndelivered(t *testing.T) {
 	}
 	var out bytes.Buffer
 	for attempt := 1; attempt <= drainReminderMaxAttempts; attempt++ {
-		_, info := f.view(t)
+		info := f.rowInfo(t)
 		if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderProposed {
 			t.Fatalf("attempt %d outcome = %v, want proposed; journal %q", attempt, got, out.String())
 		}
@@ -2293,7 +2336,7 @@ func TestDrainReminderCountsNoticesTheLaneExpiresUndelivered(t *testing.T) {
 			t.Fatalf("after attempt %d open ops = %d, want the notice closed expired", attempt, n)
 		}
 	}
-	_, info := f.view(t)
+	info := f.rowInfo(t)
 	if got := maybeRemindDrainingSession(f.sp, f.store, info, f.clk, &out); got != drainReminderExhausted {
 		t.Fatalf("outcome = %v, want exhausted; journal %q", got, out.String())
 	}
@@ -2326,8 +2369,8 @@ func TestDrainReminderNudgesARestartPendingWedgeDirectlyWithTheMessageLane(t *te
 			if err := f.store.SetMetadataBatch(f.id, map[string]string{key: "true"}); err != nil {
 				t.Fatal(err)
 			}
-			_, info := f.view(t)
-			if got := sessionpkg.ContentGate(info, true, f.clk.Now(), sessionpkg.GateContentDrainNotice); got != sessionpkg.ContentGateRestartPending {
+			info := f.rowInfo(t)
+			if got := sessionpkg.ContentGate(info, sessionpkg.StopRequest{}, true, f.clk.Now(), sessionpkg.GateContentDrainNotice); got != sessionpkg.ContentGateRestartPending {
 				t.Fatalf("gate = %q, want restart_pending", got)
 			}
 			var out bytes.Buffer
