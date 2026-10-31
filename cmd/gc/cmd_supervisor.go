@@ -34,7 +34,6 @@ import (
 	"github.com/gastownhall/gascity/internal/reconcilekey"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sdnotify"
-	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/gastownhall/gascity/internal/transcriptmeta"
@@ -1098,13 +1097,20 @@ func supervisorStatusWithOptions(stdout, stderr io.Writer, asJSON bool) int {
 			running, pidSource = true, "api"
 		}
 	}
-	// Unit ownership only makes sense when we have a real live PID to compare
-	// against the unit's MainPID (ga-9pjtoy) -- the service_manager/api
-	// fallback paths above confirm liveness without ever learning a PID.
+	// Unit ownership only makes sense when we have a real live PID to match
+	// against the unit's MainPID and its descendants (ga-9pjtoy) -- the
+	// service_manager/api fallback paths above confirm liveness without ever
+	// learning a PID.
 	var ownership supervisorUnitOwnershipStatus
 	if pid > 0 {
 		ownership = supervisorDetermineUnitOwnership(pid)
 	}
+	// A live process is not proof of supervision: on macOS the stop path
+	// leaves a persistent launchd override behind, so the supervisor can
+	// answer every liveness probe while nothing restarts it after logout.
+	// pid is the socket answer start's already-running check reads, so it
+	// decides whether the remedy has to stop the supervisor first.
+	supervisionWarning := supervisorLaunchdSupervisionWarning(pid > 0)
 	if asJSON {
 		payload := map[string]any{
 			"schema_version": "1",
@@ -1130,11 +1136,13 @@ func supervisorStatusWithOptions(stdout, stderr io.Writer, asJSON bool) int {
 				payload["supervisor_unit"] = ownership.Unit
 			}
 		}
+		addSupervisorSupervisionJSON(payload, supervisionWarning)
 		if err := writeCLIJSONLine(stdout, payload); err != nil {
 			return 1
 		}
 		return 0
 	}
+	printSupervisorSupervisionWarning(stderr, supervisionWarning)
 	switch {
 	case pid > 0:
 		fmt.Fprintf(stdout, "Supervisor is running (PID %d)\n", pid) //nolint:errcheck
@@ -1142,9 +1150,12 @@ func supervisorStatusWithOptions(stdout, stderr io.Writer, asJSON bool) int {
 		case "owned":
 			fmt.Fprintf(stdout, "Owned by systemd unit %s\n", ownership.Unit) //nolint:errcheck
 		case "outside_unit":
-			if ownership.UnitActive {
+			switch {
+			case ownership.ProbeErr != nil:
+				fmt.Fprintf(stdout, "Warning: could not verify that systemd unit %s owns the supervisor: %v\n", ownership.Unit, ownership.ProbeErr) //nolint:errcheck
+			case ownership.UnitActive:
 				fmt.Fprintf(stdout, "Warning: running outside systemd unit %s (unit is active but tracking a different process)\n", ownership.Unit) //nolint:errcheck
-			} else {
+			default:
 				fmt.Fprintf(stdout, "Warning: running outside systemd unit %s (unit is installed but inactive)\n", ownership.Unit) //nolint:errcheck
 			}
 		}
@@ -1156,6 +1167,28 @@ func supervisorStatusWithOptions(stdout, stderr io.Writer, asJSON bool) int {
 		fmt.Fprintln(stdout, "Supervisor is not running") //nolint:errcheck
 		return 1
 	}
+}
+
+// addSupervisorSupervisionJSON adds a launchd supervision problem to the
+// status payload. The keys are present only when status found one, so
+// supervised is never true: its absence means launchd is supervising, the
+// host is not macOS, the agent is not installed or its plist cannot be read,
+// or launchd could not answer.
+func addSupervisorSupervisionJSON(payload map[string]any, warning string) {
+	if warning == "" {
+		return
+	}
+	payload["supervised"] = false
+	payload["supervision_warning"] = warning
+}
+
+// printSupervisorSupervisionWarning reports a launchd supervision problem on
+// stderr, leaving the liveness report on stdout and the exit code unchanged.
+func printSupervisorSupervisionWarning(stderr io.Writer, warning string) {
+	if warning == "" {
+		return
+	}
+	fmt.Fprintf(stderr, "gc supervisor status: warning: %s\n", warning) //nolint:errcheck
 }
 
 func newSupervisorReloadCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -2241,6 +2274,15 @@ func startOneCity(
 		})
 	}
 
+	// A worker site's city is the remote controller's: the supervisor builds
+	// no runtime for it, whichever city the supervisor itself was started in.
+	// Each attempt re-reads the descriptor, so removing a stray one clears it.
+	if err := refuseCityStartOnWorkerSite(path); err != nil {
+		emitPendingCityCreateFailure(cr, path, name, "city_init_failed", err, stderr)
+		recordInitFailure(name, err.Error())
+		return
+	}
+
 	if err := ensureLegacyNamedPacksCached(path); err != nil {
 		emitPendingCityCreateFailure(cr, path, name, "pack_cache_failed", err, stderr)
 		recordInitFailure(name, fmt.Sprintf("fetching packs: %v", err))
@@ -2268,7 +2310,9 @@ func startOneCity(
 
 	// Latch the session reconciler before any init: a refused city must not
 	// start its bead store or open its event log.
-	wiring, wiringErr := newControllerWiring(cfg, reconcilerModeLookupEnv, stderr)
+	var reconcilerBoot strings.Builder
+	wiring, wiringErr := newControllerWiringLoggingTo(cfg, reconcilerModeLookupEnv, stderr, &reconcilerBoot)
+	logSupervisorReconcilerBoot(stderr, path, cityName, reconcilerBoot.String())
 	if wiringErr != nil {
 		emitPendingCityCreateFailure(cr, path, cityName, "session_reconciler_refused", wiringErr, stderr)
 		recordInitFailure(cityName, wiringErr.Error())
@@ -2406,6 +2450,13 @@ func startOneCity(
 		}))
 		return runtimeErr
 	}); err != nil {
+		// The recorder is this city's rotation owner: left open, its
+		// [events.mirror] copier would hold the mirror lock for the life of
+		// the supervisor, and every retry's copier would wait on it.
+		cityCancel()
+		if fr != nil {
+			fr.Close() //nolint:errcheck
+		}
 		emitPendingCityCreateFailure(cr, path, cityName, "city_runtime_failed", err, stderr)
 		recordInitFailure(cityName, fmt.Sprintf("city runtime: %v", err))
 		return
@@ -2443,10 +2494,7 @@ func startOneCity(
 	// restart (ga-n2d Gap C). Best-effort, mirrors runController — a sweep
 	// failure must never block city startup.
 	_ = runPostPrepareStep("releasing_stale_name_claims", func() error {
-		if cs.cityBeadStore == nil {
-			return nil
-		}
-		if released, err := sessionpkg.ReleaseStaleConfiguredNameClaims(cs.cityBeadStore, cfg, cityName); err != nil {
+		if released, err := releaseStaleNameClaimsAtStartup(cs, cfg, cityName); err != nil {
 			fmt.Fprintf(stderr, "gc supervisor: city '%s': stale name-claim sweep: %v\n", cityName, err) //nolint:errcheck
 		} else if released > 0 {
 			fmt.Fprintf(stderr, "gc supervisor: city '%s': released %d stale configured name claim(s) at startup\n", cityName, released) //nolint:errcheck
@@ -2457,6 +2505,8 @@ func startOneCity(
 	_ = runPostPrepareStep("starting_bead_event_watcher", func() error {
 		cs.startBeadEventWatcher(cityCtx)
 		cs.startAutocloseSweep(cityCtx)
+		cs.startOpSweep(cityCtx)
+		cs.startConversationLaneHost(cityCtx, wiring.mode)
 		cs.startMaintenanceLoop(cityCtx)
 		return nil
 	})
@@ -2494,6 +2544,9 @@ func startOneCity(
 	// where an early panic deletes a non-existent entry, leaving a
 	// zombie after the post-launch insertion.
 	alreadyRunning := publishManagedCity(cr, path, mc)
+	if !alreadyRunning {
+		forgetSupervisorReconcilerBoot(path)
+	}
 	if alreadyRunning {
 		cr.BatchUpdate(func(
 			_ map[string]*managedCity,
@@ -2661,8 +2714,8 @@ func startOneCity(
 				if err := shutdownBeadsProvider(p); err != nil {
 					fmt.Fprintf(stderr, "gc supervisor: city '%s': bead store: %v\n", n, err) //nolint:errcheck
 				}
-				// Close the file recorder (only on panic — normal exit
-				// leaves it for the external caller via mc.closer).
+				// Close the file recorder. A normal exit leaves it to the
+				// stop that removed the city (mc.closer), unless none did.
 				if cityFr != nil {
 					cityFr.Close() //nolint:errcheck
 				}
@@ -2696,6 +2749,7 @@ func startOneCity(
 			} else {
 				// Normal exit (context canceled) — reset panic counter
 				// and remove from map in a single critical section.
+				removed := false
 				cr.BatchUpdate(func(
 					cities map[string]*managedCity,
 					_ map[string]cityInitProgress,
@@ -2703,8 +2757,17 @@ func startOneCity(
 					panicHistory map[string]*panicRecord,
 				) {
 					delete(panicHistory, p)
-					deleteManagedCityIfCurrent(cities, p, mc)
+					removed = deleteManagedCityIfCurrent(cities, p, mc)
 				})
+				// A stop removes the city from the map before it cancels
+				// it, then closes the recorder via mc.closer. A city canceled
+				// in place (its controller socket's stop) removed itself
+				// just now, so no stop will: close the recorder here, outside
+				// the registry lock, or its [events.mirror] copier holds the
+				// mirror lock for the life of the supervisor.
+				if removed && cityFr != nil {
+					cityFr.Close() //nolint:errcheck
+				}
 			}
 			// Signal completion last — ensures all cleanup is done before
 			// waiters (shutdown/unregister paths) proceed.
@@ -2735,6 +2798,7 @@ func startOneCity(
 	rec.Record(events.Event{Type: events.ControllerStarted, Actor: "gc"})
 	telemetry.RecordControllerLifecycle(context.Background(), "started")
 	fmt.Fprintf(stdout, "Launching city '%s' (%s)\n", cityName, path) //nolint:errcheck
+	warnBdInventoryAtControllerStart(path, cfg, rec)
 }
 
 func emitPendingCityCreateResult(cr *cityRegistry, path, cityName string, stderr io.Writer) {

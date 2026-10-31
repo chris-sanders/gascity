@@ -134,6 +134,10 @@ cmd_gc_integration_tests=(
   TestBlockedRepairOnRealBdRestoresOverBlockedWork
   TestCapstoneIntegrationRealMinter
   TestControllerDiscoversAddedCronOrderWithoutRestart
+  TestGcBdBurnAndWispGCJudgesReadRealBd
+  TestGcBdBurnJudgeCoversAProxiedServerCascade
+  TestGcBdMolWispRootOnlyMintsOneWorkBead
+  TestInitializingARealEmbeddedRigLetsItCreateGcTypedBeads
   TestManagedBdRigProviderStoreRecoversAfterHardKillPortRebind
   TestManagedBeadsNativeCLICompatibility
   TestPhase2RealTransportBoundsStayAHangDetector
@@ -141,6 +145,10 @@ cmd_gc_integration_tests=(
   TestPhase2RealTransportResultToleratesASlowButCorrectStart
   TestPhase2WorkerCoreRealTransportProof
   TestRigAddIncludeResolvesScopedRegistryPackName
+  TestStartRecyclePinsThePeeksObjectOnRealTmux
+  TestStartRecycleQuarantinesARateLimitCorpseOnRealTmux
+  TestStartRecycleSparesAZombiesOperatorPaneOnRealTmux
+  TestStopRefusesARuntimeReplacedAtTheCallOnRealTmux
   TestStorageGateServesACityFromItsBeadsWorkspace
 )
 
