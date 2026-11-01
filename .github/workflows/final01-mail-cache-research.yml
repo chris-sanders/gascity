@@ -1,0 +1,225 @@
+name: FINAL-01 fork-only GitPython validator-cache research
+
+on:
+  push:
+    branches:
+      - codex/final01-mail-cache-research-20261101
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Compare official, cached and baseline mail delivery
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: 9564d8919c5ce07dcfc1e6cf76f50d12ada32c14
+      IMAGE_TAG: final01-mail-cache:9564d891
+      WHEEL_URL: https://files.pythonhosted.org/packages/6b/50/2a923c4dc02522ff9567f07c67ed1deca6d5fa9474f4708168b8088dfa37/gitpython-3.2.1-py3-none-any.whl
+      WHEEL_SHA256: d66b0832aa8755c1a84892937282df0befb16c97e5a64aeebd68be9c5e323f53
+    steps:
+      - name: Checkout research harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: research
+          persist-credentials: false
+      - name: Checkout exact candidate source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: chris-sanders/gascity
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - name: Record source and runner
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          {
+            printf 'candidate_source=%s\n' "$SOURCE_SHA"
+            printf 'research_commit=%s\n' "$(git -C research rev-parse HEAD)"
+            uname -a
+            nproc
+            lscpu
+            free -h
+            df -h .
+            docker version
+            sha256sum source/contrib/k8s/Dockerfile.mail source/.github/requirements/mcp-agent-mail.txt research/research/final01-mail-burst.py research/research/sitecustomize.py research/research/final01-gitpython-cache-differential.py
+          } > evidence/source-and-runner.txt
+      - name: Build the standard candidate mail image
+        id: image
+        run: |
+          set -euo pipefail
+          docker build -f source/contrib/k8s/Dockerfile.mail -t "$IMAGE_TAG" source
+          docker image inspect --format 'image_id={{.Id}}' "$IMAGE_TAG" | tee evidence/image-id.txt
+      - name: Obtain and verify the official GitPython 3.2.1 wheel
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 "$WHEEL_URL" -o evidence/gitpython-3.2.1-py3-none-any.whl
+          printf '%s  %s\n' "$WHEEL_SHA256" evidence/gitpython-3.2.1-py3-none-any.whl | sha256sum -c -
+          sha256sum evidence/gitpython-3.2.1-py3-none-any.whl > evidence/wheel-sha256.txt
+      - name: Differentially verify official validator behavior in image
+        id: validation
+        run: |
+          set -euo pipefail
+          docker run --rm --cpus 2 --memory 4g \
+            -v "$GITHUB_WORKSPACE/evidence/gitpython-3.2.1-py3-none-any.whl:/tmp/gitpython-3.2.1.whl:ro" \
+            -v "$GITHUB_WORKSPACE/research/research/sitecustomize.py:/tmp/sitecustomize.py:ro" \
+            -v "$GITHUB_WORKSPACE/research/research/final01-gitpython-cache-differential.py:/tmp/cache-differential.py:ro" \
+            --entrypoint /bin/sh "$IMAGE_TAG" -c \
+            'set -eu; python3 -m pip install --no-deps --no-cache-dir --target /tmp/gitpython-new /tmp/gitpython-3.2.1.whl; export PYTHONPATH=/tmp:/tmp/gitpython-new; exec python3 /tmp/cache-differential.py' \
+            2>&1 | tee evidence/cache-validation.log
+          rg -q '^CACHE_DIFFERENTIAL PASS ' evidence/cache-validation.log
+      - name: Run three alternating-order triples of 400 real sends
+        id: trials
+        run: |
+          set -euo pipefail
+          host_snapshot() {
+            local path="$1"
+            {
+              date -u '+%Y-%m-%dT%H:%M:%SZ'
+              uptime
+              cat /proc/loadavg
+              free -m
+              for resource in cpu io memory; do
+                if [ -r "/proc/pressure/$resource" ]; then printf '%s ' "$resource"; cat "/proc/pressure/$resource"; fi
+              done
+            } > "$path"
+          }
+          run_trial() {
+            local kind="$1" cid rc vmstat_pid=''
+            shift
+            host_snapshot "evidence/${kind}-before.txt"
+            cid="$(docker create --name "final01-cache-${GITHUB_RUN_ID}-${kind}" --cpus 2 --memory 4g \
+              -v "$GITHUB_WORKSPACE/research/research/final01-mail-burst.py:/tmp/mail-burst.py:ro" \
+              "$@")"
+            docker inspect --format 'nano_cpus={{.HostConfig.NanoCpus}} memory_bytes={{.HostConfig.Memory}} ulimits={{json .HostConfig.Ulimits}}' "$cid" > "evidence/${kind}-container-config.txt"
+            if command -v vmstat >/dev/null 2>&1; then
+              vmstat -w -t 2 > "evidence/${kind}-vmstat.log" & vmstat_pid=$!
+            fi
+            if timeout --signal=TERM --kill-after=10s 600s docker start -a "$cid" > "evidence/${kind}.log" 2>&1; then rc=0; else rc=$?; fi
+            docker inspect --format '{{json .State}}' "$cid" > "evidence/${kind}-container-state.json" || true
+            docker rm -f "$cid" >/dev/null || true
+            if [ -n "$vmstat_pid" ] && [ "$(ps -p "$vmstat_pid" -o comm= | tr -d ' ')" = vmstat ]; then kill "$vmstat_pid" || true; fi
+            if [ -n "$vmstat_pid" ]; then wait "$vmstat_pid" || true; fi
+            host_snapshot "evidence/${kind}-after.txt"
+            printf '%s\n' "$rc" > "evidence/${kind}.exit"
+            printf '%s exit=%s\n' "$kind" "$rc"
+            if [ "$rc" -ne 0 ]; then return "$rc"; fi
+          }
+          run_baseline() {
+            run_trial "$1" --entrypoint python3 "$IMAGE_TAG" /tmp/mail-burst.py "hosted-$1"
+          }
+          run_new() {
+            local kind="$1"
+            run_trial "$kind" \
+              -v "$GITHUB_WORKSPACE/evidence/gitpython-3.2.1-py3-none-any.whl:/tmp/gitpython-3.2.1-py3-none-any.whl:ro" \
+              --entrypoint /bin/sh "$IMAGE_TAG" -c \
+              'set -eu; python3 -m pip install --no-deps --no-cache-dir --target /tmp/gitpython-new /tmp/gitpython-3.2.1-py3-none-any.whl; export PYTHONPATH=/tmp/gitpython-new; exec python3 /tmp/mail-burst.py "$1"' sh "hosted-$kind"
+          }
+          run_cached() {
+            local kind="$1"
+            run_trial "$kind" \
+              -v "$GITHUB_WORKSPACE/evidence/gitpython-3.2.1-py3-none-any.whl:/tmp/gitpython-3.2.1-py3-none-any.whl:ro" \
+              -v "$GITHUB_WORKSPACE/research/research/sitecustomize.py:/tmp/sitecustomize.py:ro" \
+              --entrypoint /bin/sh "$IMAGE_TAG" -c \
+              'set -eu; python3 -m pip install --no-deps --no-cache-dir --target /tmp/gitpython-new /tmp/gitpython-3.2.1-py3-none-any.whl; export PYTHONPATH=/tmp:/tmp/gitpython-new; exec python3 /tmp/mail-burst.py "$1"' sh "hosted-$kind"
+          }
+          run_baseline baseline-1
+          run_new gitpython321-1
+          run_cached gitpython321-cache-1
+          run_new gitpython321-2
+          run_cached gitpython321-cache-2
+          run_baseline baseline-2
+          run_cached gitpython321-cache-3
+          run_baseline baseline-3
+          run_new gitpython321-3
+      - name: Validate deliveries and summarize without deciding acceptance
+        id: summary
+        if: ${{ always() && steps.trials.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path('evidence')
+          fields = ('EFFECTIVE_PACKAGES', 'EXPERIMENT_ENV', 'INDEX_INITIAL', 'INDEX_FINAL', 'INBOX_SUMMARY', 'REQUEST_LATENCY', 'RESULT')
+          variants = (('baseline', '3.1.62'), ('gitpython321', '3.2.1'), ('gitpython321-cache', '3.2.1'))
+          outputs = []
+          package_reference = None
+          for trial in (1, 2, 3):
+              row = {'trial': trial}
+              for variant, expected in variants:
+                  name = f'{variant}-{trial}'
+                  rc = int((root / f'{name}.exit').read_text())
+                  lines = (root / f'{name}.log').read_text(errors='replace').splitlines()
+                  values = {}
+                  for line in lines:
+                      for key in fields:
+                          prefix = key + ' '
+                          if line.startswith(prefix):
+                              values[key] = json.loads(line[len(prefix):])
+                  missing = [key for key in fields if key not in values]
+                  if rc != 0 or missing:
+                      raise SystemExit(f'{name}: incomplete exit={rc} missing={missing}')
+                  if values['EXPERIMENT_ENV']['gitpython'] != expected or values['EFFECTIVE_PACKAGES'].get('gitpython') != expected:
+                      raise SystemExit(f'{name}: wrong effective GitPython version')
+                  if values['REQUEST_LATENCY']['request_count'] != 400 or values['REQUEST_LATENCY']['service_count'] != 400:
+                      raise SystemExit(f'{name}: request accounting is incomplete')
+                  if values['RESULT']['success'] != 400 or values['INBOX_SUMMARY']['count'] != 400 or values['INBOX_SUMMARY']['unique_ids'] != 400 or values['INBOX_SUMMARY']['unique_subjects'] != 400:
+                      raise SystemExit(f'{name}: delivery or uniqueness check failed')
+                  packages = values['EFFECTIVE_PACKAGES'].copy()
+                  packages.pop('gitpython')
+                  if package_reference is None:
+                      package_reference = packages
+                  if packages != package_reference:
+                      raise SystemExit(f'{name}: package inventory differs beyond GitPython')
+                  if variant == 'gitpython321-cache':
+                      cache_lines = [line for line in lines if line.startswith('CACHE_INFO ')]
+                      if not cache_lines:
+                          raise SystemExit(f'{name}: cache instrumentation did not run')
+                      hit_values = re.findall(r"'hits': (\d+)", cache_lines[-1])
+                      if not hit_values or int(hit_values[-1]) == 0:
+                          raise SystemExit(f'{name}: no cache hits were recorded')
+                  row[variant] = values
+              outputs.append(row)
+          (root / 'summary.json').write_text(json.dumps(outputs, indent=2, sort_keys=True) + '\n')
+          for row in outputs:
+              base = row['baseline']['RESULT']
+              print('trial', row['trial'], 'order', ['baseline', 'gitpython321', 'gitpython321-cache'] if row['trial'] == 1 else (['gitpython321', 'gitpython321-cache', 'baseline'] if row['trial'] == 2 else ['gitpython321-cache', 'baseline', 'gitpython321']))
+              for variant, _ in variants:
+                  result = row[variant]['RESULT']
+                  print(variant, json.dumps({'wall': result['wall'], 'commit_p95': result['commit_p95'], 'success': result['success'], 'archive_wait_over_60s': result['archive_wait_over_60s'], 'commit_over_60s': result['commit_over_60s'], 'wall_ratio_vs_baseline': result['wall'] / base['wall'], 'commit_p95_ratio_vs_baseline': result['commit_p95'] / base['commit_p95']}))
+          print('Research only: comparable timings do not decide performance or security acceptance.')
+          PY
+      - name: Upload research logs and metadata
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: final01-mail-cache-research-9564d891
+          path: |
+            evidence/source-and-runner.txt
+            evidence/image-id.txt
+            evidence/wheel-sha256.txt
+            evidence/cache-validation.log
+            evidence/*.log
+            evidence/*.exit
+            evidence/*-container-state.json
+            evidence/*-container-config.txt
+            evidence/*-before.txt
+            evidence/*-after.txt
+            evidence/summary.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Require complete safe comparisons
+        if: ${{ always() }}
+        env:
+          IMAGE_OUTCOME: ${{ steps.image.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validation.outcome }}
+          TRIAL_OUTCOME: ${{ steps.trials.outcome }}
+          SUMMARY_OUTCOME: ${{ steps.summary.outcome }}
+        run: |
+          printf 'image=%s validation=%s trials=%s summary=%s\n' "$IMAGE_OUTCOME" "$VALIDATION_OUTCOME" "$TRIAL_OUTCOME" "$SUMMARY_OUTCOME"
+          [[ "$IMAGE_OUTCOME" == success && "$VALIDATION_OUTCOME" == success && "$TRIAL_OUTCOME" == success && "$SUMMARY_OUTCOME" == success ]]
