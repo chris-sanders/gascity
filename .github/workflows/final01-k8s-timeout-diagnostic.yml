@@ -1,0 +1,52 @@
+name: FINAL-01 focused K8s timeout diagnostic
+
+on:
+  push:
+    branches:
+      - codex/final01-mail-burst-research-20261101
+
+permissions:
+  contents: read
+
+jobs:
+  k8s-test:
+    name: Run exact candidate K8s tests locally with verbose output
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact C14 candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: chris-sanders/gascity
+          ref: f440168898d8eebfb2a5e7ca013641b052807bb8
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Set up pinned Bazel
+        uses: ./.github/actions/setup-bazel
+      - name: Run the single timed-out target locally
+        env:
+          GC_TEST_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          bazel test --config=ci \
+            --jobs=4 \
+            --local_resources=cpu=2,memory=3500 \
+            --strategy=GoTest=local \
+            --test_timeout=900 \
+            --test_verbose_timeout_warnings \
+            --test_output=all \
+            --test_arg=-test.v \
+            //internal/runtime/k8s:k8s_test \
+            2>&1 | tee "$RUNNER_TEMP/k8s-test.log"
+      - name: Upload verbose target log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: final01-k8s-timeout-diagnostic-${{ github.run_id }}
+          path: ${{ runner.temp }}/k8s-test.log
+          if-no-files-found: ignore
+          retention-days: 7
