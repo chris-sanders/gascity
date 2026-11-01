@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - codex/final01-mail-burst-research-20261101
+    paths:
+      - .github/workflows/final01-k8s-timeout-diagnostic.yml
 
 permissions:
   contents: read
@@ -29,6 +31,11 @@ jobs:
         uses: ./.github/actions/setup-bazel
       - name: Create Bazel test tmpdir
         run: mkdir -p /tmp/bt
+      - name: Install LLVM linker shared library
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libxml2
+          ldconfig -p | grep -F 'libxml2.so.2'
       - name: Run the single timed-out target locally
         env:
           GC_TEST_REPO_ROOT: ${{ github.workspace }}

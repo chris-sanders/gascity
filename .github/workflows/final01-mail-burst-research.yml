@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - codex/final01-mail-burst-research-20261101
+    paths:
+      - research/final01-mail-burst.py
+      - research/sitecustomize.py
+      - research/final01-gitpython-cache-differential.py
+  workflow_dispatch:
 
 permissions:
   contents: read
