@@ -3,7 +3,7 @@ name: FINAL-01 fork-only GitPython validator-cache research
 on:
   push:
     branches:
-      - codex/final01-mail-cache-research-20261101
+      - codex/final01-mail-burst-research-20261101
 
 permissions:
   contents: read
