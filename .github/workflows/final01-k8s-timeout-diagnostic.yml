@@ -13,7 +13,10 @@ permissions:
 jobs:
   k8s-test:
     name: Run exact candidate K8s tests locally with verbose output
-    runs-on: ubuntu-latest
+    # Keep the diagnostic on the same LTS generation used by the normal
+    # Docker/Bazel toolchain. ubuntu-latest advanced to 26.04, where the
+    # legacy libxml2 ABI required by the pinned LLVM linker is unavailable.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout exact C14 candidate
@@ -31,11 +34,8 @@ jobs:
         uses: ./.github/actions/setup-bazel
       - name: Create Bazel test tmpdir
         run: mkdir -p /tmp/bt
-      - name: Install LLVM linker shared library
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libxml2
-          ldconfig -p | grep -F 'libxml2.so.2'
+      - name: Verify LLVM linker shared library
+        run: ldconfig -p | grep -F 'libxml2.so.2'
       - name: Run the single timed-out target locally
         env:
           GC_TEST_REPO_ROOT: ${{ github.workspace }}
