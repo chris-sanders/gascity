@@ -1,0 +1,140 @@
+name: FINAL-01 fork-only mail burst research
+
+on:
+  push:
+    branches:
+      - codex/final01-mail-burst-research-20261101
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Compare real mail delivery on one hosted runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 9564d8919c5ce07dcfc1e6cf76f50d12ada32c14
+      IMAGE_TAG: final01-mail-burst:9564d891
+      WHEEL_URL: https://files.pythonhosted.org/packages/6b/50/2a923c4dc02522ff9567f07c67ed1deca6d5fa9474f4708168b8088dfa37/gitpython-3.2.1-py3-none-any.whl
+      WHEEL_SHA256: d66b0832aa8755c1a84892937282df0befb16c97e5a64aeebd68be9c5e323f53
+    steps:
+      - name: Checkout research harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: research
+          persist-credentials: false
+      - name: Checkout exact candidate source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: chris-sanders/gascity
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - name: Record source and runner
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          {
+            printf 'candidate_source=%s\n' "$SOURCE_SHA"
+            printf 'research_commit=%s\n' "$(git -C research rev-parse HEAD)"
+            uname -a
+            nproc
+            lscpu
+            free -h
+            df -h .
+            docker version
+            sha256sum source/contrib/k8s/Dockerfile.mail source/.github/requirements/mcp-agent-mail.txt research/research/final01-mail-burst.py research/.github/workflows/final01-mail-burst-research.yml
+          } > evidence/source-and-runner.txt
+      - name: Build the standard candidate mail image
+        id: image
+        run: |
+          set -euo pipefail
+          docker build -f source/contrib/k8s/Dockerfile.mail -t "$IMAGE_TAG" source
+          docker image inspect --format 'image_id={{.Id}}' "$IMAGE_TAG" | tee evidence/image-id.txt
+      - name: Obtain and verify the official GitPython 3.2.1 wheel
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 "$WHEEL_URL" -o evidence/gitpython-3.2.1-py3-none-any.whl
+          printf '%s  %s\n' "$WHEEL_SHA256" evidence/gitpython-3.2.1-py3-none-any.whl | sha256sum -c -
+          sha256sum evidence/gitpython-3.2.1-py3-none-any.whl > evidence/wheel-sha256.txt
+      - name: Run 400 real sends per version sequentially
+        id: trials
+        run: |
+          set -euo pipefail
+          run_trial() {
+            local kind="$1" cid rc
+            shift
+            cid="$(docker create --name "final01-burst-${GITHUB_RUN_ID}-${kind}" --cpus 2 --memory 4g \
+              -v "$GITHUB_WORKSPACE/research/research/final01-mail-burst.py:/tmp/mail-burst.py:ro" \
+              "$@")"
+            if timeout --signal=TERM --kill-after=10s 600s docker start -a "$cid" > "evidence/${kind}.log" 2>&1; then rc=0; else rc=$?; fi
+            docker inspect --format '{{json .State}}' "$cid" > "evidence/${kind}-container-state.json" || true
+            docker rm -f "$cid" >/dev/null || true
+            printf '%s\n' "$rc" > "evidence/${kind}.exit"
+            printf '%s exit=%s\n' "$kind" "$rc"
+          }
+          run_trial baseline --entrypoint python3 "$IMAGE_TAG" /tmp/mail-burst.py hosted-baseline
+          run_trial gitpython321 \
+            -v "$GITHUB_WORKSPACE/evidence/gitpython-3.2.1-py3-none-any.whl:/tmp/gitpython-3.2.1-py3-none-any.whl:ro" \
+            --entrypoint /bin/sh "$IMAGE_TAG" -c \
+            'set -eu; python3 -m pip install --no-deps --no-cache-dir --target /tmp/gitpython-new /tmp/gitpython-3.2.1-py3-none-any.whl; export PYTHONPATH=/tmp/gitpython-new; exec python3 /tmp/mail-burst.py hosted-gitpython321'
+      - name: Validate measurements and summarize without deciding acceptance
+        id: summary
+        if: ${{ always() && steps.trials.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root=Path('evidence')
+          fields=('EFFECTIVE_PACKAGES','EXPERIMENT_ENV','INDEX_INITIAL','INDEX_FINAL','INBOX_SUMMARY','REQUEST_LATENCY','RESULT')
+          output={}
+          for name,expected in (('baseline','3.1.62'),('gitpython321','3.2.1')):
+              rc=int((root/f'{name}.exit').read_text())
+              values={}
+              for line in (root/f'{name}.log').read_text(errors='replace').splitlines():
+                  for key in fields:
+                      prefix=key+' '
+                      if line.startswith(prefix): values[key]=json.loads(line[len(prefix):])
+              missing=[key for key in fields if key not in values]
+              if rc != 0 or missing:
+                  raise SystemExit(f'{name}: incomplete trial exit={rc} missing={missing}')
+              if values['EXPERIMENT_ENV']['gitpython'] != expected or values['EFFECTIVE_PACKAGES'].get('gitpython') != expected:
+                  raise SystemExit(f'{name}: incorrect effective GitPython version')
+              output[name]=values
+          before=output['baseline']['EFFECTIVE_PACKAGES'].copy()
+          after=output['gitpython321']['EFFECTIVE_PACKAGES'].copy()
+          before.pop('gitpython'); after.pop('gitpython')
+          if before != after:
+              raise SystemExit('effective package inventories differ beyond GitPython')
+          (root/'summary.json').write_text(json.dumps(output,indent=2,sort_keys=True)+'\n')
+          for name in ('baseline','gitpython321'):
+              print(name,json.dumps({key:output[name][key] for key in ('EXPERIMENT_ENV','INDEX_INITIAL','INDEX_FINAL','INBOX_SUMMARY','REQUEST_LATENCY','RESULT')}))
+          print('Research only: successful execution does not establish performance or security acceptance.')
+          PY
+      - name: Upload research logs and metadata
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: final01-mail-burst-research-9564d891
+          path: |
+            evidence/source-and-runner.txt
+            evidence/image-id.txt
+            evidence/wheel-sha256.txt
+            evidence/*.log
+            evidence/*.exit
+            evidence/*-container-state.json
+            evidence/summary.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Require complete comparable trials
+        if: ${{ always() }}
+        env:
+          IMAGE_OUTCOME: ${{ steps.image.outcome }}
+          TRIAL_OUTCOME: ${{ steps.trials.outcome }}
+          SUMMARY_OUTCOME: ${{ steps.summary.outcome }}
+        run: |
+          printf 'image=%s trials=%s summary=%s\n' "$IMAGE_OUTCOME" "$TRIAL_OUTCOME" "$SUMMARY_OUTCOME"
+          [[ "$IMAGE_OUTCOME" == success && "$TRIAL_OUTCOME" == success && "$SUMMARY_OUTCOME" == success ]]
