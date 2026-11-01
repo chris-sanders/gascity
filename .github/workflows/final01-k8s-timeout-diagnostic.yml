@@ -34,7 +34,8 @@ jobs:
           set -euo pipefail
           bazel test --config=ci \
             --jobs=4 \
-            --local_resources=cpu=2,memory=3500 \
+            --local_resources=cpu=2 \
+            --local_resources=memory=3500 \
             --strategy=GoTest=local \
             --test_timeout=900 \
             --test_verbose_timeout_warnings \
