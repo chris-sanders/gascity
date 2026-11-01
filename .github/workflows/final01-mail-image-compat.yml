@@ -1,0 +1,134 @@
+name: FINAL-01 fork-hosted mail image verification
+
+on:
+  push:
+    branches:
+      - codex/final01-mail-scan-ubuntu-20261101
+
+permissions:
+  contents: read
+
+jobs:
+  mail-image:
+    name: Build exact source, scan mail image, check compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 9326b9725364f1e88c019ef366c81a9fbea74d4d
+      IMAGE_TAG: gc-mcp-mail:final01-9326b9725364
+      TRIVY_VERSION: v0.70.0
+    steps:
+      - name: Checkout exact candidate source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+
+      - name: Verify source checkout
+        working-directory: source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Build the candidate mail image
+        id: build
+        run: docker build -f source/contrib/k8s/Dockerfile.mail -t "$IMAGE_TAG" source
+
+      - name: Record image digest and pinned package versions
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        run: |
+          docker image inspect --format='image_id={{.Id}}' "$IMAGE_TAG" | tee mail-image-identity.txt
+          docker run --rm --entrypoint python3 "$IMAGE_TAG" -c \
+            'import importlib.metadata as m; print("GitPython=" + m.version("GitPython")); print("joserfc=" + m.version("joserfc"))' \
+            | tee -a mail-image-identity.txt
+
+      - name: Install pinned Trivy
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          TRIVY_INSTALL_BIN_DIR="$RUNNER_TEMP/trivy-bin" source/.github/scripts/install-trivy-archive.sh "$TRIVY_VERSION"
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
+      - name: Generate mail image vulnerability report and SBOM
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          mkdir -p trivy-results
+          trivy image \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --ignorefile source/.trivyignore.yaml \
+            --timeout 15m \
+            --format json \
+            --output trivy-results/gc-mcp-mail.vuln.json \
+            "$IMAGE_TAG"
+          trivy image \
+            --scanners vuln \
+            --ignorefile source/.trivyignore.yaml \
+            --timeout 15m \
+            --format cyclonedx \
+            --output trivy-results/gc-mcp-mail.cdx.json \
+            "$IMAGE_TAG"
+
+      - name: Enforce official HIGH and CRITICAL image policy
+        id: vulnerability-policy
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          trivy image \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --ignorefile source/.trivyignore.yaml \
+            --exit-code 1 \
+            --timeout 15m \
+            --format table \
+            "$IMAGE_TAG"
+
+      - name: Check mail filelock exit regression
+        id: filelock
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            --entrypoint python3 \
+            -v "$GITHUB_WORKSPACE/source/.github/scripts/mcp-mail-filelock-exit-regression.py:/tmp/mcp-mail-filelock-exit-regression.py:ro" \
+            "$IMAGE_TAG" \
+            /tmp/mcp-mail-filelock-exit-regression.py
+
+      - name: Check JWT compatibility and claim rejection
+        id: jwt
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            --entrypoint python3 \
+            -v "$GITHUB_WORKSPACE/source/.github/scripts/mcp-mail-jwt-compatibility.py:/tmp/mcp-mail-jwt-compatibility.py:ro" \
+            "$IMAGE_TAG" \
+            /tmp/mcp-mail-jwt-compatibility.py
+
+      - name: Upload source, image, scan, and SBOM evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: final01-mail-image-9326b9725364
+          path: |
+            mail-image-identity.txt
+            trivy-results/
+          if-no-files-found: warn
+          retention-days: 5
+
+      - name: Require every image and compatibility gate
+        if: ${{ always() }}
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          VULNERABILITY_OUTCOME: ${{ steps.vulnerability-policy.outcome }}
+          FILELOCK_OUTCOME: ${{ steps.filelock.outcome }}
+          JWT_OUTCOME: ${{ steps.jwt.outcome }}
+        run: |
+          printf 'build=%s vulnerability-policy=%s filelock=%s jwt=%s\n' \
+            "$BUILD_OUTCOME" "$VULNERABILITY_OUTCOME" "$FILELOCK_OUTCOME" "$JWT_OUTCOME"
+          [[ "$BUILD_OUTCOME" == success && \
+             "$VULNERABILITY_OUTCOME" == success && \
+             "$FILELOCK_OUTCOME" == success && \
+             "$JWT_OUTCOME" == success ]]
