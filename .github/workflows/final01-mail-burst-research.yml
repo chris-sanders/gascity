@@ -70,7 +70,7 @@ jobs:
             --entrypoint /bin/sh "$IMAGE_TAG" -c \
             'set -eu; python3 -m pip install --no-deps --no-cache-dir --target /tmp/gitpython-new /tmp/gitpython-3.2.1-py3-none-any.whl; export PYTHONPATH=/tmp:/tmp/gitpython-new; exec python3 /tmp/cache-differential.py' \
             2>&1 | tee evidence/cache-validation.log
-          rg -q '^CACHE_DIFFERENTIAL PASS ' evidence/cache-validation.log
+          grep -q '^CACHE_DIFFERENTIAL PASS ' evidence/cache-validation.log
       - name: Run three alternating-order triples of 400 real sends
         id: trials
         run: |

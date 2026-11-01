@@ -27,6 +27,8 @@ jobs:
           cache: false
       - name: Set up pinned Bazel
         uses: ./.github/actions/setup-bazel
+      - name: Create Bazel test tmpdir
+        run: mkdir -p /tmp/bt
       - name: Run the single timed-out target locally
         env:
           GC_TEST_REPO_ROOT: ${{ github.workspace }}
