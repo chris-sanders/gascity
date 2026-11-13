@@ -127,15 +127,15 @@ func demandRowServable(b beads.Bead) bool {
 			return false
 		}
 	}
-	// LABEL: case-insensitive. Here the query is NOT the last word: whatever
-	// `gc ready` returns, the hook re-applies the hold filter in Go with
-	// EqualFold (isHeldHookCandidate) before serving a candidate, so a
-	// "Hold:Mayor" bead is served by the reader and then stripped by the hook.
-	// The worker never sees it, so it is not capacity demand.
+	// LABEL: human is exact, case-sensitive, like the query's label filter;
+	// the hook does not apply a human post-filter. Dispatch holds are
+	// case-insensitive: the hook re-applies them with EqualFold
+	// (isHeldHookCandidate), so a "Hold:Mayor" bead is stripped even if the
+	// reader serves it. The worker never sees it, so it is not capacity demand.
 	for _, label := range b.Labels {
 		label = strings.TrimSpace(label)
 		for _, excluded := range rules.ExcludeLabels {
-			if strings.EqualFold(label, excluded) {
+			if label == excluded || (excluded != beadmeta.HumanLabel && strings.EqualFold(label, excluded)) {
 				return false
 			}
 		}
@@ -167,7 +167,8 @@ const (
 	// projection that reads explicitly false, which is bd's own answer, computed
 	// through the ready-projection enrichment's `bd sql`/`bd blocked` door.
 	demandRowClaimable demandRowClaimability = "claimable"
-	// demandRowDeferred: defer_until, or bd's indefinite deferral, gates the row
+	// demandRowDeferred: a future defer_until, or bd's deferred status (dated or
+	// not, until the store wakes the row), gates the row
 	// (beads.IsDeferred). Both are FRESH bead-local fields — never stale — so this
 	// is proof that no worker could have claimed the row.
 	demandRowDeferred demandRowClaimability = "deferred"

@@ -121,7 +121,7 @@ The controller already has optional runtime extension points:
 These signals are uneven across providers. The design must tolerate:
 
 - full support (`tmux`, `exec` packs that declare `report-activity`,
-  `report-attachment` and `proc.exec`)
+  `report-attachment`, `proc.exec` and `idle-boundary`)
 - activity-only support (`k8s`, other `exec` packs)
 - no meaningful idle-boundary support (`subprocess`)
 - routed mixed capability (`auto`, `hybrid`)
@@ -535,7 +535,8 @@ Interactive safety is stricter than worker safety:
   that session, even when an agent-level override asked for sleep
 - interactive auto-sleep therefore fails closed on k8s/ACP-style
   backends today, and on `exec` packs unless they declare
-  `report-activity`, `report-attachment` and `proc.exec`
+  `report-activity`, `report-attachment`, `proc.exec` and
+  `idle-boundary`
 
 For tmux-like providers, `WaitForIdle` must treat a foreground process
 blocked on stdin or a visible approval prompt as not idle. A provider
@@ -614,9 +615,9 @@ Provider classes in current code:
 |---|---|---|---|---|
 | `tmux` | yes | no structured pending today | yes | strongest support |
 | `k8s` | yes | no | no | timed-only sleep |
-| `exec` | script-dependent | no | pane scan over `exec` when declared | `full` with report-activity + report-attachment + proc.exec (5s idle-proof budget), otherwise `timed_only` |
+| `exec` | script-dependent | no | pane scan over `exec` when declared | `full` with report-activity + report-attachment + proc.exec + idle-boundary (5s idle-proof budget), otherwise `timed_only` |
 | `subprocess` | no useful activity | no | no | disabled |
-| `acp` | yes (`session/update`, durably stamped) | currently unsupported | no | timed-only sleep |
+| `acp` | yes (`session/update`, durably stamped) | yes (held `session/request_permission`, seen by the owning provider) | no | timed-only sleep |
 | `auto` / `hybrid` | routed | routed | routed | decide per session, not globally |
 
 Composite providers must route `Pending(name)` the same way they already
@@ -625,8 +626,11 @@ it implements `InteractionProvider`. Type-assert failure and
 `ErrInteractionUnsupported` both map to "no pending capability for this
 session."
 
-Until a provider actually surfaces structured pending interactions,
-`pending` is a latent wake reason rather than an active production path.
+ACP surfaces each held `session/request_permission` as a structured
+pending interaction, so `pending` is an active wake reason for ACP
+sessions. Only the provider instance that owns the connection sees the
+request; any other instance answers `ErrSessionNotFound`, which the
+probe reads as "no pending interaction".
 
 ### 9) Keep asleep sessions as pool slots
 
@@ -1163,10 +1167,10 @@ sleep_after_idle = "off"
 | `timed_only` interactive | stay inherited-off unless the agent explicitly opts in |
 | `disabled` | no idle sleep; fix provider capability first |
 
-Until providers implement structured `Pending()`, `timed_only`
-non-interactive sessions have no pending-interaction guard beyond their
-activity clock. That is acceptable for initial rollout only with an
-explicitly non-zero starter window such as `30s`.
+A `timed_only` non-interactive session on a provider without structured
+`Pending()` has no pending-interaction guard beyond its activity clock.
+That is acceptable for initial rollout only with an explicitly non-zero
+starter window such as `30s`.
 
 ### Migration from `idle_timeout`
 

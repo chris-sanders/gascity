@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/beadstest"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -57,7 +58,7 @@ func (e *killedSeatEnv) readyTicks(t *testing.T, work beads.Bead, name string, n
 func TestOperatorSuspendSticksAcrossLegacyTicks(t *testing.T) {
 	t.Run("API and CLI fallback (Manager.Suspend)", func(t *testing.T) {
 		e, work, name := runningSeatWithWork(t)
-		if err := session.NewManagerWithOptions(e.mem, e.sp, session.WithClock(e.clk), session.WithCityPath(e.city)).Suspend(context.Background(), testActorIn(t, session.ActorOperator, e.city), e.seat.ID, false); err != nil {
+		if err := session.NewManagerWithOptions(beadstest.Sessions(e.mem), e.sp, session.WithClock(e.clk), session.WithCityPath(e.city)).Suspend(context.Background(), testActorIn(t, session.ActorOperator, e.city), e.seat.ID, false); err != nil {
 			t.Fatalf("Suspend: %v", err)
 		}
 		if starts := e.readyTicks(t, work, name, 3); starts != 0 || e.sp.IsRunning(name) {
@@ -198,6 +199,34 @@ func TestFreeableExcludesUserHold(t *testing.T) {
 			if got := isPoolSessionSlotFreeableInfo(session.Info{MetadataState: "asleep", SleepReason: reason, SleptAt: meta["slept_at"], SleepIntent: intent}, now); got != want {
 				t.Errorf("info reason %q intent %q: freeable = %v, want %v", reason, intent, got, want)
 			}
+		}
+	}
+	// A soft-suspended row (no operator hold) is not freeable for its state,
+	// not for a hold.
+	soft := map[string]string{"state": "suspended", "slept_at": now.Add(-time.Hour).Format(time.RFC3339)}
+	if isPoolSessionSlotFreeable(beads.Bead{ID: "s-1", Type: sessionBeadType, Labels: []string{sessionBeadLabel}, Metadata: soft}, now) ||
+		isPoolSessionSlotFreeableInfo(session.Info{MetadataState: "suspended", SleptAt: soft["slept_at"]}, now) {
+		t.Error("a soft-suspended row is freeable")
+	}
+}
+
+// TestUserHoldDrainReleased: a user-hold drain is released once its row no
+// longer carries the operator's suspend, a soft suspend included; it holds
+// while the user hold stands, and a drain for another reason is never one.
+func TestUserHoldDrainReleased(t *testing.T) {
+	hold := string(session.SleepReasonUserHold)
+	for _, tc := range []struct {
+		reason string
+		info   session.Info
+		want   bool
+	}{
+		{hold, session.Info{SleepIntent: hold}, false},
+		{hold, session.Info{}, true},
+		{hold, session.Info{MetadataState: "suspended"}, true},
+		{"idle", session.Info{}, false},
+	} {
+		if got := userHoldDrainReleased(tc.reason, tc.info); got != tc.want {
+			t.Errorf("userHoldDrainReleased(%q, %+v) = %v, want %v", tc.reason, tc.info, got, tc.want)
 		}
 	}
 }

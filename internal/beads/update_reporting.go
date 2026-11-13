@@ -27,7 +27,7 @@ type UpdateReporter interface {
 // afterwards: in one round trip through UpdateReporting when store offers it,
 // otherwise as Update followed by Get.
 func UpdateAndReadBack(store Store, id string, opts UpdateOpts) (UpdatedRow, error) {
-	if reporter, ok := store.(UpdateReporter); ok {
+	if reporter, ok := As[UpdateReporter](store); ok {
 		return reporter.UpdateReporting(id, opts)
 	}
 	if err := store.Update(id, opts); err != nil {
@@ -47,6 +47,9 @@ var _ UpdateReporter = (*BdStore)(nil)
 // would otherwise issue to confirm the write. Output that does not carry the
 // row (an older bd, or a shape change) falls back to Get.
 func (s *BdStore) UpdateReporting(id string, opts UpdateOpts) (UpdatedRow, error) {
+	if err := bdSplitSafeUpdate(opts); err != nil {
+		return UpdatedRow{}, err
+	}
 	args := bdUpdateArgs(id, opts)
 	if len(args) == 3 {
 		// No fields to update: Update is a no-op, so report the row as it is.

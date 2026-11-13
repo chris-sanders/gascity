@@ -240,9 +240,9 @@ func TestSetWaitHoldClearWritesEmptyStrings(t *testing.T) {
 }
 
 // TestCloseEmitsClosePatchThenClose proves Close stamps ClosePatch metadata and
-// then closes the bead — the byte-identical replacement for closeBead's
-// SetMetadataBatch(ClosePatch)+Close, WITHOUT any work-reassignment side effect
-// (that is Phase 6).
+// then closes the bead, in one transaction on a store without the atomic
+// close (CommitClose), WITHOUT any work-reassignment side effect (that is
+// Phase 6).
 func TestCloseEmitsClosePatchThenClose(t *testing.T) {
 	b := sessionBeadFixture("s-1", "open", map[string]string{"state": "active"})
 	is, rec := recordingStore(t, b)
@@ -255,15 +255,17 @@ func TestCloseEmitsClosePatchThenClose(t *testing.T) {
 	if !closed {
 		t.Fatalf("Close reported not-closed for an open bead")
 	}
-
-	gotOps := opsOf(rec.Calls())
-	wantOps := []string{"SetMetadataBatch", "Close"}
-	if !reflect.DeepEqual(gotOps, wantOps) {
-		t.Fatalf("Close ops = %v, want %v", gotOps, wantOps)
+	got, err := rec.Get("s-1")
+	if err != nil {
+		t.Fatal(err)
 	}
-	want := map[string]string(ClosePatch(now, "gc_swept"))
-	if !reflect.DeepEqual(rec.CallsForOp("SetMetadataBatch")[0].Metadata, want) {
-		t.Errorf("close patch = %#v, want %#v", rec.CallsForOp("SetMetadataBatch")[0].Metadata, want)
+	if got.Status != "closed" {
+		t.Fatalf("status = %q, want closed", got.Status)
+	}
+	for k, v := range ClosePatch(now, "gc_swept") {
+		if got.Metadata[k] != v {
+			t.Errorf("metadata[%q] = %q, want %q", k, got.Metadata[k], v)
+		}
 	}
 }
 
@@ -593,16 +595,17 @@ func TestCircuitResetGenerationSurfacesStoreError(t *testing.T) {
 }
 
 // TestPersistedMarkersReturnsVerbatimValues proves the typed read returns the
-// persisted session_name / continuation_epoch / sleep_reason metadata values
-// verbatim — equivalent to the raw store.Get(id) + read .Metadata[...] the
+// persisted session_name / continuation_epoch / sleep_reason /
+// continuation_reset_pending metadata values verbatim — equivalent to the raw store.Get(id) + read .Metadata[...] the
 // cmd_wait registration and retry/clear paths performed. It performs no bead
 // validation (matching the raw reads) and emits no mutating op.
 func TestPersistedMarkersReturnsVerbatimValues(t *testing.T) {
 	b := sessionBeadFixture("s-1", "open", map[string]string{
-		"__title":            "My Session",
-		"session_name":       "polecat-1",
-		"continuation_epoch": "4",
-		"sleep_reason":       "wait-hold",
+		"__title":                    "My Session",
+		"session_name":               "polecat-1",
+		"continuation_epoch":         "4",
+		"sleep_reason":               "wait-hold",
+		"continuation_reset_pending": "true",
 	})
 	is, rec := recordingStore(t, b)
 
@@ -611,10 +614,11 @@ func TestPersistedMarkersReturnsVerbatimValues(t *testing.T) {
 		t.Fatalf("PersistedMarkers: %v", err)
 	}
 	want := PersistedMarkers{
-		Title:             "My Session",
-		SessionName:       "polecat-1",
-		ContinuationEpoch: "4",
-		SleepReason:       "wait-hold",
+		Title:                    "My Session",
+		SessionName:              "polecat-1",
+		ContinuationEpoch:        "4",
+		SleepReason:              "wait-hold",
+		ContinuationResetPending: "true",
 	}
 	if got != want {
 		t.Errorf("PersistedMarkers = %#v, want %#v (the raw read values)", got, want)
@@ -762,5 +766,20 @@ func TestUpdateMetadataInfoFailedWritePersistsNothingAndReturnsInputUnchanged(t 
 		if v := after.Metadata[k]; v != "" {
 			t.Errorf("durable row key %q = %q after failed Update, want unset (all-or-nothing)", k, v)
 		}
+	}
+}
+
+// TestStoreBacked: a front door over a store is backed; a nil door and a door
+// over the zero handle are not.
+func TestStoreBacked(t *testing.T) {
+	if !NewStore(beadstest.Sessions(beads.NewMemStore())).Backed() {
+		t.Error("a door over a store reports unbacked")
+	}
+	if NewStore(beads.SessionStore{}).Backed() {
+		t.Error("a door over the zero handle reports backed")
+	}
+	var nilDoor *Store
+	if nilDoor.Backed() {
+		t.Error("a nil door reports backed")
 	}
 }

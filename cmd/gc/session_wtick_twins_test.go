@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/beadstest"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
@@ -226,6 +227,10 @@ func TestRetireDuplicateRowsMatchesBeads(t *testing.T) {
 		}
 		winner := mkSession("5", spec.SessionName)         // canonical name + higher generation → wins
 		loser := mkSession("3", spec.SessionName+"-stale") // distinct session_name → runtime stop path
+		// The loser holds a wait and a quarantine, which its retire clears.
+		if err := store.SetMetadataBatch(loser, map[string]string{"wait_hold": "true", "sleep_intent": "wait-hold", "quarantined_until": "2126-01-01T00:00:00Z"}); err != nil {
+			t.Fatalf("hold the loser: %v", err)
+		}
 		// continuity-ineligible: excluded from the group.
 		ineligible, err := store.Create(beads.Bead{
 			Type: session.BeadType, Status: "open", Labels: []string{session.LabelSession},
@@ -252,7 +257,7 @@ func TestRetireDuplicateRowsMatchesBeads(t *testing.T) {
 
 	loserName := spec.SessionName + "-stale"
 	loadOpen := func(t *testing.T, store beads.Store) []beads.Bead {
-		all, err := session.ListAllSessionBeads(store, beads.ListQuery{})
+		all, err := session.ListAllSessionBeads(beadstest.Sessions(store), beads.ListQuery{})
 		if err != nil {
 			t.Fatalf("list sessions: %v", err)
 		}
@@ -317,6 +322,11 @@ func TestRetireDuplicateRowsMatchesBeads(t *testing.T) {
 			}
 			if loserBead.Metadata["state"] != "archived" {
 				t.Fatalf("%s: loser not retired to archived: state=%q", leg.name, loserBead.Metadata["state"])
+			}
+			for _, k := range []string{"wait_hold", "sleep_intent", "quarantined_until"} {
+				if loserBead.Metadata[k] != "" {
+					t.Fatalf("%s: retired loser keeps %s=%q, want the Retire cell's clear", leg.name, k, loserBead.Metadata[k])
+				}
 			}
 			// The runtime STOP must have fired and succeeded (loser no longer running).
 			if leg.sp.IsRunning(loserName) {
